@@ -53,14 +53,14 @@ jobs:
           RUN_ID="${{ inputs.xnu_run_id }}"
           if [ -z "$RUN_ID" ] && [ "${{ inputs.build_ramdisk }}" = "true" ]; then
             for id in $(gh run list -R "${{ github.repository }}" --workflow ci.yml --status success --limit 15 --json databaseId --jq '.[].databaseId'); do
-              if gh api "repos/${{ github.repository }}/actions/runs/$id/artifacts" --jq '.artifacts[].name' | grep -qx "xnu-kernel"; then
+              if gh api "repos/${{ github.repository }}/actions/runs/$id/artifacts" --jq '.artifacts[].name' | grep -qx "begonia-xnu-11215-DEVELOPMENT"; then
                 RUN_ID="$id"
                 break
               fi
             done
           fi
           if [ "${{ inputs.build_ramdisk }}" = "true" ] && [ -z "$RUN_ID" ]; then
-            echo "error: no successful ci.yml run with xnu-kernel artifact found" >&2
+            echo "error: no successful ci.yml run with begonia-xnu-11215-DEVELOPMENT artifact found" >&2
             exit 1
           fi
 
@@ -101,7 +101,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p out-xnu out-ios18
-          gh run download "${{ needs.prepare.outputs.xnu_run_id }}" -R "${{ github.repository }}" -n xnu-kernel -D out-xnu
+          gh run download "${{ needs.prepare.outputs.xnu_run_id }}" -R "${{ github.repository }}" -n begonia-xnu-11215-DEVELOPMENT -D out-xnu
           cp out-xnu/kernel.development.sweet out-ios18/
           ls -lh out-ios18/kernel.development.sweet
 
