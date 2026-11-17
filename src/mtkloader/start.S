@@ -102,15 +102,130 @@ jump_to_kernel:
     br      x19
 
 /*
- * chain_stub(uint64_t dtb, uint64_t dst, uint64_t src, uint64_t len, uint64_t entry)
- * Position-independent copier executed out of high DRAM to restore Android's original Image.
+ * void mmu_off_jump(uint64_t arg0, uint64_t entry, uint64_t clean_base, uint64_t clean_len)
+ * Clean+invalidate [clean_base, clean_base + clean_len) to PoC, tear down CurrentEL
+ * MMU/D-cache/I-cache/VBAR, and enter `entry` with x0 = arg0, x1 = x2 = x3 = 0.
+ */
+.globl mmu_off_jump
+mmu_off_jump:
+    msr     daifset, #0xf
+    cbz     x3, 2f
+    mrs     x9, ctr_el0
+    ubfx    x9, x9, #16, #4
+    mov     x10, #4
+    lsl     x9, x10, x9
+    sub     x11, x9, #1
+    add     x12, x2, x3
+    bic     x10, x2, x11
+    dsb     sy
+1:  cmp     x10, x12
+    b.hs    2f
+    dc      civac, x10
+    add     x10, x10, x9
+    b       1b
+2:  dsb     sy
+    mrs     x9, CurrentEL
+    cmp     x9, #8
+    b.eq    3f
+    mrs     x9, sctlr_el1
+    bic     x9, x9, #(1 << 0)
+    bic     x9, x9, #(1 << 2)
+    bic     x9, x9, #(1 << 12)
+    msr     sctlr_el1, x9
+    isb
+    tlbi    vmalle1
+    msr     vbar_el1, xzr
+    b       4f
+3:  mrs     x9, sctlr_el2
+    bic     x9, x9, #(1 << 0)
+    bic     x9, x9, #(1 << 2)
+    bic     x9, x9, #(1 << 12)
+    msr     sctlr_el2, x9
+    isb
+    tlbi    alle2
+    msr     vbar_el2, xzr
+4:  dsb     sy
+    ic      iallu
+    dsb     sy
+    isb
+    mov     x4, x1
+    mov     x1, xzr
+    mov     x2, xzr
+    mov     x3, xzr
+    br      x4
+
+/*
+ * chain_stub(uint64_t dtb, uint64_t dst, uint64_t src, uint64_t len, uint64_t entry, uint64_t tail_zero)
+ * Position-independent copier executed out of high DRAM (VA == PA) with MMU/caches on.
+ * Restores Android's original Image, zeroes shifted tail, flushes PoC, tears down MMU, jumps.
  */
 chain_stub:
-1:  ldr     x6, [x2], #8
-    str     x6, [x1], #8
-    subs    x3, x3, #8
-    b.hi    1b
+    msr     daifset, #0xf
+    mov     x6, x1
+    mov     x7, x3
+1:  cmp     x3, #16
+    b.lo    2f
+    ldp     x9, x10, [x2], #16
+    stp     x9, x10, [x1], #16
+    sub     x3, x3, #16
+    b       1b
+2:  cmp     x3, #8
+    b.lo    3f
+    ldr     x9, [x2], #8
+    str     x9, [x1], #8
+    sub     x3, x3, #8
+    b       2b
+3:  cbz     x3, 4f
+    ldrb    w9, [x2], #1
+    strb    w9, [x1], #1
+    sub     x3, x3, #1
+    b       3b
+4:  mov     x8, x5
+5:  cmp     x8, #16
+    b.lo    6f
+    stp     xzr, xzr, [x1], #16
+    sub     x8, x8, #16
+    b       5b
+6:  cbz     x8, 7f
+    strb    wzr, [x1], #1
+    sub     x8, x8, #1
+    b       6b
+7:  mrs     x9, ctr_el0
+    ubfx    x9, x9, #16, #4
+    mov     x10, #4
+    lsl     x9, x10, x9
+    sub     x11, x9, #1
+    add     x12, x6, x7
+    add     x12, x12, x5
+    bic     x10, x6, x11
     dsb     sy
+8:  cmp     x10, x12
+    b.hs    9f
+    dc      civac, x10
+    add     x10, x10, x9
+    b       8b
+9:  dsb     sy
+    mrs     x9, CurrentEL
+    cmp     x9, #8
+    b.eq    10f
+    mrs     x9, sctlr_el1
+    bic     x9, x9, #(1 << 0)
+    bic     x9, x9, #(1 << 2)
+    bic     x9, x9, #(1 << 12)
+    msr     sctlr_el1, x9
+    isb
+    tlbi    vmalle1
+    msr     vbar_el1, xzr
+    b       11f
+10: mrs     x9, sctlr_el2
+    bic     x9, x9, #(1 << 0)
+    bic     x9, x9, #(1 << 2)
+    bic     x9, x9, #(1 << 12)
+    msr     sctlr_el2, x9
+    isb
+    tlbi    alle2
+    msr     vbar_el2, xzr
+11: dsb     sy
     ic      iallu
     dsb     sy
     isb

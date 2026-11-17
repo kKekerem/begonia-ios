@@ -1,0 +1,263 @@
+name: iOS 18.7.8 IPSW & RootFS Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_ramdisk:
+        description: "Build iOS 18.7.8 (22H352) Restore RamDisk & SWEETXNU payloads"
+        required: true
+        type: boolean
+        default: true
+      build_full_rootfs:
+        description: "Download full 22H352 IPSW/cryptexes & build sparse RootFS (.simg.zst) to Release"
+        required: true
+        type: boolean
+        default: true
+      include_jb:
+        description: "Include Procursus/Sileo jailbreak bootstrap in full RootFS"
+        required: false
+        type: boolean
+        default: false
+      xnu_run_id:
+        description: "Specific ci.yml run ID providing xnu-kernel artifact (blank = latest success)"
+        required: false
+        type: string
+        default: ""
+      release_tag:
+        description: "GitHub Release tag for cloud-built IPSW outputs"
+        required: false
+        type: string
+        default: "ios18-22h352-begonia"
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      xnu_run_id: ${{ steps.resolve.outputs.xnu_run_id }}
+      ipsw_url: ${{ steps.resolve.outputs.ipsw_url }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+    steps:
+      - name: Resolve XNU artifact run, IPSW URL, and Release tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.release_tag }}"
+          [ -n "$TAG" ] || TAG="ios18-22h352-begonia"
+
+          RUN_ID="${{ inputs.xnu_run_id }}"
+          if [ -z "$RUN_ID" ] && [ "${{ inputs.build_ramdisk }}" = "true" ]; then
+            for id in $(gh run list -R "${{ github.repository }}" --workflow ci.yml --status success --limit 15 --json databaseId --jq '.[].databaseId'); do
+              if gh api "repos/${{ github.repository }}/actions/runs/$id/artifacts" --jq '.artifacts[].name' | grep -qx "xnu-kernel"; then
+                RUN_ID="$id"
+                break
+              fi
+            done
+          fi
+          if [ "${{ inputs.build_ramdisk }}" = "true" ] && [ -z "$RUN_ID" ]; then
+            echo "error: no successful ci.yml run with xnu-kernel artifact found" >&2
+            exit 1
+          fi
+
+          IPSW_URL=$(curl -fsSL "https://api.ipsw.me/v4/ipsw/iPhone11,8/22H352" | jq -r '.url' || true)
+          if [ -z "$IPSW_URL" ] || [ "$IPSW_URL" = "null" ]; then
+            echo "error: failed to resolve iPhone11,8 22H352 IPSW URL" >&2
+            exit 1
+          fi
+
+          if ! gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$TAG" -R "${{ github.repository }}" \
+              --title "iOS 18.7.8 (22H352) begonia cloud builds" \
+              --notes "Automated cloud-built XNU-11215 ADTs, ramdisk payload, kernel-only payload, and sparse RootFS for Xiaomi Redmi Note 8 Pro (begonia)."
+          fi
+
+          echo "xnu_run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "ipsw_url=$IPSW_URL" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved XNU run=${RUN_ID:-none}, IPSW=$IPSW_URL, Release=$TAG"
+
+  ramdisk-payload:
+    needs: prepare
+    if: ${{ inputs.build_ramdisk }}
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone Bergamota tools (pinned commit)
+        run: |
+          git clone https://github.com/ry-diffusion/Bergamota.git bergamota
+          git -C bergamota checkout 37a7a7a917fc09945ed2f7d1ae68b84d4525b4cb
+
+      - name: Install ipsw & zstd
+        run: brew install blacktop/tap/ipsw zstd
+
+      - name: Download compiled begonia XNU kernel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p out-xnu out-ios18
+          gh run download "${{ needs.prepare.outputs.xnu_run_id }}" -R "${{ github.repository }}" -n xnu-kernel -D out-xnu
+          cp out-xnu/kernel.development.sweet out-ios18/
+          ls -lh out-ios18/kernel.development.sweet
+
+      - name: Fetch 22H352 DeviceTree & build begonia ADTs
+        run: |
+          set -euo pipefail
+          URL="${{ needs.prepare.outputs.ipsw_url }}"
+          mkdir -p dt-work
+          python3 bergamota/tools/remotezip.py "$URL" BuildManifest.plist dt-work >/dev/null
+          DT=$(python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb"))["BuildIdentities"][0]["Manifest"]["DeviceTree"]["Info"]["Path"])' dt-work/BuildManifest.plist)
+          echo "DeviceTree member: $DT"
+          python3 bergamota/tools/remotezip.py "$URL" "$DT" dt-work >/dev/null
+          ipsw img4 im4p extract "dt-work/$DT" -o out-ios18/n841ap.adt >/dev/null
+
+          python3 src/tools/mkadt_begonia.py out-ios18/begonia-ios18-n841.adt \
+            --identity n841ap --display-scale 2 --cpus 6 --product-adt out-ios18/n841ap.adt
+          python3 src/tools/mkadt_begonia.py out-ios18/begonia-ios18-d22.adt \
+            --identity d22ap --display-scale 3 --cpus 6 --product-adt out-ios18/n841ap.adt
+
+      - name: Build Stage-2 kernel-only & Stage-1b Restore RamDisk payloads
+        run: |
+          set -euo pipefail
+          URL="${{ needs.prepare.outputs.ipsw_url }}"
+          python3 src/tools/mkpayload.py \
+            out-ios18/kernel.development.sweet \
+            out-ios18/begonia-ios18-n841.adt \
+            out-ios18/begonia-xnu-kernel-only-payload.bin \
+            --cmdline "debug=0x14e serial=3 rd=ufsroot0 ufsroot=iosroot rw=1 -v cpus=6" \
+            --compress
+
+          (
+            cd bergamota
+            bash tools/renegade/fetch-ramdisk.sh -u "$URL"
+            bash tools/renegade/mkramdisk-root.sh
+          )
+          hdiutil detach -force "$(pwd)/bergamota/research/ios18/ramdisk/mnt" >/dev/null 2>&1 || true
+
+          python3 -I bergamota/tools/renegade/hfs_trim.py bergamota/research/ios18/ios18-root.hfs || true
+          cp bergamota/research/ios18/ios18-root.hfs out-ios18/ios18-begonia-ramdisk.hfs
+
+          python3 src/tools/mkpayload.py \
+            out-ios18/kernel.development.sweet \
+            out-ios18/begonia-ios18-n841.adt \
+            out-ios18/begonia-xnu-ramdisk-payload.bin \
+            --ramdisk out-ios18/ios18-begonia-ramdisk.hfs \
+            --cmdline "debug=0x14e serial=3 rd=md0 -v cpus=6" \
+            --compress
+
+          zstd -T0 -9 out-ios18/ios18-begonia-ramdisk.hfs -o out-ios18/ios18-begonia-ramdisk.hfs.zst
+          rm -f out-ios18/ios18-begonia-ramdisk.hfs
+
+          (cd out-ios18 && shasum -a 256 * > SHA256SUMS.txt)
+          ls -lh out-ios18/
+          {
+            echo "### iOS 18.7.8 (22H352) RamDisk & Payloads"
+            echo '```'
+            ls -lh out-ios18/
+            cat out-ios18/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: begonia-ios18-ramdisk
+          path: out-ios18/
+          retention-days: 14
+
+      - name: Upload payloads to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.prepare.outputs.release_tag }}" out-ios18/* \
+            -R "${{ github.repository }}" --clobber
+
+  full-rootfs:
+    needs: prepare
+    if: ${{ inputs.build_full_rootfs }}
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk space & install tools
+        run: |
+          df -h
+          xcrun simctl delete all >/dev/null 2>&1 || true
+          sudo rm -rf /Users/runner/hostedtoolcache/Android* /Library/Developer/CoreSimulator/Images/* 2>/dev/null || true
+          brew cleanup --prune=all >/dev/null 2>&1 || true
+          brew install blacktop/tap/ipsw zstd
+          df -h
+
+      - name: Clone Bergamota tools (pinned commit)
+        run: |
+          git clone https://github.com/ry-diffusion/Bergamota.git bergamota
+          git -C bergamota checkout 37a7a7a917fc09945ed2f7d1ae68b84d4525b4cb
+
+      - name: Stream & decrypt 22H352 OS + Cryptexes sequentially in cloud
+        run: |
+          set -euo pipefail
+          URL="${{ needs.prepare.outputs.ipsw_url }}"
+          cd bergamota
+          D="research/ios18/ipsw"
+          O="$D/22H352__iPhone11,8"
+          mkdir -p "$O"
+          python3 tools/remotezip.py "$URL" BuildManifest.plist "$D" >/dev/null
+          DMGS=$(RENEGADE_TARGET=ios18 python3 -I tools/renegade/targets.py dmgs)
+          for m in $DMGS; do
+            echo "=== Streaming $m ==="
+            python3 tools/remotezip.py "$URL" "=$m" "$O"
+            if [[ "$m" == *.aea ]]; then
+              ipsw fw aea "$O/$m" -o "$O"
+              rm -f "$O/$m"
+            fi
+            df -h .
+          done
+          ls -lh "$O"
+
+      - name: Build patched HFS+ full iOS 18.7.8 RootFS (.simg)
+        run: |
+          set -euo pipefail
+          cd bergamota
+          EXTRA_FLAGS=(--size 14g --delete-sources --no-bluetooth --no-posterboard --no-bglrender)
+          if [ "${{ inputs.include_jb }}" != "true" ]; then
+            EXTRA_FLAGS+=(--no-jb)
+          fi
+          RENEGADE_TARGET=ios18 RENEGADE_MIN_FREE_GB=2 \
+            python3 -I tools/renegade/mkroot-full.py \
+            "${EXTRA_FLAGS[@]}" \
+            --stages copy,macho,cache,tweaks,seal,verify,simg
+          ls -lh research/ios18/
+
+      - name: Compress, split (<1900 MiB), and publish RootFS to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p out-rootfs
+          SIMG="bergamota/research/ios18/ios18-root-full.simg"
+          ZST="out-rootfs/ios18-begonia-root-full.simg.zst"
+          zstd -T0 -3 --rm "$SIMG" -o "$ZST"
+          SIZE=$(stat -f%z "$ZST")
+          echo "Compressed RootFS size: $SIZE bytes"
+          if [ "$SIZE" -gt 1992294400 ]; then
+            split -b 1900m -d -a 2 "$ZST" "${ZST}.part"
+            rm -f "$ZST"
+          fi
+          (cd out-rootfs && shasum -a 256 * > ROOTFS_SHA256SUMS.txt)
+          ls -lh out-rootfs/
+          cat out-rootfs/ROOTFS_SHA256SUMS.txt
+          gh release upload "${{ needs.prepare.outputs.release_tag }}" out-rootfs/* \
+            -R "${{ github.repository }}" --clobber
+          {
+            echo "### iOS 18.7.8 (22H352) Full RootFS Published"
+            echo "Release: \`${{ needs.prepare.outputs.release_tag }}\`"
+            echo '```'
+            ls -lh out-rootfs/
+            cat out-rootfs/ROOTFS_SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

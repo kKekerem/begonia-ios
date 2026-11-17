@@ -4,6 +4,7 @@
 #include "xnu_boot.h"
 #include "console.h"
 #include "inflate.h"
+#include "mmu.h"
 
 extern char _start[];
 extern char __loader_end[];
@@ -211,6 +212,9 @@ const char *xnu_payload_boot(uintptr_t start, uintptr_t end)
     const struct sweet_payload *p = (const struct sweet_payload *)start;
     const struct fb_info *fb = console_fb();
     uint64_t pa_of_va = p->phys_base - p->virt_base;
+    uintptr_t adt_pa = (uintptr_t)(p->kernel_end + pa_of_va);
+    uintptr_t ba_pa = (adt_pa + p->adt_size + XNU_PAGE_16K - 1ULL) & ~(XNU_PAGE_16K - 1ULL);
+    uintptr_t top_pa = ba_pa + XNU_PAGE_16K;
 
     con_puts("XNU payload v");
     con_dec(p->version);
@@ -221,6 +225,21 @@ const char *xnu_payload_boot(uintptr_t start, uintptr_t end)
     con_puts(" size=");
     con_hex(p->mem_size);
     con_putc('\n');
+
+    struct mmu_range mmu_ranges[5] = {
+        { 0x0C000000ULL, 0x0A000000ULL, MMU_ATTR_DEV },
+        { (uint64_t)(uintptr_t)_start, (uint64_t)(__loader_end - _start), MMU_ATTR_WB },
+        { (uint64_t)start, (uint64_t)(end - start), MMU_ATTR_WB },
+        { p->phys_base, (uint64_t)(top_pa - p->phys_base), MMU_ATTR_WB },
+        { fb ? fb->base : 0ULL, fb ? (uint64_t)fb->size : 0ULL, MMU_ATTR_NC }
+    };
+    size_t nranges = (fb && fb->base && fb->size) ? 5U : 4U;
+    int mmu_rc = mmu_enable_ranges(mmu_ranges, nranges);
+    if (mmu_rc != 0) {
+        con_puts("WARN: XNU MMU setup failed rc=");
+        con_hex((uint64_t)(int64_t)mmu_rc);
+        con_putc('\n');
+    }
 
     for (uint32_t i = 0; i < p->nsegs; i++) {
         struct sweet_payload_seg_v2 s;
@@ -248,12 +267,9 @@ const char *xnu_payload_boot(uintptr_t start, uintptr_t end)
         }
     }
 
-    uintptr_t adt_pa = (uintptr_t)(p->kernel_end + pa_of_va);
     copy64(adt_pa, start + p->adt_off, p->adt_size);
     (void)adt_patch_node((uint8_t *)adt_pa, (const uint8_t *)(adt_pa + p->adt_size), 0, fb);
 
-    uintptr_t ba_pa = (adt_pa + p->adt_size + XNU_PAGE_16K - 1ULL) & ~(XNU_PAGE_16K - 1ULL);
-    uintptr_t top_pa = ba_pa + XNU_PAGE_16K;
     zero64(ba_pa, XNU_PAGE_16K);
 
     volatile struct xnu_boot_args *ba = (volatile struct xnu_boot_args *)ba_pa;
@@ -284,5 +300,8 @@ const char *xnu_payload_boot(uintptr_t start, uintptr_t end)
     con_putc('\n');
 
     console_strip_ovl_alpha();
+    if (mmu_rc == 0) {
+        mmu_off_jump(ba_pa, entry_pa, p->phys_base, (uint64_t)(top_pa - p->phys_base));
+    }
     jump_to_kernel(entry_pa, ba_pa);
 }

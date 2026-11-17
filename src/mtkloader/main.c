@@ -7,14 +7,11 @@
 #include "boot_menu.h"
 #include "console.h"
 #include "fdt.h"
+#include "mmu.h"
 #include "touch.h"
 #include "xnu_boot.h"
 
 extern char _start[];
-extern char chain_stub[];
-extern char chain_stub_end[];
-
-typedef void (*chain_fn_t)(uint64_t dtb, uint64_t dst, uint64_t src, uint64_t len, uint64_t entry);
 
 void loader_exception_handler(uint64_t slot, uint64_t esr, uint64_t elr, uint64_t far)
 {
@@ -129,20 +126,53 @@ static int find_payload_window(uintptr_t fdt, uintptr_t *out_start, uintptr_t *o
 
 static void chain_android(uintptr_t fdt, uint64_t android_len)
 {
-    con_puts("Chainbooting Android Image (len=");
+    uint64_t el = 0;
+    __asm__ volatile("mrs %0, CurrentEL" : "=r"(el));
+
+    uintptr_t src = (uintptr_t)_start + BEGONIA_CHAIN_OFFSET;
+    uint64_t tail_zero = BEGONIA_CHAIN_OFFSET;
+    if (BEGONIA_KERNEL_PA + android_len + tail_zero > BEGONIA_CHAIN_STUB_PA) {
+        tail_zero = (BEGONIA_CHAIN_STUB_PA > BEGONIA_KERNEL_PA + android_len)
+            ? (BEGONIA_CHAIN_STUB_PA - (BEGONIA_KERNEL_PA + android_len))
+            : 0ULL;
+    }
+
+    con_puts("Booting Android 17 (EL");
+    con_dec((el >> 2) & 3ULL);
+    con_puts(", fdt=");
+    con_hex((uint64_t)fdt);
+    con_puts(", len=");
     con_hex(android_len);
     con_puts(")...\n");
 
-    uintptr_t stub_len = (uintptr_t)(chain_stub_end - chain_stub);
-    volatile uint8_t *dst = (volatile uint8_t *)BEGONIA_CHAIN_STUB_PA;
-    for (uintptr_t i = 0; i < stub_len; i++) {
-        dst[i] = (uint8_t)chain_stub[i];
+    const struct fb_info *fb = console_fb();
+    struct mmu_range ranges[4] = {
+        { 0x0C000000ULL, 0x0A000000ULL, MMU_ATTR_DEV },
+        { BEGONIA_KERNEL_PA, (src + android_len + tail_zero) - BEGONIA_KERNEL_PA, MMU_ATTR_WB },
+        { BEGONIA_CHAIN_STUB_PA, 0x4000ULL, MMU_ATTR_WB },
+        { fb ? fb->base : 0ULL, fb ? (uint64_t)fb->size : 0ULL, MMU_ATTR_NC }
+    };
+    size_t nranges = (fb && fb->base && fb->size) ? 4U : 3U;
+    int mmu_rc = mmu_enable_ranges(ranges, nranges);
+    if (mmu_rc != 0) {
+        con_puts("WARN: MMU setup rc=");
+        con_hex((uint64_t)(int64_t)mmu_rc);
+        con_puts(", using uncached stub\n");
     }
-    __asm__ volatile("dsb sy; isb");
 
-    chain_fn_t fn = (chain_fn_t)BEGONIA_CHAIN_STUB_PA;
-    fn((uint64_t)fdt, BEGONIA_KERNEL_PA, (uint64_t)((uintptr_t)_start + BEGONIA_CHAIN_OFFSET),
-       android_len, BEGONIA_KERNEL_PA);
+    uintptr_t stub_len = (uintptr_t)(chain_stub_end - chain_stub);
+    volatile uint8_t *dst = (volatile uint8_t *)(uintptr_t)BEGONIA_CHAIN_STUB_PA;
+    for (uintptr_t i = 0; i < stub_len; i++) {
+        dst[i] = chain_stub[i];
+    }
+    if (mmu_rc == 0) {
+        mmu_flush_dcache_range(BEGONIA_CHAIN_STUB_PA, (uint64_t)stub_len);
+    }
+    __asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
+
+    mmu_chain_fn_t fn = (mmu_chain_fn_t)BEGONIA_CHAIN_STUB_PA;
+    fn((uint64_t)fdt, BEGONIA_KERNEL_PA, (uint64_t)src,
+       android_len, BEGONIA_KERNEL_PA, tail_zero);
 }
 
 static void show_diagnostics(uintptr_t fdt, const struct touch_state *touch)

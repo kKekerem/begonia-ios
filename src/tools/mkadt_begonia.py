@@ -27,14 +27,15 @@ INT_POL_SIZE = 0x00000050
 TIMEBASE_HZ = 13_000_000
 VTIMER_INTID = 27  # ARM PPI 11 -> GIC INTID 16 + 11 = 27
 
-FB_FALLBACK_PA = 0x7E605000
-FB_FALLBACK_SIZE = 0x017E8000
+FB_FALLBACK_PA = 0x7D9B0000
+FB_FALLBACK_SIZE = 0x02250000
 PANEL_W = 1080
 PANEL_H = 2340
 
-# Safe initial DRAM window; overridden after inspecting live /memory & /reserved-memory from device DTB
-DEFAULT_DRAM_BASE = 0x80000000
-DEFAULT_DRAM_SIZE = 0x40000000  # 1 GiB conservative initial bring-up window
+# Clean contiguous high DRAM window on MT6785 (mblock[17]: 0xc0000000, size 0x3fe00000),
+# avoiding modem/SCP/ATF carve-outs in 0x40000000..0xbfffffff.
+DEFAULT_DRAM_BASE = 0xC0000000
+DEFAULT_DRAM_SIZE = 0x3FC00000  # 1020 MiB contiguous window
 
 BEGONIA_ECID = 0x4245474F4E494101
 BOOT_MANIFEST_HASH = hashlib.sha384(b"begonia-ios boot manifest").digest()

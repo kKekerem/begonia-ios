@@ -1,16 +1,11 @@
+# begonia (Redmi Note 8 Pro / MediaTek MT6785) SoC support for SWEET xnu-11215.
+# Applied as sweet-z-900-begonia-soc-support.patch after upstream Bergamota patches.
+
 diff --git a/bsd/dev/sweet_board.h b/bsd/dev/sweet_board.h
-index 3d9c06a..5a375ed 100644
+index 3d9c06a..97b7d2c 100644
 --- a/bsd/dev/sweet_board.h
 +++ b/bsd/dev/sweet_board.h
-@@ -3,6 +3,7 @@
-  * (tools/mkadt.py --board) names the board; everything else is common.
-  *   xiaomi,sweet      Redmi Note 10 Pro, SM7150 (default)
-  *   xiaomi,beryllium  Poco F1, SDM845
-+ *   xiaomi,begonia    Redmi Note 8 Pro, MT6785
-  */
- #ifndef _SWEET_BOARD_H_
- #define _SWEET_BOARD_H_
-@@ -76,4 +77,14 @@ sweet_board_beryllium(void)
+@@ -76,4 +76,14 @@ sweet_board_beryllium(void)
  	return cached == 1;
  }
  
@@ -25,38 +20,225 @@ index 3d9c06a..5a375ed 100644
 +}
 +
  #endif /* _SWEET_BOARD_H_ */
-diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index c6d113f..602dcf8 100644
---- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
-+++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -14,6 +14,8 @@ extern "C" int sweet_reboot_restart(int panic_restart);
- extern "C" void sweet_reboot_note_panic(void);
- #include "../../../bsd/dev/sweet_board.h"
- #include "../../../bsd/dev/sweet_spmi.h"
-+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
-+static vm_offset_t begonia_wdt_base;
- 
- class SweetPlatformExpert : public IODTPlatformExpert {
- 	OSDeclareDefaultStructors(SweetPlatformExpert);
-@@ -39,6 +41,10 @@ SweetPlatformExpert::start(IOService *provider)
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 4faeee1..23f9aa7 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -137,6 +137,10 @@ sweet_keys_init(void)
+ 		return;
  	}
- 	registerService();
- 	IOLog("SWEET: platform expert registered\n");
+ 	keys_started = true;
 +	if (sweet_board_begonia()) {
-+		begonia_wdt_base = ml_io_map(0x10007000ULL, 0x1000);
-+		IOLog("BEGONIA: MT6785 platform expert active (wdt=0x%lx)\n", (unsigned long)begonia_wdt_base);
++		printf("SWEET KEYS: disabled on begonia\n");
++		return;
++	}
+ 	(void)PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 69f46a0..e1de3bd 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -114,6 +114,9 @@ sweet_spmi_init_locked(void)
+ 		return sp_ready ? 0 : -1;
+ 	}
+ 	sp_attempted = true;
++	if (sweet_board_begonia()) {
++		return -1;
++	}
+ 	sp_lock = IOLockAlloc();
+ 	if (!sp_lock) {
+ 		return -1;
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 204207f..e0af1f0 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1199,6 +1199,10 @@ sweet_touch_init(void)
+ 		return;
+ 	}
+ 	st.started = true;
++	if (sweet_board_begonia()) {
++		printf("SWEET TOUCH: disabled on begonia\n");
++		return;
 +	}
  	if (sweet_board_beryllium()) {
- 		publishResource("IORTC");       /* 0245: the PM8998 RTC below; IOKitInitializeTime waits up to 30 s for it */
- 	}
-@@ -65,6 +71,10 @@ SweetPlatformExpert::haltRestart(unsigned int type)
- 		(void)sweet_reboot_restart(1);
- 		break;
- 	case kPERestartCPU:
-+		if (sweet_board_begonia() && begonia_wdt_base) {
-+			*(volatile uint32_t *)(begonia_wdt_base + 0x14) = 0x1209U;
-+			__asm__ volatile("dsb sy" ::: "memory");
+ 		tb = &touch_beryllium;
+ 		st.irq_hint = 1; /* bit-banged reads are slow: only on IRQ edges or while touched */
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 3cb72e3..a32facb 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -90,6 +90,10 @@ sweet_usb_probe(void)
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
++	if (sweet_board_begonia()) {
++		printf("SWEET USB: disabled on begonia\n");
++		return;
++	}
+ 	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 3c2a9f7..4da8c4a 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1866,19 +1866,33 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+ #define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
+ 
+ static void
+-sweet_early_map_final(void)
++sweet_early_map_final(boot_args *args)
+ {
+ 	const vm_map_address_t va = SWEET_EARLY_FB_VA;
++	uint64_t fb_pa = (args && args->Video.v_baseAddr) ? args->Video.v_baseAddr : 0x9c000000ULL;
++	uint64_t fb_size = (args && args->Video.v_height && args->Video.v_rowBytes) ?
++	    (args->Video.v_height * args->Video.v_rowBytes) : 0x1000000ULL;
++	uint64_t block0 = fb_pa & ~((uint64_t)ARM_TT_L2_SIZE - 1ULL);
++	uint64_t block_last = (fb_pa + fb_size - 1ULL) & ~((uint64_t)ARM_TT_L2_SIZE - 1ULL);
++	unsigned int blocks = (block_last > block0 && va + 2 * ARM_TT_L2_SIZE <= gVirtBase) ? 2u : 1u;
++
+ 	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
+ 	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+ 	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+-	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+-	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+-	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+-	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+-	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	for (unsigned int i = 0; i < blocks; i++) {
++		vm_map_address_t bva = va + i * ARM_TT_L2_SIZE;
++		tt_entry_t *slot = &l2[(bva & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
++		if (i == 0) {
++			assert(*slot == ARM_TTE_EMPTY);
++		} else if (*slot != ARM_TTE_EMPTY) {
++			break;
 +		}
- 		(void)sweet_reboot_restart(0);
- 		break;
- 	default:
++		*slot = (block0 + (uint64_t)i * ARM_TT_L2_SIZE) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	}
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
+ #endif
+@@ -2217,7 +2231,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ #if defined(SWEET)
+ 	/* phystokv() must still refer to the bootstrap aperture here. */
+-	sweet_early_map_final();
++	sweet_early_map_final(args);
+ #endif
+ 	arm_vm_physmap_init(args);
+ 	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index e8f555e..58d71c0 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -523,11 +523,17 @@ LEXT(start_first_cpu)
+ 	mov		x21, #0
+ 
+ #if defined(SWEET)
+-	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	/* Stage 0: white 64x32 band from boot_args->Video (no hardcoded board FB). */
++	ldr		x0, [x20, #40]
++	cbz		x0, Lsweet_skip_mark
++	ldr		x4, [x20, #56]
++	ldr		x1, [x20, #72]
++	cmp		x1, #33
++	b.lo	Lsweet_skip_mark
++	sub		x1, x1, #32
++	madd	x0, x1, x4, x0
+ 	mov		w1, #-1
+ 	mov		x2, #32
+-	mov		x4, #4320
+ Lsweet_mark_row:
+ 	mov		x3, #64
+ 	mov		x5, x0
+@@ -539,6 +545,7 @@ Lsweet_mark_pixel:
+ 	subs	x2, x2, #1
+ 	b.ne	Lsweet_mark_row
+ 	dsb		sy
++Lsweet_skip_mark:
+ #endif
+ 
+ 	// Set low reset vector before attempting any loads
+@@ -689,19 +696,38 @@ Lkernelcache_base_found:
+ 
+ #if defined(SWEET)
+ 	/*
+-	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+-	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+-	 * create_bootstrap_mapping would replace the RAM L2 table.
+-	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+-	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
++	 * Splash framebuffer: map every 32MB Normal-NC block covering Video in the
++	 * EXISTING V=P L2 table (L1 index 0, <4GB). Framebuffers like begonia's
++	 * 0x7d9b0000..0x7e360000 cross a 32MB boundary and need two L2 slots.
+ 	 */
+-	MOV64	x10, 0x9c000000
++	ldr		x10, [x20, #40]
++	cbz		x10, Lsweet_skip_fb_map
++	ldr		x11, [x20, #56]
++	ldr		x12, [x20, #72]
++	mul		x11, x11, x12
++	cbz		x11, Lsweet_skip_fb_map
++	add		x14, x10, x11
++	sub		x14, x14, #1
++	lsr		x10, x10, #(ARM_TT_L2_SHIFT)
++	lsl		x10, x10, #(ARM_TT_L2_SHIFT)
++	lsr		x14, x14, #(ARM_TT_L2_SHIFT)
++	lsl		x14, x14, #(ARM_TT_L2_SHIFT)
++Lsweet_fb_map_loop:
++	lsr		x9, x10, #32
++	cbnz	x9, Lsweet_skip_fb_map
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++	cmp		x10, x14
++	b.eq	Lsweet_skip_fb_map
++	mov		x9, #1
++	lsl		x9, x9, #(ARM_TT_L2_SHIFT)
++	add		x10, x10, x9
++	b		Lsweet_fb_map_loop
++Lsweet_skip_fb_map:
+ #endif
+ 
+ 	/* Ensure TTEs are visible */
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 7dcca46..2c20cc3 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -18,7 +18,7 @@
+  * 0x9d400000 1080x2246); sweet_early_set_video picks it from boot_args.
+  */
+ #define EARLY_BLOCK_PA 0x9c000000ull
+-#define EARLY_BLOCK_SIZE 0x2000000ull
++#define EARLY_BLOCK_SIZE 0x4000000ull
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)EARLY_BLOCK_PA;
+ static unsigned int early_width = 1080u, early_height = 2400u, early_stride = 4320u / 4;
+ static uint64_t early_off;
+@@ -200,11 +200,14 @@ sweet_early_flush_log(void)
+ void
+ sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes)
+ {
+-	if (pa < EARLY_BLOCK_PA || width == 0 || height <= 32 || rowbytes < width * 4 ||
+-	    pa + height * rowbytes > EARLY_BLOCK_PA + EARLY_BLOCK_SIZE) {
++	if (pa == 0 || width == 0 || height <= 32 || rowbytes < width * 4) {
+ 		return; /* keep the sweet default */
+ 	}
+-	early_off = pa - EARLY_BLOCK_PA;
++	uint64_t block = pa & ~0x1ffffffull;
++	if (pa + height * rowbytes > block + EARLY_BLOCK_SIZE) {
++		return;
++	}
++	early_off = pa - block;
+ 	early_width = (unsigned int)width;
+ 	early_height = (unsigned int)height;
+ 	early_stride = (unsigned int)(rowbytes / 4);
