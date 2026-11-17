@@ -1,0 +1,2329 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index ea5a65a..0d3f12b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -119,6 +119,10 @@ bsd/dev/sweet_smmu.c			standard
+ bsd/dev/sweet_fb.c			standard
+ bsd/dev/sweet_a630.c			standard
+ bsd/dev/sweet_a630_pas.c			standard
++bsd/dev/begonia_keys.c			standard
++bsd/dev/begonia_touch.c			standard
++bsd/dev/begonia_mali.c			standard
++bsd/dev/begonia_mali_mmu.c		standard
+ bsd/dev/beryllium_wlan.c		standard
+ bsd/dev/beryllium_bt_hci.c		standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/begonia_drivers.h b/bsd/dev/begonia_drivers.h
+new file mode 100644
+index 0000000..0e94ba8
+--- /dev/null
++++ b/bsd/dev/begonia_drivers.h
+@@ -0,0 +1,51 @@
++/*
++ * Internal driver interfaces for Redmi Note 8 Pro (begonia / MT6785).
++ */
++#ifndef _BEGONIA_DRIVERS_H_
++#define _BEGONIA_DRIVERS_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <mach/vm_types.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++void begonia_platform_hw_init(void);
++void begonia_keys_init(void);
++void begonia_touch_init(void);
++void begonia_mali_init(void);
++
++bool begonia_pmic_read(uint32_t reg, uint32_t *val);
++bool begonia_pmic_write(uint32_t reg, uint32_t val);
++
++bool begonia_mali_ready(void);
++uint32_t begonia_mali_gpu_id(void);
++uint32_t begonia_mali_va_bits(void);
++bool begonia_mali_param(uint32_t which, uint64_t *value);
++uint64_t begonia_mali_va_alloc(uint64_t size);
++void begonia_mali_va_free(uint64_t gpu_va, uint64_t size);
++bool begonia_mali_map_page(uint64_t gpu_va, uint64_t phys, bool readonly);
++void begonia_mali_unmap_range(uint64_t gpu_va, uint64_t size);
++void begonia_mali_mmu_flush(void);
++uint64_t begonia_mali_submit(uint64_t jc_va, bool fragment);
++bool begonia_mali_wait(uint64_t seq, uint64_t timeout_ns);
++void begonia_mali_note_client(int delta);
++void begonia_mali_note_buffer(uint64_t addr, uint64_t size);
++
++void begonia_mali_mmu_init(vm_offset_t mali_regs, uint32_t va_bits);
++uint64_t begonia_mali_mmu_root_pa(void);
++uint32_t begonia_mali_mmu_transcfg(void);
++bool begonia_mali_mmu_map_unlocked(uint64_t gpu_va, uint64_t phys, bool readonly);
++void begonia_mali_mmu_unmap_unlocked(uint64_t gpu_va, uint64_t size);
++void begonia_mali_mmu_as0_set(vm_offset_t mali_regs, uint64_t transtab, uint32_t transcfg);
++void begonia_mali_mmu_flush_unlocked(vm_offset_t mali_regs);
++
++void SweetMaliPublish(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _BEGONIA_DRIVERS_H_ */
+diff --git a/bsd/dev/begonia_keys.c b/bsd/dev/begonia_keys.c
+new file mode 100644
+index 0000000..70e5b2c
+--- /dev/null
++++ b/bsd/dev/begonia_keys.c
+@@ -0,0 +1,218 @@
++/*
++ * Polled physical keys & MT6359 PMIC wrapper (WACS2) for Redmi Note 8 Pro (begonia / MT6785).
++ *   Volume Up / Down: MT6785 keypad controller kp@10010000 (KP_MEM1 bits 0..1, active-low)
++ *   Power key:        MT6359 PMIC TOPSTATUS (0x2a) bit 1 via pwrap@1000d000 (active-low)
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <libkern/libkern.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_board.h"
++#include "begonia_drivers.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_key(int key, int down);
++
++#define BEGONIA_KPD_PHYS        0x10010000u
++#define BEGONIA_KP_MEM1         0x0004u
++
++#define BEGONIA_PWRAP_PHYS      0x1000d000u
++#define PWRAP_WACS2_CMD         0x0c20u
++#define PWRAP_WACS2_RDATA       0x0c24u
++#define PWRAP_WACS2_VLDCLR      0x0c28u
++#define PWRAP_FSM(r)            (((r) >> 16) & 7u)
++#define PWRAP_FSM_IDLE          0u
++#define PWRAP_FSM_WFVLDCLR      6u
++
++#define MT6359_TOPSTATUS        0x002au
++#define MT6359_PWRKEY_DEB_BIT   (1u << 1)
++
++static LCK_GRP_DECLARE(begonia_pwrap_grp, "begonia-pwrap");
++static LCK_MTX_DECLARE(begonia_pwrap_mtx, &begonia_pwrap_grp);
++
++static vm_offset_t kpd_base;
++static vm_offset_t pwrap_base;
++static bool keys_started;
++static int keys_sleep_chan;
++static int keys_log;
++
++static inline uint32_t
++mm_rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++mm_wr32(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++}
++
++static bool
++pwrap_ensure_mapped(void)
++{
++	if (pwrap_base == 0) {
++		pwrap_base = ml_io_map(BEGONIA_PWRAP_PHYS, 0x1000u);
++	}
++	return pwrap_base != 0;
++}
++
++static bool
++pwrap_wait_fsm(uint32_t state)
++{
++	for (uint32_t spin = 0; spin < 100000u; spin++) {
++		if (PWRAP_FSM(mm_rd32(pwrap_base, PWRAP_WACS2_RDATA)) == state) {
++			return true;
++		}
++	}
++	return false;
++}
++
++bool
++begonia_pmic_read(uint32_t reg, uint32_t *val)
++{
++	bool ok = false;
++
++	if (val == NULL) {
++		return false;
++	}
++	lck_mtx_lock(&begonia_pwrap_mtx);
++	if (pwrap_ensure_mapped() && pwrap_wait_fsm(PWRAP_FSM_IDLE)) {
++		mm_wr32(pwrap_base, PWRAP_WACS2_CMD, ((reg >> 1) & 0x7fffu) << 16);
++		if (pwrap_wait_fsm(PWRAP_FSM_WFVLDCLR)) {
++			*val = mm_rd32(pwrap_base, PWRAP_WACS2_RDATA) & 0xffffu;
++			mm_wr32(pwrap_base, PWRAP_WACS2_VLDCLR, 1u);
++			ok = true;
++		}
++	}
++	lck_mtx_unlock(&begonia_pwrap_mtx);
++	return ok;
++}
++
++bool
++begonia_pmic_write(uint32_t reg, uint32_t val)
++{
++	bool ok = false;
++
++	lck_mtx_lock(&begonia_pwrap_mtx);
++	if (pwrap_ensure_mapped() && pwrap_wait_fsm(PWRAP_FSM_IDLE)) {
++		uint32_t cmd = (1u << 31) | (((reg >> 1) & 0x7fffu) << 16) | (val & 0xffffu);
++		mm_wr32(pwrap_base, PWRAP_WACS2_CMD, cmd);
++		ok = pwrap_wait_fsm(PWRAP_FSM_IDLE);
++	}
++	lck_mtx_unlock(&begonia_pwrap_mtx);
++	return ok;
++}
++
++static void
++keys_sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&keys_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++begonia_keys_thread(__unused void *arg, __unused wait_result_t result)
++{
++	static const char *names[3] = { "power", "volup", "voldown" };
++	int stable[3] = { 0, 0, 0 };
++	int prev_raw[3] = { 0, 0, 0 };
++	uint32_t pmic_errs = 0;
++
++	for (;;) {
++		uint32_t kmem = mm_rd32(kpd_base, BEGONIA_KP_MEM1);
++		uint32_t top = 0;
++		bool pok = begonia_pmic_read(MT6359_TOPSTATUS, &top);
++		int raw[3];
++
++		raw[0] = pok ? ((top & MT6359_PWRKEY_DEB_BIT) == 0 ? 1 : 0) : stable[0];
++		raw[1] = (kmem & (1u << 0)) == 0 ? 1 : 0;
++		raw[2] = (kmem & (1u << 1)) == 0 ? 1 : 0;
++
++		if (!pok && (pmic_errs++ % 250u) == 0) {
++			printf("BEGONIA KEYS: PMIC TOPSTATUS read failed
++");
++		} else if (pok) {
++			pmic_errs = 0;
++		}
++
++		for (int k = 0; k < 3; k++) {
++			if (raw[k] == prev_raw[k] && raw[k] != stable[k]) {
++				stable[k] = raw[k];
++				if (keys_log) {
++					printf("BEGONIA KEYS: %s %s (kmem=%#x top=%#x)
++",
++					    names[k], stable[k] ? "down" : "up", kmem, top);
++				}
++				sweet_hid_key(k, stable[k]);
++			}
++			prev_raw[k] = raw[k];
++		}
++		keys_sleep_ms(20u);
++	}
++}
++
++void
++begonia_keys_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++
++	if (keys_started || !sweet_board_begonia()) {
++		return;
++	}
++	keys_started = true;
++	(void)PE_parse_boot_argn("begoniakeys", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("begoniakeylog", &keys_log, sizeof(keys_log));
++	if (!enabled) {
++		printf("BEGONIA KEYS: disabled (begoniakeys=0)
++");
++		return;
++	}
++	kpd_base = ml_io_map(BEGONIA_KPD_PHYS, 0x1000u);
++	if (kpd_base == 0 || !pwrap_ensure_mapped()) {
++		printf("BEGONIA KEYS: ml_io_map failed (kpd=%#lx pwrap=%#lx)
++",
++		    (unsigned long)kpd_base, (unsigned long)pwrap_base);
++		return;
++	}
++	uint32_t top = 0;
++	bool pok = begonia_pmic_read(MT6359_TOPSTATUS, &top);
++	printf("BEGONIA KEYS: kp@%#x kmem1=%#x pwrap@%#x topstatus=%#x (ok=%d)
++",
++	    BEGONIA_KPD_PHYS, mm_rd32(kpd_base, BEGONIA_KP_MEM1),
++	    BEGONIA_PWRAP_PHYS, top, pok ? 1 : 0);
++
++	if (kernel_thread_start(begonia_keys_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("BEGONIA KEYS: kernel_thread_start failed
++");
++	}
++}
++
++void
++begonia_platform_hw_init(void)
++{
++	static bool hw_started;
++
++	if (hw_started || !sweet_board_begonia()) {
++		return;
++	}
++	hw_started = true;
++	begonia_keys_init();
++	begonia_touch_init();
++	begonia_mali_init();
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
+new file mode 100644
+index 0000000..893d5ad
+--- /dev/null
++++ b/bsd/dev/begonia_mali.c
+@@ -0,0 +1,492 @@
++/*
++ * ARM Mali-G76 MC4 (r0p0, 0x7211 @ 0x13040000) driver for Redmi Note 8 Pro (begonia / MT6785).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <libkern/libkern.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
++#include <pexpert/pexpert.h>
++#include "sweet_board.h"
++#include "begonia_drivers.h"
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define TOPCKGEN_PA             0x10000000u
++#define INFRACFG_PA             0x10001000u
++#define SPM_PA                  0x10006000u
++#define APMIXED_PA              0x1000c000u
++#define MFGCFG_PA               0x13fbf000u
++#define MALI_PA                 0x13040000u
++
++#define MT6359_VPU_CON0         0x1488u
++#define MT6359_VPU_ELR0         0x14acu
++#define MT6359_VGPU11_CON0      0x1588u
++#define MT6359_VGPU11_DBG1      0x15a8u
++#define MT6359_VGPU11_ELR0      0x15acu
++
++#define MFGPLL_CON0             0x0250u
++#define MFGPLL_CON1             0x0254u
++#define MFGPLL_PWR_CON0         0x025cu
++#define CLK_CFG_UPDATE          0x0004u
++#define CK_CFG_3_SET            0x0054u
++#define CK_CFG_3_CLR            0x0058u
++
++#define PWR_STATUS              0x0160u
++#define PWR_STATUS_2ND          0x0164u
++#define PWR_RST_B               (1u << 0)
++#define PWR_ISO                 (1u << 1)
++#define PWR_ON                  (1u << 2)
++#define PWR_ON_2ND              (1u << 3)
++#define PWR_CLK_DIS             (1u << 4)
++#define INFRA_PROT_CLR          0x02a4u
++#define INFRA_PROT_1_CLR        0x02acu
++#define MFG1_PROT_STEP2_MASK    ((1u << 21) | (1u << 22))
++#define MFG1_PROT_STEP1_MASK    ((1u << 19) | (1u << 20) | (1u << 21))
++#define MFG_CG_CLR              0x0008u
++
++#define GPU_ID                  0x000u
++#define GPU_L2_FEATURES         0x004u
++#define GPU_CORE_FEATURES       0x008u
++#define GPU_TILER_FEATURES      0x00cu
++#define GPU_MEM_FEATURES        0x010u
++#define GPU_MMU_FEATURES        0x014u
++#define GPU_AS_PRESENT          0x018u
++#define GPU_JS_PRESENT          0x01cu
++#define GPU_INT_RAWSTAT         0x020u
++#define GPU_INT_CLEAR           0x024u
++#define GPU_INT_MASK            0x028u
++#define GPU_CMD                 0x030u
++#define GPU_AFBC_FEATURES       0x04cu
++#define GPU_THREAD_MAX_THREADS  0x0a0u
++#define GPU_THREAD_MAX_WG_SIZE  0x0a4u
++#define GPU_THREAD_MAX_BARRIER  0x0a8u
++#define GPU_THREAD_FEATURES     0x0acu
++#define GPU_TEX_FEATURES(n)     (0x0b0u + (n) * 4u)
++#define GPU_JS_FEATURES(n)      (0x0c0u + (n) * 4u)
++#define SHADER_PRESENT_LO       0x100u
++#define TILER_PRESENT_LO        0x110u
++#define L2_PRESENT_LO           0x120u
++#define SHADER_READY_LO         0x140u
++#define TILER_READY_LO          0x150u
++#define L2_READY_LO             0x160u
++#define SHADER_PWRON_LO         0x180u
++#define TILER_PWRON_LO          0x190u
++#define L2_PWRON_LO             0x1a0u
++#define COHERENCY_FEATURES      0x300u
++#define GPU_THREAD_TLS_ALLOC    0x310u
++#define STACK_PRESENT_LO        0xe00u
++
++#define JOB_INT_RAWSTAT         0x1000u
++#define JOB_INT_CLEAR           0x1004u
++#define JOB_INT_MASK            0x1008u
++#define JS_SLOT(n)              (0x1800u + (n) * 0x80u)
++#define JS_HEAD_NEXT_LO         0x40u
++#define JS_HEAD_NEXT_HI         0x44u
++#define JS_AFFINITY_NEXT_LO     0x50u
++#define JS_AFFINITY_NEXT_HI     0x54u
++#define JS_CONFIG_NEXT          0x58u
++#define JS_COMMAND_NEXT         0x60u
++#define JS_CONFIG_VAL           ((3u << 8) | (1u << 10) | (3u << 12) | (8u << 16))
++#define JS_CONFIG_IDENT         ((3u << 8) | (3u << 12) | (8u << 16))
++#define AS0                     0x2400u
++#define AS_FAULTSTATUS          0x1cu
++
++SYSCTL_NODE(_kern, OID_AUTO, begonia, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "Redmi Note 8 Pro (begonia) drivers");
++
++static vm_offset_t topck, infra, spm, apmixed, mfgcfg, mali;
++static LCK_GRP_DECLARE(mali_grp, "begonia-mali");
++static LCK_MTX_DECLARE(mali_mtx, &mali_grp);
++
++static uint32_t g_stage, g_gpu_id, g_shader_mask, g_tiler_mask, g_l2_mask, g_va_bits, g_freq_khz;
++static uint32_t g_clients, g_buffers, g_submits, g_faults;
++static uint64_t g_seq, g_done_seq;
++static bool g_started, g_ready;
++
++SYSCTL_UINT(_kern_begonia, OID_AUTO, mali, CTLFLAG_RD | CTLFLAG_LOCKED, &g_stage, 0, "Mali-G76 bringup stage (0..6)");
++SYSCTL_UINT(_kern_begonia, OID_AUTO, mali_id, CTLFLAG_RD | CTLFLAG_LOCKED, &g_gpu_id, 0, "Mali GPU_ID");
++SYSCTL_UINT(_kern_begonia, OID_AUTO, mali_shaders, CTLFLAG_RD | CTLFLAG_LOCKED, &g_shader_mask, 0, "Mali shader core mask");
++SYSCTL_UINT(_kern_begonia, OID_AUTO, mali_va_bits, CTLFLAG_RD | CTLFLAG_LOCKED, &g_va_bits, 0, "Mali MMU VA bits");
++SYSCTL_UINT(_kern_begonia, OID_AUTO, mali_freq_khz, CTLFLAG_RD | CTLFLAG_LOCKED, &g_freq_khz, 0, "Mali MFGPLL KHz");
++SYSCTL_UINT(_kern_begonia, OID_AUTO, mali_clients, CTLFLAG_RD | CTLFLAG_LOCKED, &g_clients, 0, "Open SweetMali clients");
++SYSCTL_UINT(_kern_begonia, OID_AUTO, mali_buffers, CTLFLAG_RD | CTLFLAG_LOCKED, &g_buffers, 0, "Mapped Mali BOs");
++SYSCTL_UINT(_kern_begonia, OID_AUTO, mali_submits, CTLFLAG_RD | CTLFLAG_LOCKED, &g_submits, 0, "Submitted Mali jobs");
++SYSCTL_UINT(_kern_begonia, OID_AUTO, mali_faults, CTLFLAG_RD | CTLFLAG_LOCKED, &g_faults, 0, "Mali MMU/job faults");
++
++static inline uint32_t
++rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++wr32(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++}
++
++static bool
++wait_mask(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, uint32_t ms)
++{
++	for (uint32_t us = 0; us < ms * 1000u; us += 10u) {
++		if ((rd32(base, off) & mask) == want) {
++			return true;
++		}
++		delay(10);
++	}
++	return (rd32(base, off) & mask) == want;
++}
++
++static bool
++power_pmic_rails(void)
++{
++	uint32_t vpu_elr = 0, vgpu_elr = 0, vpu_con = 0, vgpu_con = 0, dbg1 = 0;
++
++	if (!begonia_pmic_read(MT6359_VPU_ELR0, &vpu_elr) ||
++	    !begonia_pmic_read(MT6359_VPU_CON0, &vpu_con) ||
++	    !begonia_pmic_read(MT6359_VGPU11_ELR0, &vgpu_elr) ||
++	    !begonia_pmic_read(MT6359_VGPU11_CON0, &vgpu_con)) {
++		return false;
++	}
++	if (!begonia_pmic_write(MT6359_VPU_ELR0, (vpu_elr & ~0x7fu) | 0x48u) ||
++	    !begonia_pmic_write(MT6359_VPU_CON0, vpu_con | 1u)) {
++		return false;
++	}
++	delay(250);
++	if (!begonia_pmic_write(MT6359_VGPU11_ELR0, (vgpu_elr & ~0x7fu) | 0x30u) ||
++	    !begonia_pmic_write(MT6359_VGPU11_CON0, vgpu_con | 1u)) {
++		return false;
++	}
++	delay(300);
++	(void)begonia_pmic_read(MT6359_VGPU11_DBG1, &dbg1);
++	printf("BEGONIA MALI: PMIC VSRAM_GPU=850mV VGPU=700mV DBG1=%#x
++", dbg1);
++	return true;
++}
++
++static void
++setup_clocks(void)
++{
++	uint32_t con0, con1, dds;
++
++	wr32(topck, CK_CFG_3_CLR, 0xffu << 16);
++	wr32(topck, CK_CFG_3_SET, 3u << 16);
++	wr32(topck, CLK_CFG_UPDATE, 1u << 14);
++	delay(10);
++
++	con0 = rd32(apmixed, MFGPLL_CON0);
++	if ((con0 & 1u) == 0u) {
++		wr32(apmixed, MFGPLL_PWR_CON0, rd32(apmixed, MFGPLL_PWR_CON0) | 1u);
++		delay(10);
++		wr32(apmixed, MFGPLL_PWR_CON0, rd32(apmixed, MFGPLL_PWR_CON0) & ~(1u << 1));
++		delay(5);
++		dds = (uint32_t)(((545ull * 4ull) << 14) / 26ull) & 0x3fffffu;
++		wr32(apmixed, MFGPLL_CON1, (1u << 31) | (2u << 24) | dds);
++		delay(20);
++		wr32(apmixed, MFGPLL_CON0, rd32(apmixed, MFGPLL_CON0) | 1u);
++		delay(40);
++	}
++	con1 = rd32(apmixed, MFGPLL_CON1);
++	g_freq_khz = (uint32_t)((((uint64_t)(con1 & 0x3fffffu) * 26000ull) >> 14) /
++	    (1ull << ((con1 >> 24) & 7u)));
++
++	wr32(topck, CK_CFG_3_CLR, 0xffu << 16);
++	wr32(topck, CK_CFG_3_SET, 1u << 16);
++	wr32(topck, CLK_CFG_UPDATE, 1u << 14);
++	delay(10);
++}
++
++static bool
++mtcmos_on(uint32_t con_off, uint32_t sta_mask, uint32_t sram_bits, uint32_t sram_ack, bool is_mfg1)
++{
++	wr32(spm, con_off, rd32(spm, con_off) | PWR_ON);
++	wr32(spm, con_off, rd32(spm, con_off) | PWR_ON_2ND);
++	if (!wait_mask(spm, PWR_STATUS, sta_mask, sta_mask, 20) ||
++	    !wait_mask(spm, PWR_STATUS_2ND, sta_mask, sta_mask, 20)) {
++		return false;
++	}
++	wr32(spm, con_off, rd32(spm, con_off) & ~PWR_CLK_DIS);
++	wr32(spm, con_off, rd32(spm, con_off) & ~PWR_ISO);
++	wr32(spm, con_off, rd32(spm, con_off) | PWR_RST_B);
++	if (is_mfg1) {
++		wr32(spm, con_off, rd32(spm, con_off) & ~(1u << 8));
++		if (!wait_mask(spm, con_off, 1u << 12, 0u, 20)) {
++			return false;
++		}
++		wr32(spm, con_off, rd32(spm, con_off) & ~(1u << 9));
++		if (!wait_mask(spm, con_off, 1u << 13, 0u, 20)) {
++			return false;
++		}
++		wr32(infra, INFRA_PROT_CLR, MFG1_PROT_STEP2_MASK);
++		wr32(infra, INFRA_PROT_1_CLR, MFG1_PROT_STEP1_MASK);
++	} else if (sram_bits != 0u) {
++		wr32(spm, con_off, rd32(spm, con_off) & ~sram_bits);
++		if (!wait_mask(spm, con_off, sram_ack, 0u, 20)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool
++run_selftest_job(vm_offset_t kva, uint64_t gpu_va, uint32_t magic, const char *tag)
++{
++	volatile uint32_t *job = (volatile uint32_t *)kva;
++	volatile uint32_t *dst = (volatile uint32_t *)(kva + 0x800u);
++	uint32_t js = JS_SLOT(1);
++
++	bzero((void *)kva, PAGE_SIZE);
++	job[4] = (2u << 1) | 1u | (1u << 16);
++	job[8] = (uint32_t)(gpu_va + 0x800u);
++	job[9] = (uint32_t)((gpu_va + 0x800u) >> 32);
++	job[10] = 6u;
++	job[12] = magic;
++	sweet_dma_sync_va((void *)kva, PAGE_SIZE);
++
++	wr32(mali, JOB_INT_MASK, 0u);
++	wr32(mali, JOB_INT_CLEAR, 0xffffffffu);
++	wr32(mali, js + JS_HEAD_NEXT_LO, (uint32_t)gpu_va);
++	wr32(mali, js + JS_HEAD_NEXT_HI, (uint32_t)(gpu_va >> 32));
++	wr32(mali, js + JS_AFFINITY_NEXT_LO, g_shader_mask);
++	wr32(mali, js + JS_AFFINITY_NEXT_HI, 0u);
++	wr32(mali, js + JS_CONFIG_NEXT, magic == 0xc0ffee01u ? JS_CONFIG_IDENT : JS_CONFIG_VAL);
++	wr32(mali, js + JS_COMMAND_NEXT, 1u);
++
++	(void)wait_mask(mali, JOB_INT_RAWSTAT, (1u << 1) | (1u << 17), 1u << 1, 100u);
++	sweet_dma_sync_va((void *)kva, PAGE_SIZE);
++	bool ok = (*dst == magic);
++	printf("BEGONIA MALI: selftest (%s) irq=%#x fault=%#x word=%#x (%s)
++",
++	    tag, rd32(mali, JOB_INT_RAWSTAT), rd32(mali, AS0 + AS_FAULTSTATUS),
++	    *dst, ok ? "PASS" : "FAIL");
++	wr32(mali, JOB_INT_CLEAR, 0xffffffffu);
++	return ok;
++}
++
++void
++begonia_mali_init(void)
++{
++	int enabled = 1;
++	vm_offset_t test_kva = 0;
++
++	if (g_started || !sweet_board_begonia()) {
++		return;
++	}
++	g_started = true;
++	(void)PE_parse_boot_argn("begoniamali", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("BEGONIA MALI: disabled (begoniamali=0)
++");
++		return;
++	}
++
++	topck = ml_io_map(TOPCKGEN_PA, 0x1000u);
++	infra = ml_io_map(INFRACFG_PA, 0x1000u);
++	spm = ml_io_map(SPM_PA, 0x1000u);
++	apmixed = ml_io_map(APMIXED_PA, 0x1000u);
++	mfgcfg = ml_io_map(MFGCFG_PA, 0x1000u);
++	mali = ml_io_map(MALI_PA, 0x10000u);
++	if (!topck || !infra || !spm || !apmixed || !mfgcfg || !mali) {
++		printf("BEGONIA MALI: ml_io_map failed
++");
++		return;
++	}
++	if (!power_pmic_rails()) {
++		printf("BEGONIA MALI: PMIC rail bringup failed
++");
++		return;
++	}
++	setup_clocks();
++	g_stage = 1;
++
++	if (!mtcmos_on(0x328u, 1u << 4, 0u, 0u, false) ||
++	    !mtcmos_on(0x32cu, 1u << 7, 0u, 0u, true) ||
++	    !mtcmos_on(0x330u, 1u << 20, 1u << 8, 1u << 12, false) ||
++	    !mtcmos_on(0x334u, 1u << 22, 1u << 8, 1u << 12, false) ||
++	    !mtcmos_on(0x338u, 1u << 23, 1u << 8, 1u << 12, false) ||
++	    !mtcmos_on(0x350u, 1u << 13, 1u << 8, 1u << 12, false)) {
++		printf("BEGONIA MALI: MFG MTCMOS failed
++");
++		return;
++	}
++	wr32(mfgcfg, MFG_CG_CLR, 1u);
++	delay(10);
++	g_stage = 2;
++
++	g_gpu_id = rd32(mali, GPU_ID);
++	if (g_gpu_id == 0u || g_gpu_id == 0xffffffffu) {
++		printf("BEGONIA MALI: bad GPU_ID=%#x
++", g_gpu_id);
++		return;
++	}
++	wr32(mali, GPU_INT_MASK, 0u);
++	wr32(mali, GPU_INT_CLEAR, 0xffffffffu);
++	wr32(mali, GPU_CMD, 1u);
++	(void)wait_mask(mali, GPU_INT_RAWSTAT, 1u << 8, 1u << 8, 50u);
++	wr32(mali, GPU_INT_CLEAR, 0xffffffffu);
++
++	g_l2_mask = rd32(mali, L2_PRESENT_LO);
++	g_tiler_mask = rd32(mali, TILER_PRESENT_LO);
++	g_shader_mask = rd32(mali, SHADER_PRESENT_LO);
++	g_va_bits = rd32(mali, GPU_MMU_FEATURES) & 0xffu;
++	if (g_va_bits < 33u || g_va_bits > 48u) {
++		g_va_bits = 48u;
++	}
++	begonia_mali_mmu_init(mali, g_va_bits);
++
++	wr32(mali, L2_PWRON_LO, g_l2_mask);
++	wr32(mali, TILER_PWRON_LO, g_tiler_mask);
++	wr32(mali, SHADER_PWRON_LO, g_shader_mask);
++	if (!wait_mask(mali, L2_READY_LO, g_l2_mask, g_l2_mask, 50u) ||
++	    !wait_mask(mali, TILER_READY_LO, g_tiler_mask, g_tiler_mask, 50u) ||
++	    !wait_mask(mali, SHADER_READY_LO, g_shader_mask, g_shader_mask, 50u)) {
++		printf("BEGONIA MALI: core power-on timeout
++");
++		return;
++	}
++	g_stage = 3;
++	printf("BEGONIA MALI: GPU_ID=%#x (%u MHz) shaders=%#x tiler=%#x l2=%#x va=%u
++",
++	    g_gpu_id, g_freq_khz / 1000u, g_shader_mask, g_tiler_mask, g_l2_mask, g_va_bits);
++
++	if (kmem_alloc_contig(kernel_map, &test_kva, PAGE_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return;
++	}
++	ppnum_t test_pn = pmap_find_phys(kernel_pmap, (addr64_t)test_kva);
++	uint64_t test_pa = ptoa_64(test_pn);
++	begonia_mali_mmu_as0_set(mali, 0ull, 2u);
++	if (!run_selftest_job(test_kva, test_pa, 0xc0ffee01u, "identity")) {
++		kmem_free(kernel_map, test_kva, PAGE_SIZE);
++		return;
++	}
++	g_stage = 4;
++
++	bool mapped = begonia_mali_map_page(0x00100000ull, test_pa, false);
++	if (mapped) {
++		begonia_mali_mmu_as0_set(mali, begonia_mali_mmu_root_pa(), begonia_mali_mmu_transcfg());
++		mapped = run_selftest_job(test_kva, 0x00100000ull, 0xc0ffee02u, "page-table");
++		begonia_mali_unmap_range(0x00100000ull, 4096ull);
++	}
++	kmem_free(kernel_map, test_kva, PAGE_SIZE);
++	if (!mapped) {
++		return;
++	}
++	g_stage = 5;
++	g_ready = true;
++	SweetMaliPublish();
++	g_stage = 6;
++}
++
++bool begonia_mali_ready(void) { return g_ready; }
++uint32_t begonia_mali_gpu_id(void) { return g_gpu_id; }
++uint32_t begonia_mali_va_bits(void) { return g_va_bits; }
++
++bool
++begonia_mali_param(uint32_t which, uint64_t *value)
++{
++	if (!g_ready || value == NULL) {
++		return false;
++	}
++	if (which >= 18u && which <= 21u) {
++		*value = rd32(mali, GPU_TEX_FEATURES(which - 18u));
++		return true;
++	}
++	if (which >= 22u && which <= 37u) {
++		*value = rd32(mali, GPU_JS_FEATURES(which - 22u));
++		return true;
++	}
++	switch (which) {
++	case 0: *value = g_gpu_id >> 16; return true;
++	case 1: *value = g_gpu_id & 0xffffu; return true;
++	case 2: *value = g_shader_mask; return true;
++	case 3: *value = g_tiler_mask; return true;
++	case 4: *value = g_l2_mask; return true;
++	case 5: *value = rd32(mali, STACK_PRESENT_LO); return true;
++	case 6: *value = rd32(mali, GPU_AS_PRESENT); return true;
++	case 7: *value = rd32(mali, GPU_JS_PRESENT); return true;
++	case 8: *value = rd32(mali, GPU_L2_FEATURES); return true;
++	case 9: *value = rd32(mali, GPU_CORE_FEATURES); return true;
++	case 10: *value = rd32(mali, GPU_TILER_FEATURES); return true;
++	case 11: *value = rd32(mali, GPU_MEM_FEATURES); return true;
++	case 12: *value = rd32(mali, GPU_MMU_FEATURES); return true;
++	case 13: *value = rd32(mali, GPU_THREAD_FEATURES); return true;
++	case 14: *value = rd32(mali, GPU_THREAD_MAX_THREADS); return true;
++	case 15: *value = rd32(mali, GPU_THREAD_MAX_WG_SIZE); return true;
++	case 16: *value = rd32(mali, GPU_THREAD_MAX_BARRIER); return true;
++	case 17: *value = rd32(mali, COHERENCY_FEATURES); return true;
++	case 38: *value = 1u; return true;
++	case 39: *value = rd32(mali, GPU_THREAD_TLS_ALLOC); return true;
++	case 40: *value = rd32(mali, GPU_AFBC_FEATURES); return true;
++	default: return false;
++	}
++}
++
++uint64_t
++begonia_mali_submit(uint64_t jc_va, bool fragment)
++{
++	uint32_t slot = fragment ? 0u : 1u;
++	uint32_t js = JS_SLOT(slot);
++	uint64_t seq;
++
++	if (!g_ready || jc_va == 0u) {
++		return 0u;
++	}
++	lck_mtx_lock(&mali_mtx);
++	g_submits++;
++	seq = ++g_seq;
++	uint32_t irqm = (1u << slot) | (1u << (slot + 16u));
++	wr32(mali, JOB_INT_CLEAR, irqm);
++	(void)wait_mask(mali, js + JS_COMMAND_NEXT, 1u, 0u, 50u);
++	wr32(mali, js + JS_HEAD_NEXT_LO, (uint32_t)jc_va);
++	wr32(mali, js + JS_HEAD_NEXT_HI, (uint32_t)(jc_va >> 32));
++	wr32(mali, js + JS_AFFINITY_NEXT_LO, g_shader_mask);
++	wr32(mali, js + JS_AFFINITY_NEXT_HI, 0u);
++	wr32(mali, js + JS_CONFIG_NEXT, JS_CONFIG_VAL);
++	wr32(mali, js + JS_COMMAND_NEXT, 1u);
++
++	if (!wait_mask(mali, JOB_INT_RAWSTAT, irqm, 1u << slot, 500u)) {
++		g_faults++;
++	}
++	wr32(mali, JOB_INT_CLEAR, irqm);
++	g_done_seq = seq;
++	lck_mtx_unlock(&mali_mtx);
++	return seq;
++}
++
++bool
++begonia_mali_wait(uint64_t seq, __unused uint64_t timeout_ns)
++{
++	return seq <= g_done_seq;
++}
++
++void
++begonia_mali_note_client(int delta)
++{
++	if (delta > 0) {
++		(void)__atomic_add_fetch(&g_clients, 1u, __ATOMIC_RELAXED);
++	} else if (delta < 0) {
++		uint32_t cur = __atomic_load_n(&g_clients, __ATOMIC_RELAXED);
++		if (cur > 0u) {
++			(void)__atomic_sub_fetch(&g_clients, 1u, __ATOMIC_RELAXED);
++		}
++	}
++}
++
++void
++begonia_mali_note_buffer(__unused uint64_t addr, __unused uint64_t size)
++{
++	(void)__atomic_add_fetch(&g_buffers, 1u, __ATOMIC_RELAXED);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/begonia_mali_mmu.c b/bsd/dev/begonia_mali_mmu.c
+new file mode 100644
+index 0000000..d61f22c
+--- /dev/null
++++ b/bsd/dev/begonia_mali_mmu.c
+@@ -0,0 +1,336 @@
++/*
++ * Mali-G76 AArch64 Stage-1 4K GPU MMU & VA allocator for begonia (MT6785).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <libkern/libkern.h>
++#include <kern/locks.h>
++#include <mach/vm_param.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
++#include "sweet_board.h"
++#include "begonia_drivers.h"
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++#define AS0                     0x2400u
++#define AS_TRANSTAB_LO          0x00u
++#define AS_TRANSTAB_HI          0x04u
++#define AS_MEMATTR_LO           0x08u
++#define AS_MEMATTR_HI           0x0cu
++#define AS_COMMAND              0x18u
++#define AS_STATUS               0x28u
++#define AS_TRANSCFG_LO          0x30u
++#define AS_TRANSCFG_HI          0x34u
++
++#define PTE_TABLE               3ull
++#define PTE_PAGE                3ull
++#define PTE_AF                  (1ull << 10)
++#define PTE_SH_INNER            (3ull << 8)
++#define PTE_AP_RW               (1ull << 6)
++#define PTE_AP_RO               (3ull << 6)
++#define PTE_ADDR_MASK           0x0000fffffffff000ull
++
++#define MALI_VA_BASE            0x10000000ull
++#define MALI_VA_LIMIT           0x0800000000ull
++#define MALI_FREE_SLOTS         256u
++#define PT_HASH_BUCKETS         1024u
++
++struct pt_rec {
++	uint64_t pa;
++	uint64_t *va;
++	struct pt_rec *next;
++};
++
++struct va_free_slot {
++	uint64_t addr;
++	uint64_t size;
++};
++
++static LCK_GRP_DECLARE(mali_mmu_grp, "begonia-mali-mmu");
++static LCK_MTX_DECLARE(mali_mmu_mtx, &mali_mmu_grp);
++
++static vm_offset_t g_mali_regs;
++static uint32_t g_mmu_va_bits = 48u;
++static vm_offset_t g_pt_slab_va, g_meta_slab_va;
++static uint64_t g_pt_slab_pa, g_pt_root_pa, *g_pt_root_va;
++static uint32_t g_pt_slab_off = PAGE_SIZE, g_meta_slab_off = PAGE_SIZE;
++static struct pt_rec *g_pt_hash[PT_HASH_BUCKETS];
++static uint64_t g_va_cursor = MALI_VA_BASE;
++static struct va_free_slot g_va_free[MALI_FREE_SLOTS];
++
++static inline uint32_t
++mmu_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(g_mali_regs + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++mmu_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(g_mali_regs + off) = v;
++}
++
++static void
++mmu_wait_idle(void)
++{
++	for (uint32_t us = 0; us < 50000u; us += 10u) {
++		if ((mmu_rd(AS0 + AS_STATUS) & 1u) == 0u) {
++			return;
++		}
++		delay(10);
++	}
++}
++
++static void *
++meta_alloc(size_t sz)
++{
++	sz = (sz + 7u) & ~7u;
++	if (g_meta_slab_off + sz > PAGE_SIZE) {
++		vm_offset_t pg = 0;
++		if (kmem_alloc_contig(kernel_map, &pg, PAGE_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			return NULL;
++		}
++		g_meta_slab_va = pg;
++		g_meta_slab_off = 0;
++	}
++	void *p = (void *)(g_meta_slab_va + g_meta_slab_off);
++	g_meta_slab_off += (uint32_t)sz;
++	return p;
++}
++
++static uint64_t *
++pt_alloc_4k(uint64_t *pa_out)
++{
++	if (g_pt_slab_off + 4096u > PAGE_SIZE) {
++		vm_offset_t pg = 0;
++		if (kmem_alloc_contig(kernel_map, &pg, PAGE_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			return NULL;
++		}
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)pg);
++		if (pn == 0) {
++			return NULL;
++		}
++		g_pt_slab_va = pg;
++		g_pt_slab_pa = ptoa_64(pn);
++		g_pt_slab_off = 0;
++	}
++	uint64_t *va = (uint64_t *)(g_pt_slab_va + g_pt_slab_off);
++	uint64_t pa = g_pt_slab_pa + g_pt_slab_off;
++	struct pt_rec *r = (struct pt_rec *)meta_alloc(sizeof(*r));
++	if (r == NULL) {
++		return NULL;
++	}
++	g_pt_slab_off += 4096u;
++	sweet_dma_sync_va(va, 4096u);
++	r->pa = pa;
++	r->va = va;
++	uint32_t b = (uint32_t)((pa >> 12) % PT_HASH_BUCKETS);
++	r->next = g_pt_hash[b];
++	g_pt_hash[b] = r;
++	*pa_out = pa;
++	return va;
++}
++
++static uint64_t *
++pt_find_va(uint64_t pa)
++{
++	pa &= PTE_ADDR_MASK;
++	for (struct pt_rec *r = g_pt_hash[(pa >> 12) % PT_HASH_BUCKETS]; r != NULL; r = r->next) {
++		if (r->pa == pa) {
++			return r->va;
++		}
++	}
++	return NULL;
++}
++
++static uint64_t *
++pt_walk_next(uint64_t *entry)
++{
++	uint64_t phys = 0;
++	uint64_t *child;
++
++	if (*entry & 1ull) {
++		return pt_find_va(*entry);
++	}
++	child = pt_alloc_4k(&phys);
++	if (child == NULL) {
++		return NULL;
++	}
++	*entry = phys | PTE_TABLE;
++	sweet_dma_sync_va(entry, sizeof(*entry));
++	return child;
++}
++
++void
++begonia_mali_mmu_init(vm_offset_t mali_regs, uint32_t va_bits)
++{
++	g_mali_regs = mali_regs;
++	g_mmu_va_bits = va_bits;
++}
++
++uint64_t begonia_mali_mmu_root_pa(void) { return g_pt_root_pa; }
++
++uint32_t
++begonia_mali_mmu_transcfg(void)
++{
++	uint32_t ina = (g_mmu_va_bits <= 55u) ? (55u - g_mmu_va_bits) : 7u;
++	return 6u | (ina << 6) | (1u << 24);
++}
++
++void
++begonia_mali_mmu_as0_set(vm_offset_t mali_regs, uint64_t transtab, uint32_t transcfg)
++{
++	g_mali_regs = mali_regs;
++	mmu_wr(AS0 + AS_TRANSTAB_LO, (uint32_t)transtab);
++	mmu_wr(AS0 + AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
++	mmu_wr(AS0 + AS_TRANSCFG_LO, transcfg);
++	mmu_wr(AS0 + AS_TRANSCFG_HI, 0u);
++	mmu_wr(AS0 + AS_MEMATTR_LO, 0x88888888u);
++	mmu_wr(AS0 + AS_MEMATTR_HI, 0x88888888u);
++	mmu_wr(AS0 + AS_COMMAND, 1u);
++	mmu_wait_idle();
++}
++
++void
++begonia_mali_mmu_flush_unlocked(__unused vm_offset_t mali_regs)
++{
++	mmu_wr(AS0 + AS_COMMAND, 3u);
++	mmu_wait_idle();
++}
++
++bool
++begonia_mali_mmu_map_unlocked(uint64_t gpu_va, uint64_t phys, bool readonly)
++{
++	uint64_t *tbl = g_pt_root_va;
++
++	if (tbl == NULL) {
++		g_pt_root_va = pt_alloc_4k(&g_pt_root_pa);
++		tbl = g_pt_root_va;
++		if (tbl == NULL) {
++			return false;
++		}
++	}
++	if (g_mmu_va_bits > 39u) {
++		if ((tbl = pt_walk_next(&tbl[(gpu_va >> 39) & 0x1ffu])) == NULL) {
++			return false;
++		}
++	}
++	if ((tbl = pt_walk_next(&tbl[(gpu_va >> 30) & 0x1ffu])) == NULL ||
++	    (tbl = pt_walk_next(&tbl[(gpu_va >> 21) & 0x1ffu])) == NULL) {
++		return false;
++	}
++	uint64_t *leaf = &tbl[(gpu_va >> 12) & 0x1ffu];
++	*leaf = (phys & PTE_ADDR_MASK) | PTE_AF | PTE_SH_INNER |
++	    (readonly ? PTE_AP_RO : PTE_AP_RW) | PTE_PAGE;
++	sweet_dma_sync_va(leaf, sizeof(*leaf));
++	return true;
++}
++
++void
++begonia_mali_mmu_unmap_unlocked(uint64_t gpu_va, uint64_t size)
++{
++	for (uint64_t off = 0; off < size; off += 4096ull) {
++		uint64_t va = gpu_va + off;
++		uint64_t *tbl = g_pt_root_va;
++		if (tbl == NULL) {
++			break;
++		}
++		if (g_mmu_va_bits > 39u) {
++			uint64_t e0 = tbl[(va >> 39) & 0x1ffu];
++			if ((e0 & 1ull) == 0u || (tbl = pt_find_va(e0)) == NULL) {
++				continue;
++			}
++		}
++		uint64_t e1 = tbl[(va >> 30) & 0x1ffu];
++		if ((e1 & 1ull) == 0u || (tbl = pt_find_va(e1)) == NULL) {
++			continue;
++		}
++		uint64_t e2 = tbl[(va >> 21) & 0x1ffu];
++		if ((e2 & 1ull) == 0u || (tbl = pt_find_va(e2)) == NULL) {
++			continue;
++		}
++		uint64_t *leaf = &tbl[(va >> 12) & 0x1ffu];
++		*leaf = 0;
++		sweet_dma_sync_va(leaf, sizeof(*leaf));
++	}
++}
++
++uint64_t
++begonia_mali_va_alloc(uint64_t size)
++{
++	uint64_t addr = 0;
++
++	size = (size + 4095ull) & ~4095ull;
++	if (size == 0u) {
++		return 0u;
++	}
++	lck_mtx_lock(&mali_mmu_mtx);
++	for (uint32_t i = 0; i < MALI_FREE_SLOTS; i++) {
++		if (g_va_free[i].size >= size) {
++			addr = g_va_free[i].addr;
++			g_va_free[i].addr += size;
++			g_va_free[i].size -= size;
++			break;
++		}
++	}
++	if (addr == 0u && g_va_cursor + size <= MALI_VA_LIMIT) {
++		addr = g_va_cursor;
++		g_va_cursor += size;
++	}
++	lck_mtx_unlock(&mali_mmu_mtx);
++	return addr;
++}
++
++void
++begonia_mali_va_free(uint64_t gpu_va, uint64_t size)
++{
++	size = (size + 4095ull) & ~4095ull;
++	if (gpu_va == 0u || size == 0u) {
++		return;
++	}
++	lck_mtx_lock(&mali_mmu_mtx);
++	for (uint32_t i = 0; i < MALI_FREE_SLOTS; i++) {
++		if (g_va_free[i].size == 0u) {
++			g_va_free[i].addr = gpu_va;
++			g_va_free[i].size = size;
++			break;
++		}
++	}
++	lck_mtx_unlock(&mali_mmu_mtx);
++}
++
++bool
++begonia_mali_map_page(uint64_t gpu_va, uint64_t phys, bool readonly)
++{
++	bool ok;
++	lck_mtx_lock(&mali_mmu_mtx);
++	ok = begonia_mali_mmu_map_unlocked(gpu_va, phys, readonly);
++	lck_mtx_unlock(&mali_mmu_mtx);
++	return ok;
++}
++
++void
++begonia_mali_unmap_range(uint64_t gpu_va, uint64_t size)
++{
++	lck_mtx_lock(&mali_mmu_mtx);
++	begonia_mali_mmu_unmap_unlocked(gpu_va, size);
++	begonia_mali_mmu_flush_unlocked(g_mali_regs);
++	lck_mtx_unlock(&mali_mmu_mtx);
++}
++
++void
++begonia_mali_mmu_flush(void)
++{
++	lck_mtx_lock(&mali_mmu_mtx);
++	begonia_mali_mmu_flush_unlocked(g_mali_regs);
++	lck_mtx_unlock(&mali_mmu_mtx);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/begonia_touch.c b/bsd/dev/begonia_touch.c
+new file mode 100644
+index 0000000..5a191bb
+--- /dev/null
++++ b/bsd/dev/begonia_touch.c
+@@ -0,0 +1,400 @@
++/*
++ * Polled MT6785 SPI5 + Novatek NT36672A touchscreen driver for Redmi Note 8 Pro (begonia).
++ * Ports proven mtkloader SPI5 (0x11019000) + NVT (0x21C00) protocol to XNU HID events.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <libkern/libkern.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_board.h"
++#include "begonia_drivers.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++
++#define BEGONIA_TOPCKGEN_PA     0x10000000u
++#define BEGONIA_INFRACFG_PA     0x10001000u
++#define BEGONIA_GPIO_PA         0x10005000u
++#define BEGONIA_SPI5_PA         0x11019000u
++
++#define TOPCK_CLK_CFG_UPDATE    0x0004u
++#define TOPCK_CLK_CFG_5_CLR     0x0078u
++#define INFRA_SW_CG2_CLR        0x00a8u
++#define INFRA_CG2_SPI5_BIT      (1u << 26)
++
++#define SPI_CFG0_REG            0x0000u
++#define SPI_CFG1_REG            0x0004u
++#define SPI_TX_DATA_REG         0x0010u
++#define SPI_RX_DATA_REG         0x0014u
++#define SPI_CMD_REG             0x0018u
++#define SPI_STATUS0_REG         0x001cu
++#define SPI_PAD_SEL_REG         0x0024u
++#define SPI_CFG2_REG            0x0028u
++
++#define SPI_CMD_ACT             (1u << 0)
++#define SPI_CMD_RESUME          (1u << 1)
++#define SPI_CMD_RST             (1u << 2)
++#define SPI_CMD_PAUSE_EN        (1u << 4)
++#define SPI_CMD_TXMSBF          (1u << 12)
++#define SPI_CMD_RXMSBF          (1u << 13)
++#define SPI_CMD_FINISH_IE       (1u << 16)
++#define SPI_CMD_PAUSE_IE        (1u << 17)
++#define SPI_FIFO_BYTES          32u
++
++#define NVT_EVENT_BUF_ADDR      0x21c00u
++#define NVT_EVENT_FWINFO        0x78u
++#define NVT_EVENT_PROJECTID     0x9au
++#define NVT_MAX_SLOTS           10u
++#define NVT_EMPTY_RELEASE       3u
++#define PANEL_W                 1080u
++#define PANEL_H                 2340u
++
++static vm_offset_t topck_base, infra_base, gpio_base, spi5_base;
++static bool touch_started;
++static int touch_chan;
++static uint32_t touch_poll_ms = 8;
++static int touch_log;
++
++static inline uint32_t
++reg_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++reg_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++}
++
++static void
++gpio_set_mode(uint32_t pin, uint32_t mode)
++{
++	uint32_t off = 0x0300u + (pin / 8u) * 0x10u;
++	uint32_t shift = (pin % 8u) * 4u;
++	uint32_t v = reg_rd(gpio_base, off);
++	v = (v & ~(0xfu << shift)) | ((mode & 0xfu) << shift);
++	reg_wr(gpio_base, off, v);
++}
++
++static void
++gpio_set_dir(uint32_t pin, bool out)
++{
++	uint32_t off = (pin / 32u) * 0x10u;
++	uint32_t bit = 1u << (pin % 32u);
++	uint32_t v = reg_rd(gpio_base, off);
++	reg_wr(gpio_base, off, out ? (v | bit) : (v & ~bit));
++}
++
++static void
++gpio_set_dout(uint32_t pin, bool val)
++{
++	uint32_t off = 0x0100u + (pin / 32u) * 0x10u;
++	uint32_t bit = 1u << (pin % 32u);
++	uint32_t v = reg_rd(gpio_base, off);
++	reg_wr(gpio_base, off, val ? (v | bit) : (v & ~bit));
++}
++
++static void
++spi5_hw_init(void)
++{
++	/* clk26m (0) and clear PDN_SPI (bit 15) on TOPCKGEN CLK_CFG_5 */
++	reg_wr(topck_base, TOPCK_CLK_CFG_5_CLR, (0x3u << 8) | (1u << 15));
++	reg_wr(topck_base, TOPCK_CLK_CFG_UPDATE, (1u << 21));
++	reg_wr(infra_base, INFRA_SW_CG2_CLR, INFRA_CG2_SPI5_BIT);
++
++	/* GPIO1=INT(in), GPIO2=RST(kept high), GPIO35..38=SPI5_A (func 5) */
++	gpio_set_mode(1u, 0u);
++	gpio_set_dir(1u, false);
++	gpio_set_dout(2u, true);
++	gpio_set_mode(2u, 0u);
++	gpio_set_dir(2u, true);
++
++	gpio_set_mode(35u, 5u);
++	gpio_set_dir(35u, true);
++	gpio_set_mode(36u, 5u);
++	gpio_set_dir(36u, true);
++	gpio_set_mode(37u, 5u);
++	gpio_set_dir(37u, false);
++	gpio_set_mode(38u, 5u);
++	gpio_set_dir(38u, true);
++
++	/* 26 MHz / 6 = ~4.33 MHz, pad-select = 0 */
++	reg_wr(spi5_base, SPI_CMD_REG, SPI_CMD_RST);
++	reg_wr(spi5_base, SPI_CMD_REG, 0u);
++	reg_wr(spi5_base, SPI_PAD_SEL_REG, 0u);
++	reg_wr(spi5_base, SPI_CFG2_REG, ((3u - 1u) << 0) | ((3u - 1u) << 16));
++	reg_wr(spi5_base, SPI_CFG0_REG, ((6u - 1u) << 0) | ((6u - 1u) << 16));
++	reg_wr(spi5_base, SPI_CFG1_REG, 5u);
++}
++
++static int
++spi5_wait_status(void)
++{
++	for (uint32_t spin = 0; spin < 250000u; spin++) {
++		if (reg_rd(spi5_base, SPI_STATUS0_REG) & 3u) {
++			return 0;
++		}
++	}
++	return -1;
++}
++
++static int
++spi5_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
++{
++	uint32_t base_cmd = SPI_CMD_TXMSBF | SPI_CMD_RXMSBF | SPI_CMD_FINISH_IE | SPI_CMD_PAUSE_IE;
++	uint32_t off = 0;
++
++	if (len == 0u) {
++		return 0;
++	}
++	reg_wr(spi5_base, SPI_CMD_REG, SPI_CMD_RST);
++	reg_wr(spi5_base, SPI_CMD_REG, 0u);
++	(void)reg_rd(spi5_base, SPI_STATUS0_REG);
++
++	while (off < len) {
++		uint32_t chunk = len - off;
++		bool has_more, is_first;
++		uint32_t cfg1;
++
++		if (chunk > SPI_FIFO_BYTES) {
++			chunk = SPI_FIFO_BYTES;
++		}
++		has_more = (off + chunk) < len;
++		is_first = (off == 0u);
++
++		cfg1 = reg_rd(spi5_base, SPI_CFG1_REG);
++		cfg1 &= ~0x03ffff00u;
++		cfg1 |= ((chunk - 1u) << 16);
++		reg_wr(spi5_base, SPI_CFG1_REG, cfg1);
++
++		for (uint32_t i = 0; i < chunk; i += 4u) {
++			uint32_t w = 0u;
++			uint32_t rem = chunk - i;
++			if (rem > 4u) {
++				rem = 4u;
++			}
++			if (tx != NULL) {
++				for (uint32_t b = 0; b < rem; b++) {
++					w |= ((uint32_t)tx[off + i + b]) << (b * 8u);
++				}
++			}
++			reg_wr(spi5_base, SPI_TX_DATA_REG, w);
++		}
++
++		reg_wr(spi5_base, SPI_CMD_REG,
++		    base_cmd | (has_more ? SPI_CMD_PAUSE_EN : 0u) | (is_first ? SPI_CMD_ACT : SPI_CMD_RESUME));
++
++		if (spi5_wait_status() != 0) {
++			reg_wr(spi5_base, SPI_CMD_REG, SPI_CMD_RST);
++			reg_wr(spi5_base, SPI_CMD_REG, 0u);
++			return -1;
++		}
++
++		for (uint32_t i = 0; i < chunk; i += 4u) {
++			uint32_t w = reg_rd(spi5_base, SPI_RX_DATA_REG);
++			if (rx != NULL) {
++				uint32_t rem = chunk - i;
++				if (rem > 4u) {
++					rem = 4u;
++				}
++				for (uint32_t b = 0; b < rem; b++) {
++					rx[off + i + b] = (uint8_t)(w >> (b * 8u));
++				}
++			}
++		}
++		off += chunk;
++	}
++	return 0;
++}
++
++static int
++nvt_set_page(uint32_t addr)
++{
++	uint8_t tx[3] = {
++		0xffu,
++		(uint8_t)((addr >> 15) & 0xffu),
++		(uint8_t)((addr >> 7) & 0xffu),
++	};
++	return spi5_xfer(tx, NULL, 3u);
++}
++
++static int
++nvt_read_reg(uint8_t reg_addr, uint8_t *out, uint32_t data_len)
++{
++	uint8_t tx[72];
++	uint8_t rx[72];
++	uint32_t total = data_len + 2u;
++
++	if (total > sizeof(tx)) {
++		return -1;
++	}
++	bzero(tx, total);
++	tx[0] = reg_addr & 0x7fu;
++	if (spi5_xfer(tx, rx, total) != 0) {
++		return -1;
++	}
++	memcpy(out, rx + 2, data_len);
++	return 0;
++}
++
++static bool
++nvt_probe_fw(uint8_t *fw_ver, uint16_t *pid)
++{
++	uint8_t info[16];
++	uint8_t pid_buf[2];
++
++	if (nvt_set_page(NVT_EVENT_BUF_ADDR | NVT_EVENT_FWINFO) != 0 ||
++	    nvt_read_reg(NVT_EVENT_FWINFO, info, sizeof(info)) != 0) {
++		return false;
++	}
++	if ((uint8_t)(info[0] + info[1]) != 0xffu || info[0] == 0u) {
++		return false;
++	}
++	*fw_ver = info[0];
++	*pid = 0;
++	if (nvt_set_page(NVT_EVENT_BUF_ADDR | NVT_EVENT_PROJECTID) == 0 &&
++	    nvt_read_reg(NVT_EVENT_PROJECTID, pid_buf, 2u) == 0) {
++		*pid = (uint16_t)(((uint16_t)pid_buf[1] << 8) | pid_buf[0]);
++	}
++	(void)nvt_set_page(NVT_EVENT_BUF_ADDR);
++	return true;
++}
++
++static void
++touch_sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&touch_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++begonia_touch_thread(__unused void *arg, __unused wait_result_t result)
++{
++	bool active[NVT_MAX_SLOTS];
++	uint16_t lx[NVT_MAX_SLOTS], ly[NVT_MAX_SLOTS];
++	uint8_t miss[NVT_MAX_SLOTS];
++	uint8_t fw_ver = 0;
++	uint16_t pid = 0;
++	bool ready = false;
++
++	bzero(active, sizeof(active));
++	bzero(lx, sizeof(lx));
++	bzero(ly, sizeof(ly));
++	bzero(miss, sizeof(miss));
++
++	spi5_hw_init();
++	for (uint32_t t = 0; t < 10u && !ready; t++) {
++		ready = nvt_probe_fw(&fw_ver, &pid);
++		if (!ready) {
++			touch_sleep_ms(100u);
++		}
++	}
++	if (!ready) {
++		printf("BEGONIA TOUCH: NT36672A FW not active in SRAM (boot via mtkloader dualboot to load FW); waiting paused
++");
++		return;
++	}
++	printf("BEGONIA TOUCH: NT36672A ready on SPI5 (pid=%#x fw=v%u poll=%ums)
++",
++	    pid, fw_ver, touch_poll_ms);
++
++	for (;;) {
++		uint8_t pts[65];
++		if (nvt_set_page(NVT_EVENT_BUF_ADDR) == 0 && nvt_read_reg(0x00u, pts, sizeof(pts)) == 0) {
++			bool seen[NVT_MAX_SLOTS];
++			bzero(seen, sizeof(seen));
++
++			for (uint32_t i = 0; i < NVT_MAX_SLOTS; i++) {
++				uint32_t pos = i * 6u;
++				uint8_t id = pts[pos] >> 3;
++				uint8_t state = pts[pos] & 0x07u;
++				if (id < 1u || id > NVT_MAX_SLOTS) {
++					continue;
++				}
++				uint32_t slot = id - 1u;
++				uint32_t x = ((uint32_t)pts[pos + 1u] << 4) | ((uint32_t)pts[pos + 3u] >> 4);
++				uint32_t y = ((uint32_t)pts[pos + 2u] << 4) | ((uint32_t)pts[pos + 3u] & 0x0fu);
++				if ((state == 1u || state == 2u) && x < PANEL_W && y < PANEL_H) {
++					seen[slot] = true;
++					miss[slot] = 0;
++					if (!active[slot] || lx[slot] != x || ly[slot] != y) {
++						active[slot] = true;
++						lx[slot] = (uint16_t)x;
++						ly[slot] = (uint16_t)y;
++						if (touch_log) {
++							printf("BEGONIA TOUCH: slot=%u down (%u,%u)
++", slot, x, y);
++						}
++						sweet_hid_touch((int)slot, 1, (int)x, (int)y);
++					}
++				} else if (state == 3u && active[slot]) {
++					active[slot] = false;
++					miss[slot] = 0;
++					if (touch_log) {
++						printf("BEGONIA TOUCH: slot=%u up (%u,%u)
++", slot, lx[slot], ly[slot]);
++					}
++					sweet_hid_touch((int)slot, 0, (int)lx[slot], (int)ly[slot]);
++				}
++			}
++			for (uint32_t slot = 0; slot < NVT_MAX_SLOTS; slot++) {
++				if (active[slot] && !seen[slot] && ++miss[slot] >= NVT_EMPTY_RELEASE) {
++					active[slot] = false;
++					miss[slot] = 0;
++					sweet_hid_touch((int)slot, 0, (int)lx[slot], (int)ly[slot]);
++				}
++			}
++		}
++		touch_sleep_ms(touch_poll_ms);
++	}
++}
++
++void
++begonia_touch_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++
++	if (touch_started || !sweet_board_begonia()) {
++		return;
++	}
++	touch_started = true;
++	(void)PE_parse_boot_argn("begoniatouch", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("begoniatouchlog", &touch_log, sizeof(touch_log));
++	(void)PE_parse_boot_argn("begoniatouchms", &touch_poll_ms, sizeof(touch_poll_ms));
++	if (touch_poll_ms < 1u || touch_poll_ms > 20u) {
++		touch_poll_ms = 8u;
++	}
++	if (!enabled) {
++		printf("BEGONIA TOUCH: disabled (begoniatouch=0)
++");
++		return;
++	}
++	topck_base = ml_io_map(BEGONIA_TOPCKGEN_PA, 0x1000u);
++	infra_base = ml_io_map(BEGONIA_INFRACFG_PA, 0x1000u);
++	gpio_base = ml_io_map(BEGONIA_GPIO_PA, 0x1000u);
++	spi5_base = ml_io_map(BEGONIA_SPI5_PA, 0x1000u);
++	if (!topck_base || !infra_base || !gpio_base || !spi5_base) {
++		printf("BEGONIA TOUCH: ml_io_map failed
++");
++		return;
++	}
++	if (kernel_thread_start(begonia_touch_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("BEGONIA TOUCH: kernel_thread_start failed
++");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 23f9aa7..13bc770 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -15,6 +15,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include "sweet_board.h"
++#include "begonia_drivers.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+@@ -138,7 +139,7 @@ sweet_keys_init(void)
+ 	}
+ 	keys_started = true;
+ 	if (sweet_board_begonia()) {
+-		printf("SWEET KEYS: disabled on begonia\n");
++		begonia_keys_init();
+ 		return;
+ 	}
+ 	(void)PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled));
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index e0af1f0..bad5468 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -26,6 +26,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include "sweet_board.h"
++#include "begonia_drivers.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -1200,7 +1201,7 @@ sweet_touch_init(void)
+ 	}
+ 	st.started = true;
+ 	if (sweet_board_begonia()) {
+-		printf("SWEET TOUCH: disabled on begonia\n");
++		begonia_touch_init();
+ 		return;
+ 	}
+ 	if (sweet_board_beryllium()) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1a16f3f..fa038d5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -470,6 +470,9 @@ public:
+ 	bool          fBlOK, fBlackDone;
+ 	uint32_t      fBlPos;           /* 0 = off .. SWEET_FB_BL_STEPS = as found */
+ 	uint16_t      fBlRaw[2];        /* brightness bytes of strings 0, 1 as found */
++	vm_offset_t   fBlPwm;           /* begonia MT6785 disp_pwm0 @ 0x1100e000 */
++	uint32_t      fBlPwmPeriod;
++	bool          begoniaPwmWrite(uint32_t high);
+ 	void          blInit(void);
+ 	bool          blStep(int dir);
+ 	bool          blSet(bool on);   /* 0242: the backlight straight to iOS's state (no ramp), retried; false: it did not take */
+@@ -2505,9 +2508,62 @@ sweet_wled_read16(unsigned string, uint16_t *out)
+ 	return 0;
+ }
+ 
++#define BEGONIA_DISP_PWM0_PA   0x1100e000u
++#define BEGONIA_PWM_EN         0x00u
++#define BEGONIA_PWM_COMMIT     0x0cu
++#define BEGONIA_PWM_CON1       0x1cu
++
++bool
++AppleCLCD::begoniaPwmWrite(uint32_t high)
++{
++	if (fBlPwm == 0 || fBlPwmPeriod == 0) {
++		return false;
++	}
++	if (high > fBlPwmPeriod) {
++		high = fBlPwmPeriod;
++	}
++	volatile uint32_t *pwm = (volatile uint32_t *)fBlPwm;
++	uint32_t con1 = (fBlPwmPeriod & 0xfffu) | ((high & 0x1fffu) << 16);
++	pwm[BEGONIA_PWM_CON1 / 4] = con1;
++	pwm[BEGONIA_PWM_COMMIT / 4] = 1u;
++	pwm[BEGONIA_PWM_COMMIT / 4] = 0u;
++	uint32_t en = pwm[BEGONIA_PWM_EN / 4];
++	pwm[BEGONIA_PWM_EN / 4] = (high > 0) ? (en | 1u) : (en & ~1u);
++	return (pwm[BEGONIA_PWM_CON1 / 4] & 0x1fffffffu) == con1;
++}
++
+ void
+ AppleCLCD::blInit(void)
+ {
++	if (sweet_board_begonia()) {
++		fBlPwm = ml_io_map(BEGONIA_DISP_PWM0_PA, 0x1000u);
++		if (fBlPwm == 0) {
++			IOLog("SWEET FB: begonia disp_pwm0 map failed; pixel fallback\n");
++			return;
++		}
++		volatile uint32_t *pwm = (volatile uint32_t *)fBlPwm;
++		uint32_t en = pwm[BEGONIA_PWM_EN / 4];
++		uint32_t con1 = pwm[BEGONIA_PWM_CON1 / 4];
++		uint32_t period = con1 & 0xfffu;
++		uint32_t high = (con1 >> 16) & 0x1fffu;
++		if (period == 0) {
++			IOLog("SWEET FB: begonia disp_pwm0 period=0 (en=%#x con1=%#x); pixel fallback\n", en, con1);
++			return;
++		}
++		fBlPwmPeriod = period;
++		uint32_t lvl = ((uint32_t)high * 4095u + period / 2u) / period;
++		if (lvl > 4095u) {
++			lvl = 4095u;
++		}
++		if (lvl == 0u) {
++			lvl = 1024u;
++		}
++		fBlRaw[0] = fBlRaw[1] = (uint16_t)lvl;
++		fBlPos = SWEET_FB_BL_STEPS;
++		fBlOK = true;
++		IOLog("SWEET FB: begonia disp_pwm0 armed (en=%#x period=%u high=%u -> %u/4095)\n", en, period, high, lvl);
++		return;
++	}
+ 	uint8_t mod = 0, sync = 0;
+ 	uint16_t raw[SWEET_WLED_STRINGS];
+ 
+@@ -2600,6 +2656,14 @@ AppleARMBacklight::setProperties(OSObject *properties)
+ bool
+ AppleCLCD::blSet(bool on)
+ {
++	if (sweet_board_begonia()) {
++		uint32_t high = on ? (((uint32_t)(fBlRaw[0] & 0xfffu) * fBlPwmPeriod + 2047u) / 4095u) : 0u;
++		if (begoniaPwmWrite(high)) {
++			fBlPos = on ? SWEET_FB_BL_STEPS : 0;
++			return true;
++		}
++		return false;
++	}
+ 	if (!on) {
+ 		uint16_t now[SWEET_WLED_STRINGS];
+ 		if (sweet_wled_read16(0, &now[0]) == 0 && sweet_wled_read16(1, &now[1]) == 0 &&
+@@ -2641,6 +2705,24 @@ AppleCLCD::blStep(int dir)
+ 	const uint32_t N = SWEET_FB_BL_STEPS;
+ 	static uint32_t logged;
+ 
++	if (sweet_board_begonia()) {
++		if (dir < 0) {
++			if (fBlPos == 0) {
++				return true;
++			}
++			fBlPos--;
++		} else {
++			if (fBlPos >= N) {
++				return true;
++			}
++			fBlPos++;
++		}
++		uint32_t lvl = fBlPos == N ? (fBlRaw[0] & 0xfffu) :
++		    (uint32_t)(((uint64_t)(fBlRaw[0] & 0xfffu) * fBlPos * fBlPos) / (N * N));
++		uint32_t high = (lvl * fBlPwmPeriod + 2047u) / 4095u;
++		return begoniaPwmWrite(high);
++	}
++
+ 	if (dir < 0) {
+ 		if (fBlPos == 0) {
+ 			return true;
+diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
+new file mode 100644
+index 0000000..65bf2cc
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -0,0 +1,493 @@
++/*
++ * SweetMali: IOKit service and user client for begonia Mali-G76 MC4 (MT6785).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOSubMemoryDescriptor.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++
++#include "SweetMaliABI.h"
++#include "SweetSurface.h"
++#include "../../../bsd/dev/sweet_board.h"
++#include "../../../bsd/dev/begonia_drivers.h"
++
++#define MALI_BUFFERS        2048u
++#define MALI_BUFFER_MAX     (256ull << 20)
++#define MALI_SUBMIT_HANDLES 4096u
++
++struct mali_gem_slot {
++	IOMemoryDescriptor *md;
++	SweetSurface *surface;
++	uint8_t *kva;
++	uint64_t gpu_va;
++	uint64_t size;
++	uint64_t last_seq;
++	bool readonly;
++};
++
++static IOLock *gMaliClientLock;
++
++class SweetMali : public IOService {
++	OSDeclareDefaultStructors(SweetMali);
++};
++
++OSDefineMetaClassAndStructors(SweetMali, IOService);
++
++class SweetMaliUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetMaliUserClient);
++
++	task_t fTask;
++	struct mali_gem_slot *fBos;
++	uint32_t fNextBo;
++	bool fClosed;
++
++	struct mali_gem_slot *boSlot(uint32_t handle);
++	void freeSlot(struct mali_gem_slot *b);
++	IOReturn mapSlot(struct mali_gem_slot *b, uint64_t from, uint64_t size,
++	    bool readonly, uint32_t *handle);
++	IOReturn createBO(struct sweet_mali_create_bo *r);
++	IOReturn surfaceBO(struct sweet_mali_surface_bo *r);
++	IOReturn submitJobs(struct sweet_mali_submit *r);
++	IOReturn copyIn(uint64_t addr, void *dst, size_t len);
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
++	    IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetMaliUserClient, IOUserClient);
++
++extern "C" void
++SweetMaliPublish(void)
++{
++	if (!begonia_mali_ready()) {
++		return;
++	}
++	if (gMaliClientLock == NULL) {
++		gMaliClientLock = IOLockAlloc();
++	}
++	IOService *plat = IOService::getPlatform();
++	SweetMali *svc = OSTypeAlloc(SweetMali);
++	if (gMaliClientLock == NULL || plat == NULL || svc == NULL || !svc->init()) {
++		OSSafeReleaseNULL(svc);
++		return;
++	}
++	svc->setName(SWEET_MALI_SERVICE_NAME);
++	svc->setProperty(kIOUserClientClassKey, "SweetMaliUserClient");
++	if (svc->attach(plat)) {
++		svc->registerService();
++		IOLog("BEGONIA MALI: IOKit service %s published (gpu_id=%#x, va=%u-bit)
++",
++		    SWEET_MALI_SERVICE_NAME, begonia_mali_gpu_id(), begonia_mali_va_bits());
++	}
++	svc->release();
++}
++
++bool
++SweetMaliUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	if (!begonia_mali_ready() || owningTask == NULL) {
++		return false;
++	}
++	fTask = owningTask;
++	fBos = (struct mali_gem_slot *)IOMallocZeroData(sizeof(struct mali_gem_slot) * MALI_BUFFERS);
++	if (fBos == NULL) {
++		return false;
++	}
++	begonia_mali_note_client(1);
++	return true;
++}
++
++void
++SweetMaliUserClient::free(void)
++{
++	if (fBos != NULL) {
++		IOFreeData(fBos, sizeof(struct mali_gem_slot) * MALI_BUFFERS);
++		fBos = NULL;
++	}
++	IOUserClient::free();
++}
++
++struct mali_gem_slot *
++SweetMaliUserClient::boSlot(uint32_t handle)
++{
++	if (fBos == NULL || handle == 0u || handle > MALI_BUFFERS || fBos[handle - 1u].md == NULL) {
++		return NULL;
++	}
++	return &fBos[handle - 1u];
++}
++
++void
++SweetMaliUserClient::freeSlot(struct mali_gem_slot *b)
++{
++	if (b->last_seq != 0u) {
++		(void)begonia_mali_wait(b->last_seq, 2ull * NSEC_PER_SEC);
++	}
++	if (b->gpu_va != 0u && b->size != 0u) {
++		begonia_mali_unmap_range(b->gpu_va, b->size);
++		begonia_mali_va_free(b->gpu_va, b->size);
++	}
++	if (b->md != NULL) {
++		b->md->release();
++	}
++	if (b->surface != NULL) {
++		b->surface->release();
++	}
++	bzero(b, sizeof(*b));
++}
++
++IOReturn
++SweetMaliUserClient::clientClose(void)
++{
++	IOLockLock(gMaliClientLock);
++	if (!fClosed) {
++		fClosed = true;
++		for (uint32_t i = 0; fBos != NULL && i < MALI_BUFFERS; i++) {
++			if (fBos[i].md != NULL) {
++				freeSlot(&fBos[i]);
++			}
++		}
++		begonia_mali_note_client(-1);
++	}
++	IOLockUnlock(gMaliClientLock);
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
++{
++	IOReturn ret = kIOReturnBadArgument;
++
++	IOLockLock(gMaliClientLock);
++	struct mali_gem_slot *b = boSlot(type);
++	if (b != NULL && b->md != NULL) {
++		b->md->retain();
++		*memory = b->md;
++		*options = 0;
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(gMaliClientLock);
++	return ret;
++}
++
++IOReturn
++SweetMaliUserClient::copyIn(uint64_t addr, void *dst, size_t len)
++{
++	if (len == 0u) {
++		return kIOReturnSuccess;
++	}
++	if (addr == 0u) {
++		return kIOReturnBadArgument;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)addr, len,
++	    kIODirectionOut, fTask);
++	if (md == NULL) {
++		return kIOReturnNoMemory;
++	}
++	IOReturn ret = md->prepare();
++	if (ret == kIOReturnSuccess) {
++		ret = md->readBytes(0, dst, len) == len ? kIOReturnSuccess : kIOReturnVMError;
++		md->complete();
++	}
++	md->release();
++	return ret;
++}
++
++IOReturn
++SweetMaliUserClient::mapSlot(struct mali_gem_slot *b, uint64_t from, uint64_t size,
++    bool readonly, uint32_t *handle)
++{
++	uint32_t slot_id = 0;
++
++	for (uint32_t n = 0; n < MALI_BUFFERS; n++) {
++		uint32_t i = (fNextBo + n) % MALI_BUFFERS;
++		if (fBos[i].md == NULL) {
++			slot_id = i + 1u;
++			fNextBo = i + 1u;
++			break;
++		}
++	}
++	if (slot_id == 0u) {
++		return kIOReturnNoResources;
++	}
++	uint64_t gpu_va = begonia_mali_va_alloc(size);
++	if (gpu_va == 0u) {
++		return kIOReturnNoSpace;
++	}
++	bool ok = true;
++	for (uint64_t off = 0; off < size && ok; off += 4096ull) {
++		IOByteCount seglen = 0;
++		addr64_t pa = b->md->getPhysicalSegment(from + off, &seglen, kIOMemoryMapperNone);
++		ok = (pa != 0u) && begonia_mali_map_page(gpu_va + off, pa, readonly);
++	}
++	if (!ok) {
++		begonia_mali_unmap_range(gpu_va, size);
++		begonia_mali_va_free(gpu_va, size);
++		return kIOReturnNoMemory;
++	}
++	begonia_mali_mmu_flush();
++	b->gpu_va = gpu_va;
++	b->size = size;
++	b->readonly = readonly;
++	*handle = slot_id;
++	fBos[slot_id - 1u] = *b;
++	begonia_mali_note_buffer(gpu_va, size);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetMaliUserClient::createBO(struct sweet_mali_create_bo *r)
++{
++	uint64_t size = (r->size + PAGE_SIZE - 1u) & ~(uint64_t)(PAGE_SIZE - 1u);
++	if (size == 0u || size > MALI_BUFFER_MAX) {
++		return kIOReturnBadArgument;
++	}
++	IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache,
++	    (vm_size_t)size, PAGE_SIZE);
++	if (mem == NULL) {
++		return kIOReturnNoMemory;
++	}
++	uint8_t *kva = (uint8_t *)mem->getBytesNoCopy();
++	if (kva == NULL) {
++		mem->release();
++		return kIOReturnNoMemory;
++	}
++	bzero(kva, (size_t)size);
++	sweet_dma_sync_va(kva, (size_t)size);
++	struct mali_gem_slot tmp;
++	bzero(&tmp, sizeof(tmp));
++	tmp.md = mem;
++	tmp.kva = kva;
++	IOReturn ret = mapSlot(&tmp, 0u, size, false, &r->handle);
++	if (ret != kIOReturnSuccess) {
++		mem->release();
++		return ret;
++	}
++	r->offset = fBos[r->handle - 1u].gpu_va;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetMaliUserClient::surfaceBO(struct sweet_mali_surface_bo *r)
++{
++	SweetSurface *s = sweet_surface_copy(r->surface_id);
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	if (s->memory == NULL) {
++		s->release();
++		return kIOReturnUnsupported;
++	}
++	uint64_t size = (s->memory->getLength() + PAGE_SIZE - 1u) & ~(uint64_t)(PAGE_SIZE - 1u);
++	r->size = size;
++	r->offset = s->offset + (s->wrapped ? s->wrapDelta : 0u);
++	r->bytes_per_row = s->bytesPerRow;
++	r->width = s->width;
++	r->height = s->height;
++	r->pixel_format = s->pixelFormat;
++	r->planes = s->planeCount;
++	r->gpu_va = 0;
++
++	if (r->handle == SWEET_MALI_DESCRIBE_ONLY) {
++		r->handle = 0;
++		s->release();
++		return kIOReturnSuccess;
++	}
++	for (uint32_t i = 0; i < MALI_BUFFERS; i++) {
++		if (fBos[i].md != NULL && fBos[i].surface == s) {
++			r->handle = i + 1u;
++			r->gpu_va = fBos[i].gpu_va;
++			s->release();
++			return kIOReturnSuccess;
++		}
++	}
++	struct mali_gem_slot tmp;
++	bzero(&tmp, sizeof(tmp));
++	s->memory->retain();
++	tmp.md = s->memory;
++	tmp.surface = s;
++	uintptr_t ka = s->kernelAddress();
++	tmp.kva = ka != 0u ? (uint8_t *)(ka - (s->wrapped ? s->wrapDelta : 0u)) : NULL;
++	IOReturn ret = mapSlot(&tmp, 0u, size, s->wrapped, &r->handle);
++	if (ret != kIOReturnSuccess) {
++		s->memory->release();
++		s->release();
++		return ret;
++	}
++	r->gpu_va = fBos[r->handle - 1u].gpu_va;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetMaliUserClient::submitJobs(struct sweet_mali_submit *r)
++{
++	if (r->jc == 0u) {
++		return kIOReturnBadArgument;
++	}
++	uint64_t seq = begonia_mali_submit(r->jc, (r->requirements & SWEET_MALI_JD_REQ_FS) != 0u);
++	if (seq == 0u) {
++		return kIOReturnError;
++	}
++	uint32_t cnt = r->bo_handle_count;
++	if (cnt > MALI_SUBMIT_HANDLES) {
++		cnt = MALI_SUBMIT_HANDLES;
++	}
++	for (uint32_t off = 0; off < cnt; off += 64u) {
++		uint32_t handles[64];
++		uint32_t n = (cnt - off) < 64u ? (cnt - off) : 64u;
++		if (copyIn(r->bo_handles + off * sizeof(uint32_t), handles, n * sizeof(uint32_t)) != kIOReturnSuccess) {
++			break;
++		}
++		for (uint32_t k = 0; k < n; k++) {
++			struct mali_gem_slot *b = boSlot(handles[k]);
++			if (b != NULL) {
++				b->last_seq = seq;
++			}
++		}
++	}
++	r->jc = seq;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	union {
++		struct sweet_mali_gem_close close;
++		struct sweet_mali_submit submit;
++		struct sweet_mali_wait_bo waitbo;
++		struct sweet_mali_create_bo create;
++		struct sweet_mali_mmap_bo mmapbo;
++		struct sweet_mali_get_param param;
++		struct sweet_mali_get_bo_offset boff;
++		struct sweet_mali_madvise madv;
++		struct sweet_mali_info info;
++		struct sweet_mali_surface_bo sbo;
++		struct sweet_mali_bo_sync sync;
++		struct sweet_mali_wait_seq wseq;
++	} req;
++	size_t sz = args->structureInputSize;
++	IOReturn ret = kIOReturnSuccess;
++
++	if (args->structureInput == NULL || sz > sizeof(req) || fBos == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!begonia_mali_ready()) {
++		return kIOReturnNotReady;
++	}
++	bzero(&req, sizeof(req));
++	memcpy(&req, args->structureInput, sz);
++
++	if (selector == SWEET_MALI_SEL_WAIT_SEQ || selector == SWEET_MALI_SEL_WAIT_BO) {
++		uint64_t seq = req.wseq.seq;
++		int64_t tmo = req.wseq.timeout_ns;
++		if (selector == SWEET_MALI_SEL_WAIT_BO) {
++			IOLockLock(gMaliClientLock);
++			struct mali_gem_slot *b = boSlot(req.waitbo.handle);
++			if (b == NULL) {
++				IOLockUnlock(gMaliClientLock);
++				return kIOReturnNotFound;
++			}
++			seq = b->last_seq;
++			tmo = req.waitbo.timeout_ns;
++			IOLockUnlock(gMaliClientLock);
++		}
++		ret = (seq == 0u || begonia_mali_wait(seq, tmo > 0 ? (uint64_t)tmo : 0u)) ?
++		    kIOReturnSuccess : kIOReturnTimeout;
++		if (args->structureOutput != NULL && args->structureOutputSize >= sz) {
++			memcpy(args->structureOutput, &req, sz);
++			args->structureOutputSize = (uint32_t)sz;
++		}
++		return ret;
++	}
++
++	IOLockLock(gMaliClientLock);
++	switch (selector) {
++	case SWEET_MALI_SEL_GET_PARAM:
++		if (!begonia_mali_param(req.param.param, &req.param.value)) {
++			ret = kIOReturnBadArgument;
++		}
++		break;
++	case SWEET_MALI_SEL_CREATE_BO:
++		ret = createBO(&req.create);
++		break;
++	case SWEET_MALI_SEL_MMAP_BO:
++		if (boSlot(req.mmapbo.handle) == NULL) {
++			ret = kIOReturnNotFound;
++		} else {
++			req.mmapbo.offset = (uint64_t)req.mmapbo.handle << 12;
++		}
++		break;
++	case SWEET_MALI_SEL_GET_BO_OFF: {
++		struct mali_gem_slot *b = boSlot(req.boff.handle);
++		if (b == NULL) {
++			ret = kIOReturnNotFound;
++		} else {
++			req.boff.offset = b->gpu_va;
++		}
++		break;
++	}
++	case SWEET_MALI_SEL_SUBMIT:
++		ret = submitJobs(&req.submit);
++		break;
++	case SWEET_MALI_SEL_SURFACE_BO:
++		ret = surfaceBO(&req.sbo);
++		break;
++	case SWEET_MALI_SEL_BO_SYNC: {
++		struct mali_gem_slot *b = boSlot(req.sync.handle);
++		if (b == NULL) {
++			ret = kIOReturnNotFound;
++		} else if (b->kva != NULL) {
++			sweet_dma_sync_va(b->kva, (size_t)b->size);
++		}
++		break;
++	}
++	case SWEET_MALI_SEL_MADVISE:
++		req.madv.retained = 1;
++		break;
++	case SWEET_MALI_SEL_GEM_CLOSE: {
++		struct mali_gem_slot *b = boSlot(req.close.handle);
++		if (b == NULL) {
++			ret = kIOReturnNotFound;
++		} else {
++			freeSlot(b);
++		}
++		break;
++	}
++	case SWEET_MALI_SEL_INFO:
++		req.info.version = SWEET_MALI_ABI_VERSION;
++		req.info.gpu_id = begonia_mali_gpu_id();
++		req.info.va_bits = begonia_mali_va_bits();
++		break;
++	default:
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	IOLockUnlock(gMaliClientLock);
++
++	if (args->structureOutput != NULL && args->structureOutputSize >= sz) {
++		memcpy(args->structureOutput, &req, sz);
++		args->structureOutputSize = (uint32_t)sz;
++	}
++	return ret;
++}
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetMaliABI.h b/iokit/Kernel/arm/SweetMaliABI.h
+new file mode 100644
+index 0000000..11c5b5b
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetMaliABI.h
+@@ -0,0 +1,96 @@
++/*
++ * SweetMali: IOKit ABI for ARM Mali-G76 MC4 on Redmi Note 8 Pro (begonia / MT6785).
++ * Matches Linux Panfrost DRM ioctl selectors/structs plus SweetSurface import.
++ */
++#ifndef _SWEET_MALI_ABI_H_
++#define _SWEET_MALI_ABI_H_
++
++#include <stdint.h>
++
++#define SWEET_MALI_SERVICE_NAME     "SweetMali"
++#define SWEET_MALI_ABI_VERSION      1
++
++enum sweet_mali_selector {
++	SWEET_MALI_SEL_GEM_CLOSE    = 0x09,
++	SWEET_MALI_SEL_SUBMIT       = 0x40,
++	SWEET_MALI_SEL_WAIT_BO      = 0x41,
++	SWEET_MALI_SEL_CREATE_BO    = 0x42,
++	SWEET_MALI_SEL_MMAP_BO      = 0x43,
++	SWEET_MALI_SEL_GET_PARAM    = 0x44,
++	SWEET_MALI_SEL_GET_BO_OFF   = 0x45,
++	SWEET_MALI_SEL_MADVISE      = 0x48,
++	SWEET_MALI_SEL_INFO         = 0x70,
++	SWEET_MALI_SEL_SURFACE_BO   = 0x71,
++	SWEET_MALI_SEL_BO_SYNC      = 0x72,
++	SWEET_MALI_SEL_WAIT_SEQ     = 0x7d,
++};
++
++#define SWEET_MALI_JD_REQ_FS        (1u << 0)
++#define SWEET_MALI_DESCRIBE_ONLY    0xffffffffu
++
++struct sweet_mali_gem_close {
++	uint32_t handle, pad;
++};
++
++struct sweet_mali_submit {
++	uint64_t jc;
++	uint64_t in_syncs;
++	uint32_t in_sync_count;
++	uint32_t out_sync;
++	uint64_t bo_handles;
++	uint32_t bo_handle_count;
++	uint32_t requirements;
++};
++
++struct sweet_mali_wait_bo {
++	uint32_t handle, pad;
++	int64_t timeout_ns;
++};
++
++struct sweet_mali_create_bo {
++	uint32_t size, flags, handle, pad;
++	uint64_t offset;
++};
++
++struct sweet_mali_mmap_bo {
++	uint32_t handle, flags;
++	uint64_t offset;
++};
++
++struct sweet_mali_get_param {
++	uint32_t param, pad;
++	uint64_t value;
++};
++
++struct sweet_mali_get_bo_offset {
++	uint32_t handle, pad;
++	uint64_t offset;
++};
++
++struct sweet_mali_madvise {
++	uint32_t handle, madv, retained;
++};
++
++struct sweet_mali_info {
++	uint32_t version, gpu_id, va_bits, pad;
++};
++
++struct sweet_mali_surface_bo {
++	uint32_t surface_id;
++	uint32_t handle;
++	uint64_t size;
++	uint64_t gpu_va;
++	uint32_t offset, bytes_per_row;
++	uint32_t width, height, pixel_format, planes;
++};
++
++struct sweet_mali_bo_sync {
++	uint32_t handle, flags;
++};
++
++struct sweet_mali_wait_seq {
++	uint64_t seq;
++	int64_t timeout_ns;
++};
++
++#endif /* _SWEET_MALI_ABI_H_ */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 96ffe03..654ec0a 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -797,6 +797,10 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	}
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		extern "C" void begonia_platform_hw_init(void);
++		begonia_platform_hw_init();
++	}
+ //
+ //	SWEET: root on a GPT partition of the internal UFS (bsd/dev/sweet_ufs.c)
+ //
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index b0409b5..44fe438 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -19,6 +19,7 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetAdreno.cpp                                 optional iokitcpp
++iokit/Kernel/arm/SweetMali.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/SweetNetwork.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp

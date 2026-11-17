@@ -129,7 +129,7 @@ jobs:
             out-ios18/kernel.development.sweet \
             out-ios18/begonia-ios18-n841.adt \
             out-ios18/begonia-xnu-kernel-only-payload.bin \
-            --cmdline "debug=0x14e serial=3 rd=ufsroot0 ufsroot=iosroot rw=1 -v cpus=6" \
+            --cmdline "debug=0x14e serial=3 cpus=6 keepsyms=1 -v rd=ufsroot0 ufsroot=iosroot ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt=-1 wdt_test=no_user_checkin launchd_disable_all_timeouts=1 sweetfb_noconsole=1 sweetfb_hz=30 sweetfb_vsync=1 sweetfb_scale=1 sweetfb_flip=1 sweetarm64e=1 begoniamali=1 bglrender=soft" \
             --compress
 
           (
@@ -147,7 +147,7 @@ jobs:
             out-ios18/begonia-ios18-n841.adt \
             out-ios18/begonia-xnu-ramdisk-payload.bin \
             --ramdisk out-ios18/ios18-begonia-ramdisk.hfs \
-            --cmdline "debug=0x14e serial=3 rd=md0 -v cpus=6" \
+            --cmdline "debug=0x14e serial=3 rd=md0 wdt=-1 -v cpus=6 begoniamali=1" \
             --compress
 
           zstd -T0 -9 out-ios18/ios18-begonia-ramdisk.hfs -o out-ios18/ios18-begonia-ramdisk.hfs.zst
@@ -219,11 +219,18 @@ jobs:
           done
           ls -lh "$O"
 
+      - name: Install berga-tools (dash /bin/sh, dropbear, toybox, sweetuicache, bglrender)
+        run: |
+          set -euo pipefail
+          cd bergamota
+          python3 -I tools/renegade/renegade fetch-tools
+          python3 -I tools/renegade/berga_tools.py status
+
       - name: Build patched HFS+ full iOS 18.7.8 RootFS (.simg)
         run: |
           set -euo pipefail
           cd bergamota
-          EXTRA_FLAGS=(--size 18g --delete-sources --no-bluetooth --no-posterboard --no-bglrender)
+          EXTRA_FLAGS=(--size 18g --delete-sources --no-bluetooth --no-posterboard)
           if [ "${{ inputs.include_jb }}" != "true" ]; then
             EXTRA_FLAGS+=(--no-jb)
           fi

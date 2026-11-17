@@ -58,6 +58,14 @@ class TestBegoniaADT(unittest.TestCase):
         self.assertEqual(struct.unpack("<I", fbcon.prop("width"))[0], 1080)
         self.assertEqual(struct.unpack("<I", fbcon.prop("height"))[0], 2340)
 
+        mali = arm_io.child("mali")
+        self.assertIsNotNone(mali)
+        self.assertEqual(struct.unpack("<2Q", mali.prop("reg")), (0x13040000 - 0x0C000000, 0x10000))
+
+        sweet_ufs = parsed.child("sweet-ufs")
+        self.assertIsNotNone(sweet_ufs)
+        self.assertEqual(struct.unpack("<2Q", sweet_ufs.prop("reg")), (0x11270000, 0x2300))
+
 
 if __name__ == "__main__":
     unittest.main()

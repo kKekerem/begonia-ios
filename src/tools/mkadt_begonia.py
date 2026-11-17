@@ -180,6 +180,14 @@ def build_begonia_adt(
             ("canvas-height", u32(points[1] * display_scale)),
         ],
     )
+    mali = make_node(
+        "mali",
+        [
+            ph.prop(),
+            ("compatible", cstr("mediatek,mali") + cstr("arm,mali-bifrost")),
+            ("reg", u64(0x13040000 - SOC_BASE, 0x10000)),
+        ],
+    )
     arm_io = make_node(
         "arm-io",
         [
@@ -190,7 +198,16 @@ def build_begonia_adt(
             ("#size-cells", u32(2)),
             ("ranges", u64(0, SOC_BASE, SOC_SIZE)),
         ],
-        [gic, wdt, disp0],
+        [gic, wdt, disp0, mali],
+    )
+
+    sweet_ufs = make_node(
+        "sweet-ufs",
+        [
+            ph.prop(),
+            ("compatible", cstr("mediatek,ufshci") + cstr("qcom,ufshc")),
+            ("reg", u64(0x11270000, 0x2300)),
+        ],
     )
 
     fbcon = make_node(
@@ -214,7 +231,7 @@ def build_begonia_adt(
         ],
     )
 
-    children = [chosen, defaults, cpus, arm_io, fbcon, buttons]
+    children = [chosen, defaults, cpus, arm_io, sweet_ufs, fbcon, buttons]
     if product_adt_path:
         children.append(make_node("product", [ph.prop()] + extract_product_props(product_adt_path)))
 
