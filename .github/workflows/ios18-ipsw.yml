@@ -223,7 +223,7 @@ jobs:
         run: |
           set -euo pipefail
           cd bergamota
-          EXTRA_FLAGS=(--size 14g --delete-sources --no-bluetooth --no-posterboard --no-bglrender)
+          EXTRA_FLAGS=(--size 18g --delete-sources --no-bluetooth --no-posterboard --no-bglrender)
           if [ "${{ inputs.include_jb }}" != "true" ]; then
             EXTRA_FLAGS+=(--no-jb)
           fi
