@@ -793,10 +793,10 @@ index 0000000..04d06a8
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/begonia_mali_mmu.c b/bsd/dev/begonia_mali_mmu.c
 new file mode 100644
-index 0000000..5ea5908
+index 0000000..4db78b9
 --- /dev/null
 +++ b/bsd/dev/begonia_mali_mmu.c
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,337 @@
 +/*
 + * Mali-G76 AArch64 Stage-1 4K GPU MMU & VA allocator for begonia (MT6785).
 + */
@@ -805,6 +805,7 @@ index 0000000..5ea5908
 +#include <sys/systm.h>
 +#include <libkern/libkern.h>
 +#include <kern/locks.h>
++#include <machine/machine_routines.h>
 +#include <mach/vm_param.h>
 +#include <vm/pmap.h>
 +#include <vm/vm_kern.h>
@@ -1746,10 +1747,10 @@ index 1a16f3f..d9e4a98 100644
  			return true;
 diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
 new file mode 100644
-index 0000000..cca05c4
+index 0000000..5eb4dee
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMali.cpp
-@@ -0,0 +1,494 @@
+@@ -0,0 +1,495 @@
 +/*
 + * SweetMali: IOKit service and user client for begonia Mali-G76 MC4 (MT6785).
 + */
@@ -1757,6 +1758,7 @@ index 0000000..cca05c4
 +
 +#if defined(SWEET)
 +#include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>
 +#include <IOKit/IOUserClient.h>
 +#include <IOKit/IOKitKeys.h>
 +#include <IOKit/IOLib.h>
