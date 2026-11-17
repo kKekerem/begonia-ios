@@ -1,10 +1,53 @@
 /*
- * Dual-boot selection menu for Redmi Note 8 Pro (begonia / MT6785).
- * Reads MT6785 KP_MEM1 (0x10010000) and MT6359 TOPSTATUS (0x2a via PWRAP WACS2).
+ * macOS Startup Manager-style Dual-Boot Screen for Redmi Note 8 Pro (begonia / MT6785).
+ * Supports capacitive touch (Novatek NT36672A via SPI5) and physical Vol+/Vol-/Power buttons.
  */
 #include "boot_menu.h"
 #include "begonia_hw.h"
 #include "console.h"
+
+#define COL_BG          0xff111318U
+#define COL_CARD        0xff1b2029U
+#define COL_CARD_SEL    0xff232b3aU
+#define COL_BORDER      0xff2f3644U
+#define COL_SEL_RING    0xff3b82f6U
+#define COL_WHITE       0xffffffffU
+#define COL_MUTED       0xff9ca3afU
+#define COL_ANDROID     0xff34d399U
+#define COL_ANDROID_DK  0xff064e3bU
+#define COL_IOS_SILVER  0xffd1d5dbU
+#define COL_IOS_DK      0xff1e293bU
+#define COL_WARN        0xfffbbf24U
+#define COL_ERR         0xffef4444U
+
+#define BTN_UP          (1U << 0)
+#define BTN_DOWN        (1U << 1)
+#define BTN_POWER       (1U << 2)
+
+/* UI hitboxes in 1080x2340 panel coordinates */
+#define CARD_W          450U
+#define CARD_H          620U
+#define CARD_Y          400U
+#define CARD_AND_X      60U
+#define CARD_IOS_X      570U
+#define PATH_BOX_Y      1090U
+#define PATH_BOX_H      160U
+#define CONT_X          290U
+#define CONT_Y          1330U
+#define CONT_W          500U
+#define CONT_H          116U
+#define DIAG_X          310U
+#define DIAG_Y          1920U
+#define DIAG_W          460U
+#define DIAG_H          92U
+#define MODAL_X         80U
+#define MODAL_Y         720U
+#define MODAL_W         920U
+#define MODAL_H         650U
+#define MODAL_OK_X      340U
+#define MODAL_OK_Y      1210U
+#define MODAL_OK_W      400U
+#define MODAL_OK_H      96U
 
 static int pwrap_wait_fsm(uint32_t want)
 {
@@ -33,10 +76,6 @@ int pmic_read16(uint16_t reg, uint16_t *out)
     return 1;
 }
 
-#define BTN_UP      (1U << 0)
-#define BTN_DOWN    (1U << 1)
-#define BTN_POWER   (1U << 2)
-
 static uint32_t sample_buttons(void)
 {
     uint32_t btns = 0;
@@ -59,106 +98,321 @@ static uint32_t sample_buttons(void)
     return btns;
 }
 
-static void draw_menu(int has_android, int has_xnu, int selected, int secs_left)
+static void draw_centered_text(uint32_t cx, uint32_t y, const char *s, uint32_t scale, uint32_t fg)
 {
-    console_clear(0xff0d1117U);
-    console_set_fg(0xff58a6ffU);
-    con_puts("\n  begonia-ios Dual Boot Manager (MT6785)\n");
-    console_set_fg(0xff8b949eU);
-    con_puts("  --------------------------------------\n\n");
-
-    const char *labels[3] = {
-        "Android (Stock / Custom ROM)",
-        "iOS 18 (XNU-11215)",
-        "Diagnostic / Hardware Probe",
-    };
-    const int available[3] = { has_android, has_xnu, 1 };
-
-    for (int i = 0; i < 3; i++) {
-        if (i == selected) {
-            console_set_fg(0xff3fb950U);
-            con_puts("  > ");
-        } else {
-            console_set_fg(available[i] ? 0xffffffffU : 0xff6e7681U);
-            con_puts("    ");
-        }
-        con_puts("[");
-        con_dec((uint64_t)(i + 1));
-        con_puts("] ");
-        con_puts(labels[i]);
-        if (!available[i]) {
-            con_puts(" (not attached)");
-        }
-        con_putc('\n');
-    }
-
-    console_set_fg(0xff8b949eU);
-    con_puts("\n  Vol+/Vol-: Select   Power: Boot\n");
-    if (secs_left >= 0) {
-        console_set_fg(0xffd29922U);
-        con_puts("  Auto-booting in ");
-        con_dec((uint64_t)secs_left);
-        con_puts("s...\n");
-    }
-    console_set_fg(0xffffffffU);
+    uint32_t w = fb_text_width(s, scale);
+    uint32_t x = (cx > w / 2U) ? (cx - w / 2U) : 0U;
+    fb_draw_text(x, y, s, scale, fg, COL_BG, 1);
 }
 
-static int next_available(int cur, int dir, const int avail[3])
+static void fmt_u32_append(char *dst, uint32_t *pos, uint32_t val, int hex)
 {
-    for (int step = 0; step < 3; step++) {
-        cur = (cur + dir + 3) % 3;
-        if (avail[cur]) {
-            return cur;
-        }
+    static const char hd[] = "0123456789abcdef";
+    char tmp[12];
+    int n = 0;
+    if (hex) {
+        do {
+            tmp[n++] = hd[val & 0xfU];
+            val >>= 4;
+        } while (val);
+    } else {
+        do {
+            tmp[n++] = (char)('0' + (val % 10U));
+            val /= 10U;
+        } while (val);
     }
-    return BOOT_TARGET_DIAG;
+    while (n > 0) {
+        dst[(*pos)++] = tmp[--n];
+    }
 }
 
-enum boot_target boot_menu_select(int has_android, int has_xnu)
+static void str_append(char *dst, uint32_t *pos, const char *src)
 {
-    const int avail[3] = { has_android, has_xnu, 1 };
-    int selected = has_android ? BOOT_TARGET_ANDROID : (has_xnu ? BOOT_TARGET_XNU : BOOT_TARGET_DIAG);
+    while (*src) {
+        dst[(*pos)++] = *src++;
+    }
+}
 
-    /* Fast path: if only diagnostic mode is available, skip wait and run immediately */
-    if (!has_android && !has_xnu) {
-        return BOOT_TARGET_DIAG;
+static void draw_android_emblem(int32_t cx, int32_t cy)
+{
+    /* Rounded drive disk tile + clean procedural droid emblem */
+    fb_fill_round_rect((uint32_t)(cx - 95), (uint32_t)(cy - 95), 190U, 190U, 42U, COL_ANDROID_DK);
+    fb_stroke_round_rect((uint32_t)(cx - 95), (uint32_t)(cy - 95), 190U, 190U, 42U, 4U, COL_ANDROID);
+    /* Head dome (top half circle) + flat lower rim + eyes + antennas */
+    fb_fill_circle(cx, cy + 12, 48, COL_ANDROID);
+    fb_fill_rect((uint32_t)(cx - 52), (uint32_t)(cy + 16), 104U, 48U, COL_ANDROID_DK);
+    fb_fill_rect((uint32_t)(cx - 48), (uint32_t)(cy + 20), 96U, 30U, COL_ANDROID);
+    /* Left/right antennas (small angled rects) */
+    fb_fill_rect((uint32_t)(cx - 34), (uint32_t)(cy - 52), 8U, 26U, COL_ANDROID);
+    fb_fill_rect((uint32_t)(cx + 26), (uint32_t)(cy - 52), 8U, 26U, COL_ANDROID);
+    /* Eyes */
+    fb_fill_circle(cx - 18, cy - 6, 6, COL_ANDROID_DK);
+    fb_fill_circle(cx + 18, cy - 6, 6, COL_ANDROID_DK);
+}
+
+static void draw_ios_emblem(int32_t cx, int32_t cy)
+{
+    /* Sleek macOS-style silver/titanium volume badge for iOS 18 (XNU) */
+    fb_fill_round_rect((uint32_t)(cx - 95), (uint32_t)(cy - 95), 190U, 190U, 42U, COL_IOS_DK);
+    fb_stroke_round_rect((uint32_t)(cx - 95), (uint32_t)(cy - 95), 190U, 190U, 42U, 4U, 0xff64748bU);
+    /* Minimalist Apple/XNU orb + top leaf accent + crisp iOS 18 glyph */
+    fb_fill_circle(cx, cy + 12, 44, COL_IOS_SILVER);
+    fb_fill_circle(cx + 42, cy + 10, 18, COL_IOS_DK); /* classic right bite */
+    fb_fill_round_rect((uint32_t)(cx - 4), (uint32_t)(cy - 54), 22U, 16U, 8U, 0xff60a5faU);
+    draw_centered_text((uint32_t)cx, (uint32_t)(cy - 4), "18", 2U, COL_IOS_DK);
+}
+
+static void draw_card(uint32_t x, uint32_t y, int is_ios, int selected, int available)
+{
+    uint32_t bg = selected ? COL_CARD_SEL : COL_CARD;
+    fb_fill_round_rect(x, y, CARD_W, CARD_H, 40U, bg);
+    fb_stroke_round_rect(x, y, CARD_W, CARD_H, 40U, selected ? 5U : 2U,
+                         selected ? COL_SEL_RING : COL_BORDER);
+
+    uint32_t cx = x + CARD_W / 2U;
+    if (!is_ios) {
+        draw_android_emblem((int32_t)cx, (int32_t)(y + 185U));
+        draw_centered_text(cx, y + 345U, "Android 17", 3U, COL_WHITE);
+        draw_centered_text(cx, y + 410U, "AOSP RAM Chain", 2U, COL_MUTED);
+        draw_centered_text(cx, y + 475U, available ? "boot -> 0x40080000" : "Not Attached",
+                           2U, available ? COL_ANDROID : COL_ERR);
+    } else {
+        draw_ios_emblem((int32_t)cx, (int32_t)(y + 185U));
+        draw_centered_text(cx, y + 345U, "iOS 18", 3U, COL_WHITE);
+        draw_centered_text(cx, y + 410U, "XNU-11215", 2U, 0xff93c5fdU);
+        draw_centered_text(cx, y + 475U, available ? "Payload Ready" : "Not Bootable",
+                           2U, available ? COL_ANDROID : COL_WARN);
     }
 
-    int countdown = 3;
-    int ticks_per_sec = 50; /* 20 ms poll cadence */
-    int subtick = 0;
-    uint32_t prev = sample_buttons();
-    uint32_t stable = prev;
+    if (selected) {
+        fb_fill_round_rect(cx - 80U, y + CARD_H - 54U, 160U, 34U, 17U, COL_SEL_RING);
+        draw_centered_text(cx, y + CARD_H - 52U, "Selected", 2U, COL_WHITE);
+    }
+}
 
-    draw_menu(has_android, has_xnu, selected, countdown);
+static void draw_target_path_box(int selected, int has_xnu)
+{
+    fb_fill_round_rect(60U, PATH_BOX_Y, 960U, PATH_BOX_H, 28U, COL_CARD);
+    fb_stroke_round_rect(60U, PATH_BOX_Y, 960U, PATH_BOX_H, 28U, 2U, COL_BORDER);
+
+    if (selected == BOOT_TARGET_ANDROID) {
+        draw_centered_text(540U, PATH_BOX_Y + 30U, "Configured Boot Source: Android 17 (RAM)", 2U, COL_ANDROID);
+        draw_centered_text(540U, PATH_BOX_Y + 84U, "Chain Image @ 0x400c0000 -> 0x40080000 (no disk write)", 2U, COL_MUTED);
+    } else {
+        draw_centered_text(540U, PATH_BOX_Y + 26U, "Target: " IOS_EXPECTED_VOLUME, 2U, 0xff93c5fdU);
+        draw_centered_text(540U, PATH_BOX_Y + 72U, IOS_EXPECTED_KERNEL, 2U, COL_WHITE);
+        draw_centered_text(540U, PATH_BOX_Y + 116U,
+                           has_xnu ? "Volume attached in RAM payload" : "Status: Volume not present on UFS",
+                           2U, has_xnu ? COL_ANDROID : COL_WARN);
+    }
+}
+
+static void draw_continue_button(int selected)
+{
+    fb_fill_round_rect(CONT_X, CONT_Y, CONT_W, CONT_H, 58U, COL_SEL_RING);
+    const char *label = (selected == BOOT_TARGET_ANDROID) ? "Start Android 17 ->" : "Continue (iOS 18) ->";
+    draw_centered_text(CONT_X + CONT_W / 2U, CONT_Y + 34U, label, 3U, COL_WHITE);
+}
+
+static void draw_touch_footer(const struct touch_state *t)
+{
+    fb_fill_rect(40U, 2060U, 1000U, 190U, COL_BG);
+    char line[80];
+    uint32_t pos = 0;
+
+    if (t && t->ready) {
+        str_append(line, &pos, "Touch: NT36672A Ready (PID 0x");
+        fmt_u32_append(line, &pos, t->pid, 1);
+        str_append(line, &pos, " FW v");
+        fmt_u32_append(line, &pos, t->fw_ver, 0);
+        if (t->fw_uploaded) {
+            str_append(line, &pos, " RAM-DL");
+        }
+        str_append(line, &pos, ")");
+        line[pos] = '\0';
+        draw_centered_text(540U, 2070U, line, 2U, COL_ANDROID);
+    } else {
+        draw_centered_text(540U, 2070U, "Touch: Offline on SPI5 (Use Vol+/Vol-/Power)", 2U, COL_WARN);
+    }
+    draw_centered_text(540U, 2135U, "Tap card to select  *  Tap Continue or Vol+/- + Power", 2U, COL_MUTED);
+}
+
+static void draw_menu(int has_android, int has_xnu, int selected, const struct touch_state *t)
+{
+    console_clear(COL_BG);
+    draw_centered_text(540U, 120U, "Startup Manager", 4U, COL_WHITE);
+    draw_centered_text(540U, 210U, "begonia-ios  *  Redmi Note 8 Pro (MT6785)", 2U, COL_MUTED);
+
+    draw_card(CARD_AND_X, CARD_Y, 0, selected == BOOT_TARGET_ANDROID, has_android);
+    draw_card(CARD_IOS_X, CARD_Y, 1, selected == BOOT_TARGET_XNU, has_xnu);
+    draw_target_path_box(selected, has_xnu);
+    draw_continue_button(selected);
+
+    /* Hardware diagnostics chip */
+    fb_fill_round_rect(DIAG_X, DIAG_Y, DIAG_W, DIAG_H, 46U, COL_CARD);
+    fb_stroke_round_rect(DIAG_X, DIAG_Y, DIAG_W, DIAG_H, 46U, 2U, COL_BORDER);
+    draw_centered_text(DIAG_X + DIAG_W / 2U, DIAG_Y + 30U, "Hardware Diagnostics", 2U, COL_IOS_SILVER);
+
+    draw_touch_footer(t);
+}
+
+static void draw_ios_missing_modal(void)
+{
+    fb_fill_round_rect(MODAL_X, MODAL_Y, MODAL_W, MODAL_H, 36U, 0xff1e2430U);
+    fb_stroke_round_rect(MODAL_X, MODAL_Y, MODAL_W, MODAL_H, 36U, 4U, COL_ERR);
+
+    fb_fill_circle(540, (int32_t)(MODAL_Y + 95U), 46, COL_ERR);
+    draw_centered_text(540U, MODAL_Y + 71U, "!", 3U, COL_WHITE);
+
+    draw_centered_text(540U, MODAL_Y + 175U, "iOS 18 Cannot Be Started", 3U, COL_WHITE);
+    draw_centered_text(540U, MODAL_Y + 250U, "Expected boot volume / kernel path not found:", 2U, COL_MUTED);
+    draw_centered_text(540U, MODAL_Y + 305U, IOS_EXPECTED_VOLUME IOS_EXPECTED_KERNEL, 2U, 0xff93c5fdU);
+    draw_centered_text(540U, MODAL_Y + 370U, "iOS boot skipped safely. Android data untouched.", 2U, COL_ANDROID);
+
+    fb_fill_round_rect(MODAL_OK_X, MODAL_OK_Y, MODAL_OK_W, MODAL_OK_H, 48U, COL_SEL_RING);
+    draw_centered_text(MODAL_OK_X + MODAL_OK_W / 2U, MODAL_OK_Y + 24U, "OK", 3U, COL_WHITE);
+}
+
+static int in_box(uint32_t x, uint32_t y, uint32_t bx, uint32_t by, uint32_t bw, uint32_t bh)
+{
+    return x >= bx && x < (bx + bw) && y >= by && y < (by + bh);
+}
+
+static void show_modal_until_ack(struct touch_state *touch)
+{
+    draw_ios_missing_modal();
+    delay_ms(120U);
+
+    uint32_t prev_btn = sample_buttons();
+    int prev_touch = 1; /* require fresh tap/release so holding doesn't auto-dismiss */
+    for (;;) {
+        delay_ms(20U);
+        uint32_t b = sample_buttons();
+        uint32_t pressed = b & ~prev_btn;
+        prev_btn = b;
+        if (pressed != 0U) {
+            return;
+        }
+        if (touch && touch->ready) {
+            touch_poll(touch);
+            if (!touch->down) {
+                prev_touch = 0;
+            } else if (!prev_touch) {
+                if (in_box(touch->x, touch->y, MODAL_OK_X, MODAL_OK_Y, MODAL_OK_W, MODAL_OK_H) ||
+                    in_box(touch->x, touch->y, MODAL_X, MODAL_Y, MODAL_W, MODAL_H)) {
+                    /* Wait for finger release cleanly */
+                    while (touch->down) {
+                        delay_ms(20U);
+                        touch_poll(touch);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
+void boot_menu_wait_any_input(struct touch_state *touch)
+{
+    delay_ms(250U);
+    uint32_t prev_btn = sample_buttons();
+    int had_release = 0;
+    for (;;) {
+        delay_ms(25U);
+        uint32_t b = sample_buttons();
+        uint32_t pressed = b & ~prev_btn;
+        prev_btn = b;
+        if (pressed != 0U) {
+            return;
+        }
+        if (touch && touch->ready) {
+            touch_poll(touch);
+            if (!touch->down) {
+                had_release = 1;
+            } else if (had_release) {
+                while (touch->down) {
+                    delay_ms(20U);
+                    touch_poll(touch);
+                }
+                return;
+            }
+        }
+    }
+}
+
+enum boot_target boot_menu_select(int has_android, int has_xnu, struct touch_state *touch)
+{
+    int selected = has_android ? BOOT_TARGET_ANDROID : BOOT_TARGET_XNU;
+    uint32_t prev_btn = sample_buttons();
+    uint32_t stable_btn = prev_btn;
+    int prev_touch_down = 0;
+
+    draw_menu(has_android, has_xnu, selected, touch);
 
     for (;;) {
-        delay_ms(20);
-        uint32_t s1 = sample_buttons();
-        if (s1 == prev) {
-            uint32_t pressed = s1 & ~stable;
-            stable = s1;
-            if (pressed & BTN_POWER) {
-                return (enum boot_target)selected;
-            }
-            if (pressed & BTN_UP) {
-                countdown = -1;
-                selected = next_available(selected, -1, avail);
-                draw_menu(has_android, has_xnu, selected, countdown);
-            } else if (pressed & BTN_DOWN) {
-                countdown = -1;
-                selected = next_available(selected, 1, avail);
-                draw_menu(has_android, has_xnu, selected, countdown);
-            }
-        }
-        prev = s1;
+        delay_ms(20U);
 
-        if (countdown >= 0 && ++subtick >= ticks_per_sec) {
-            subtick = 0;
-            if (--countdown <= 0) {
-                return (enum boot_target)selected;
+        /* 1. Hardware buttons */
+        uint32_t s1 = sample_buttons();
+        if (s1 == prev_btn) {
+            uint32_t pressed = s1 & ~stable_btn;
+            stable_btn = s1;
+            if (pressed & (BTN_UP | BTN_DOWN)) {
+                selected = (selected == BOOT_TARGET_ANDROID) ? BOOT_TARGET_XNU : BOOT_TARGET_ANDROID;
+                draw_menu(has_android, has_xnu, selected, touch);
+            } else if (pressed & BTN_POWER) {
+                if (selected == BOOT_TARGET_XNU && !has_xnu) {
+                    show_modal_until_ack(touch);
+                    draw_menu(has_android, has_xnu, selected, touch);
+                } else if (selected != BOOT_TARGET_ANDROID || has_android) {
+                    return (enum boot_target)selected;
+                }
             }
-            draw_menu(has_android, has_xnu, selected, countdown);
+        } else {
+            prev_btn = s1;
+        }
+
+        /* 2. Capacitive touchscreen polling */
+        if (touch && touch->ready) {
+            touch_poll(touch);
+            int tapped = (!prev_touch_down && touch->down);
+            prev_touch_down = touch->down;
+            if (!tapped) {
+                continue;
+            }
+            uint32_t tx = touch->x;
+            uint32_t ty = touch->y;
+
+            if (in_box(tx, ty, CARD_AND_X, CARD_Y, CARD_W, CARD_H)) {
+                if (selected == BOOT_TARGET_ANDROID && has_android) {
+                    return BOOT_TARGET_ANDROID;
+                }
+                selected = BOOT_TARGET_ANDROID;
+                draw_menu(has_android, has_xnu, selected, touch);
+            } else if (in_box(tx, ty, CARD_IOS_X, CARD_Y, CARD_W, CARD_H)) {
+                if (selected == BOOT_TARGET_XNU) {
+                    if (!has_xnu) {
+                        show_modal_until_ack(touch);
+                        draw_menu(has_android, has_xnu, selected, touch);
+                    } else {
+                        return BOOT_TARGET_XNU;
+                    }
+                } else {
+                    selected = BOOT_TARGET_XNU;
+                    draw_menu(has_android, has_xnu, selected, touch);
+                }
+            } else if (in_box(tx, ty, CONT_X, CONT_Y, CONT_W, CONT_H)) {
+                if (selected == BOOT_TARGET_XNU && !has_xnu) {
+                    show_modal_until_ack(touch);
+                    draw_menu(has_android, has_xnu, selected, touch);
+                } else if (selected == BOOT_TARGET_ANDROID && has_android) {
+                    return BOOT_TARGET_ANDROID;
+                } else if (selected == BOOT_TARGET_XNU && has_xnu) {
+                    return BOOT_TARGET_XNU;
+                }
+            } else if (in_box(tx, ty, DIAG_X, DIAG_Y, DIAG_W, DIAG_H)) {
+                return BOOT_TARGET_DIAG;
+            }
         }
     }
 }

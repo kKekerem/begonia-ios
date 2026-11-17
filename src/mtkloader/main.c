@@ -7,6 +7,7 @@
 #include "boot_menu.h"
 #include "console.h"
 #include "fdt.h"
+#include "touch.h"
 #include "xnu_boot.h"
 
 extern char _start[];
@@ -144,7 +145,7 @@ static void chain_android(uintptr_t fdt, uint64_t android_len)
        android_len, BEGONIA_KERNEL_PA);
 }
 
-static void show_diagnostics(uintptr_t fdt)
+static void show_diagnostics(uintptr_t fdt, const struct touch_state *touch)
 {
     console_clear(0xff0d1117U);
     console_set_fg(0xff58a6ffU);
@@ -152,6 +153,19 @@ static void show_diagnostics(uintptr_t fdt)
     console_set_fg(0xffffffffU);
     con_puts("LK FDT=");
     con_hex((uint64_t)fdt);
+    con_puts("\nTouch ready=");
+    con_dec((uint64_t)touch->ready);
+    con_puts(" PID=");
+    con_hex((uint64_t)touch->pid);
+    con_puts(" FW=v");
+    con_dec((uint64_t)touch->fw_ver);
+    con_puts(" ID=");
+    for (int i = 0; i < 6; i++) {
+        con_hex(touch->chip_id[i]);
+        if (i < 5) {
+            con_putc(':');
+        }
+    }
     con_putc('\n');
     print_cpu_probe();
     print_soc_probe();
@@ -164,41 +178,50 @@ void mtkloader_main(uint64_t fdt_pa)
     uintptr_t pl_start = 0, pl_end = 0;
     const volatile uint64_t *hdr = (const volatile uint64_t *)_start;
     uint64_t android_len = hdr[4];
+    struct touch_state touch;
 
     wdt_disable();
     console_init(fdt, 2U);
+    console_strip_ovl_alpha();
+
+    uintptr_t android_img_pa = android_len ? (uintptr_t)_start + BEGONIA_CHAIN_OFFSET : 0U;
+    touch_init(android_img_pa, android_len, &touch);
 
     int has_xnu = find_payload_window(fdt, &pl_start, &pl_end);
     int has_android = (android_len != 0ULL);
-    enum boot_target target = boot_menu_select(has_android, has_xnu);
 
-    if (target == BOOT_TARGET_ANDROID && has_android) {
-        console_clear(0xff0d1117U);
-        chain_android(fdt, android_len);
-    }
-
-    show_diagnostics(fdt);
-
-    if (target == BOOT_TARGET_XNU && has_xnu) {
-        console_set_fg(0xff3fb950U);
-        con_puts("Booting SWEETXNU payload at ");
-        con_hex(pl_start);
-        con_putc('\n');
-        console_set_fg(0xffffffffU);
-
-        const char *err = xnu_payload_boot(pl_start, pl_end);
-        console_set_fg(0xffff5555U);
-        con_puts("XNU boot error: ");
-        con_puts(err);
-        con_putc('\n');
-    } else {
-        console_set_fg(0xffd29922U);
-        con_puts("Diagnostic screen ready.\n");
-        console_set_fg(0xffffffffU);
-    }
-
-    con_puts("Halted cleanly (hold Power to reboot).\n");
     for (;;) {
-        __asm__ volatile("wfe");
+        enum boot_target target = boot_menu_select(has_android, has_xnu, &touch);
+
+        if (target == BOOT_TARGET_ANDROID && has_android) {
+            console_clear(0xff000000U);
+            chain_android(fdt, android_len);
+        }
+
+        if (target == BOOT_TARGET_XNU && has_xnu) {
+            show_diagnostics(fdt, &touch);
+            console_set_fg(0xff3fb950U);
+            con_puts("Booting SWEETXNU payload at ");
+            con_hex(pl_start);
+            con_putc('\n');
+            console_set_fg(0xffffffffU);
+
+            const char *err = xnu_payload_boot(pl_start, pl_end);
+            console_set_fg(0xffff5555U);
+            con_puts("XNU boot error: ");
+            con_puts(err);
+            con_putc('\n');
+            console_set_fg(0xffffffffU);
+            con_puts("Halted cleanly (hold Power to reboot).\n");
+            for (;;) {
+                __asm__ volatile("wfe");
+            }
+        }
+
+        show_diagnostics(fdt, &touch);
+        console_set_fg(0xff3fb950U);
+        con_puts("\nTap screen or press any key to return to Startup Manager...\n");
+        console_set_fg(0xffffffffU);
+        boot_menu_wait_any_input(&touch);
     }
 }

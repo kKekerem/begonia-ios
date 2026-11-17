@@ -74,11 +74,31 @@
 #define DISP_MUTEX0_EN          (MT6785_DISP_MUTEX_BASE + 0x020u)
 #define DISP_MUTEX0_RST         (MT6785_DISP_MUTEX_BASE + 0x028u)
 
-/* Panel & fallback LK framebuffer (xiaomi-mt6785-common.dtsi / begonia-mt6785.dtsi) */
+/* Panel & fallback LK framebuffer (begonia fb0 stride = 1088*4 = 4352) */
 #define BEGONIA_PANEL_W         1080u
 #define BEGONIA_PANEL_H         2340u
+#define BEGONIA_FB_STRIDE_DEF   4352u
 #define BEGONIA_FB_FALLBACK     0x7e605000ULL
 #define BEGONIA_FB_FALLBACK_SZ  0x017e8000ULL
+
+/* Clocks, GPIO & SPI5 (Novatek NT36672A touchscreen controller on begonia) */
+#define MT6785_TOPCKGEN_BASE    0x10000000ULL
+#define TOPCK_CLK_CFG_UPDATE    (MT6785_TOPCKGEN_BASE + 0x004u)
+#define TOPCK_CLK_CFG_5_CLR     (MT6785_TOPCKGEN_BASE + 0x078u)
+#define MT6785_INFRACFG_AO_BASE 0x10001000ULL
+#define INFRA_SW_CG2_CLR        (MT6785_INFRACFG_AO_BASE + 0x0a8u)
+#define INFRA_CG2_SPI5_BIT      (1u << 26)
+
+#define MT6785_GPIO_BASE        0x10005000ULL
+#define MT6785_SPI5_BASE        0x11019000ULL
+#define SPI_CFG0_REG            0x0000u
+#define SPI_CFG1_REG            0x0004u
+#define SPI_TX_DATA_REG         0x0010u
+#define SPI_RX_DATA_REG         0x0014u
+#define SPI_CMD_REG             0x0018u
+#define SPI_STATUS0_REG         0x001cu
+#define SPI_PAD_SEL_REG         0x0024u
+#define SPI_CFG2_REG            0x0028u
 
 /* MMIO helpers (MMU is off, so all memory is Device-nGnRnE) */
 static inline uint32_t mmio_read32(uint64_t addr)

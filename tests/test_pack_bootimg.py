@@ -57,6 +57,33 @@ class TestPackBootImg(unittest.TestCase):
             self.assertEqual(blob[res3 : res3 + res4], fake_payload)
             self.assertEqual(blob[pack_bootimg.CHAIN_OFFSET : pack_bootimg.CHAIN_OFFSET + res2], fake_android_img)
 
+    def test_chainboot_preserves_ramdisk_and_dtb_without_payload(self) -> None:
+        loader = make_synthetic_loader()
+        fake_android_img = make_synthetic_loader(32768)
+        stock_ramdisk = b"RAMDISK-DATA" * 100
+        stock_dtb = pack_bootimg.build_minimal_fdt("begonia-stock-test")
+        stock_img = pack_bootimg.build_bootimg_v2(
+            kernel_gz=gzip.compress(fake_android_img, mtime=0),
+            ramdisk=stock_ramdisk,
+            second=b"",
+            dtb=stock_dtb,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            out_path = os.path.join(td, "preview.img")
+            out = pack_bootimg.pack_chainboot(stock_img, loader, out_path, payload_bin=None)
+            ks, _, rs, _, ss, _, _, pg, hv = struct.unpack_from("<9I", out, 8)
+            rdo, = struct.unpack_from("<I", out, 1632)
+            dtb_sz, = struct.unpack_from("<I", out, 1648)
+            self.assertEqual(hv, 2)
+            self.assertEqual(rs, len(stock_ramdisk))
+            self.assertEqual(rdo, 0)
+            self.assertEqual(dtb_sz, len(stock_dtb))
+            pgs = lambda n: ((n + pg - 1) // pg) * pg  # noqa: E731
+            rd_off = pg + pgs(ks)
+            self.assertEqual(out[rd_off : rd_off + rs], stock_ramdisk)
+            dtb_off = rd_off + pgs(rs) + pgs(ss)
+            self.assertEqual(out[dtb_off : dtb_off + dtb_sz], stock_dtb)
+
 
 if __name__ == "__main__":
     unittest.main()
