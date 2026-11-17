@@ -84,6 +84,32 @@ class TestPackBootImg(unittest.TestCase):
             dtb_off = rd_off + pgs(rs) + pgs(ss)
             self.assertEqual(out[dtb_off : dtb_off + dtb_sz], stock_dtb)
 
+            # Also verify recovery_dtbo extraction, placement, offset update, and v2 SHA1
+            fake_dtbo = b"\xd7\xb7\xab\x1e" + b"\xaa" * 5000
+            rec_src = pack_bootimg.build_bootimg_v2(
+                kernel_gz=gzip.compress(fake_android_img, mtime=0),
+                ramdisk=stock_ramdisk,
+                second=b"",
+                dtb=stock_dtb,
+                recovery_dtbo=fake_dtbo,
+            )
+            extracted = pack_bootimg.extract_recovery_dtbo(rec_src)
+            self.assertEqual(extracted, fake_dtbo)
+            rec_out_path = os.path.join(td, "rec-preview.img")
+            rec_out = pack_bootimg.pack_chainboot(
+                stock_img, loader, rec_out_path, payload_bin=None, recovery_dtbo=extracted
+            )
+            rks, _, rrs, _, rss, _, _, rpg, _ = struct.unpack_from("<9I", rec_out, 8)
+            rrdo_sz, rrdo_addr = struct.unpack_from("<IQ", rec_out, 1632)
+            rdtb_sz, = struct.unpack_from("<I", rec_out, 1648)
+            rpgs = lambda n: ((n + rpg - 1) // rpg) * rpg  # noqa: E731
+            expected_rdo_off = rpg + rpgs(rks) + rpgs(rrs) + rpgs(rss)
+            self.assertEqual(rrdo_sz, len(fake_dtbo))
+            self.assertEqual(rrdo_addr, expected_rdo_off)
+            self.assertEqual(rec_out[rrdo_addr : rrdo_addr + rrdo_sz], fake_dtbo)
+            rec_dtb_off = expected_rdo_off + rpgs(rrdo_sz)
+            self.assertEqual(rec_out[rec_dtb_off : rec_dtb_off + rdtb_sz], stock_dtb)
+
 
 if __name__ == "__main__":
     unittest.main()

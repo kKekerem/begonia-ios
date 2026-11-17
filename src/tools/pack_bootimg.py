@@ -95,15 +95,26 @@ def build_bootimg_v2(
     ramdisk: bytes,
     second: bytes,
     dtb: bytes,
+    recovery_dtbo: bytes = b"",
     cmdline: str = "bootopt=64S3,32N2,64N2",
     page_size: int = BEGONIA_PAGE_SIZE,
     header_template: Optional[bytes] = None,
 ) -> bytes:
+    def pages(n: int) -> int:
+        return ((n + page_size - 1) // page_size) * page_size
+
+    rdo_offset = (
+        page_size + pages(len(kernel_gz)) + pages(len(ramdisk)) + pages(len(second))
+        if recovery_dtbo
+        else 0
+    )
+
     if header_template is not None:
         hdr = bytearray(header_template[:page_size])
         struct.pack_into("<I", hdr, 8, len(kernel_gz))
         struct.pack_into("<I", hdr, 16, len(ramdisk))
         struct.pack_into("<I", hdr, 24, len(second))
+        struct.pack_into("<IQ", hdr, 1632, len(recovery_dtbo), rdo_offset)
         struct.pack_into("<I", hdr, 1648, len(dtb))
     else:
         hdr = bytearray(page_size)
@@ -125,21 +136,23 @@ def build_bootimg_v2(
             b"begonia-ios".ljust(16, b"\0"),
             cmdline.encode("utf-8")[:511].ljust(512, b"\0"),
         )
+        struct.pack_into("<IQI", hdr, 1632, len(recovery_dtbo), rdo_offset, 1660)
         struct.pack_into("<IQ", hdr, 1648, len(dtb), BEGONIA_DTB_ADDR)
 
     sha = hashlib.sha1()
-    for part in (kernel_gz, ramdisk, second, dtb):
+    for part in (kernel_gz, ramdisk, second, recovery_dtbo, dtb):
         sha.update(part)
         sha.update(struct.pack("<I", len(part)))
     hdr[576:608] = sha.digest().ljust(32, b"\0")
 
-    if header_template is not None:
-        # Boot header v2 includes recovery_dtbo (0 when repacked without recovery dtbo)
-        rdo_size, = struct.unpack_from("<I", hdr, 1632)
-        if rdo_size != 0:
-            struct.pack_into("<I", hdr, 1632, 0)
-
-    out = bytes(hdr) + _pad(kernel_gz, page_size) + _pad(ramdisk, page_size) + _pad(second, page_size) + _pad(dtb, page_size)
+    out = (
+        bytes(hdr)
+        + _pad(kernel_gz, page_size)
+        + _pad(ramdisk, page_size)
+        + _pad(second, page_size)
+        + _pad(recovery_dtbo, page_size)
+        + _pad(dtb, page_size)
+    )
     if len(out) > BEGONIA_BOOT_PARTITION:
         raise ValueError(f"boot image ({len(out)} B) exceeds begonia 64 MiB boot partition")
     return out
@@ -156,7 +169,31 @@ def pack_standalone(loader_bin: bytes, out_path: str, payload_bin: Optional[byte
     return img
 
 
-def pack_chainboot(stock_boot_img: bytes, loader_bin: bytes, out_path: str, payload_bin: Optional[bytes] = None) -> bytes:
+def extract_recovery_dtbo(recovery_img: bytes) -> bytes:
+    """Extract recovery_dtbo section from an existing v1/v2 Android recovery image."""
+    if recovery_img[:8] != b"ANDROID!":
+        raise ValueError("recovery image is not an Android boot image")
+    ksize, _, rsize, _, ssize, _, _, page, hver = struct.unpack_from("<9I", recovery_img, 8)
+    if hver < 1:
+        return b""
+    rdo_size, = struct.unpack_from("<I", recovery_img, 1632)
+    if rdo_size == 0:
+        return b""
+
+    def pages(n: int) -> int:
+        return ((n + page - 1) // page) * page
+
+    off = page + pages(ksize) + pages(rsize) + pages(ssize)
+    return recovery_img[off : off + rdo_size]
+
+
+def pack_chainboot(
+    stock_boot_img: bytes,
+    loader_bin: bytes,
+    out_path: str,
+    payload_bin: Optional[bytes] = None,
+    recovery_dtbo: bytes = b"",
+) -> bytes:
     if stock_boot_img[:8] != b"ANDROID!":
         raise ValueError("stock image is not an Android boot image")
     ksize, _, rsize, _, ssize, _, _, page, hver = struct.unpack_from("<9I", stock_boot_img, 8)
@@ -172,8 +209,11 @@ def pack_chainboot(stock_boot_img: bytes, loader_bin: bytes, out_path: str, payl
     kernel = stock_boot_img[off : off + ksize]; off += pages(ksize)
     ramdisk = stock_boot_img[off : off + rsize]; off += pages(rsize)
     second = stock_boot_img[off : off + ssize]; off += pages(ssize)
-    off += pages(rdo_size)
+    rdo = stock_boot_img[off : off + rdo_size]; off += pages(rdo_size)
     dtb = stock_boot_img[off : off + dtb_size]
+
+    if recovery_dtbo:
+        rdo = recovery_dtbo
 
     android_img = gzip.decompress(kernel) if kernel[:2] == b"\x1f\x8b" else kernel
     if android_img[0x38:0x3C] != b"ARM\x64":
@@ -198,6 +238,7 @@ def pack_chainboot(stock_boot_img: bytes, loader_bin: bytes, out_path: str, payl
         ramdisk=ramdisk,
         second=second,
         dtb=dtb,
+        recovery_dtbo=rdo,
         page_size=page,
         header_template=stock_boot_img,
     )
@@ -211,6 +252,7 @@ def main() -> int:
     ap.add_argument("loader", help="Compiled mtkloader.bin")
     ap.add_argument("out", help="Output boot.img")
     ap.add_argument("--stock-boot", default=None, help="Stock begonia boot.img for chainboot dual-boot")
+    ap.add_argument("--stock-recovery", default=None, help="Optional stock recovery.img to preserve recovery_dtbo")
     ap.add_argument("--payload", default=None, help="Optional SWEETXNU payload")
     ap.add_argument("--dtb", default=None, help="Optional DTB file for standalone mode")
     args = ap.parse_args()
@@ -223,10 +265,15 @@ def main() -> int:
     else:
         payload = None
 
+    rec_dtbo = b""
+    if args.stock_recovery:
+        with open(args.stock_recovery, "rb") as fp:
+            rec_dtbo = extract_recovery_dtbo(fp.read())
+
     if args.stock_boot:
         with open(args.stock_boot, "rb") as fp:
             stock = fp.read()
-        img = pack_chainboot(stock, loader, args.out, payload_bin=payload)
+        img = pack_chainboot(stock, loader, args.out, payload_bin=payload, recovery_dtbo=rec_dtbo)
     else:
         if args.dtb:
             with open(args.dtb, "rb") as fp:
