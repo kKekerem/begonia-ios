@@ -46,7 +46,7 @@ index bc66afd..e99065b 100644
 +    include_directories : [inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium,
 +                           inc_gallium_aux, inc_gallium_winsys_sw, inc_gallium_winsys,
 +                           inc_gallium_drivers],
-+    dependencies : [dep_m, idep_air, idep_mesautil, driver_softpipe, driver_panfrost,
++    dependencies : [dep_m, idep_air, idep_mesautil, idep_xmlconfig, driver_softpipe, driver_panfrost,
 +                    dep_libdrm],
 +    link_with : [libgallium, libgalliumvl_stub, libws_null, libpanfrostwinsys],
 +    link_args : bgair_link_args,
@@ -559,7 +559,7 @@ index 3c37161..0cb9739 100644
 +osmesa_sweet_deps = []
 +if with_gallium_panfrost and host_machine.system() == 'darwin'
 +  osmesa_sweet_files += 'sweet_hw.c'
-+  osmesa_sweet_deps += [driver_panfrost, dep_libdrm]
++  osmesa_sweet_deps += [driver_panfrost, dep_libdrm, idep_xmlconfig]
 +endif
 +
  libosmesa = shared_library(
