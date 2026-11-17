@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/sweet_board.h b/bsd/dev/sweet_board.h
+index 3d9c06a..5a375ed 100644
+--- a/bsd/dev/sweet_board.h
++++ b/bsd/dev/sweet_board.h
+@@ -3,6 +3,7 @@
+  * (tools/mkadt.py --board) names the board; everything else is common.
+  *   xiaomi,sweet      Redmi Note 10 Pro, SM7150 (default)
+  *   xiaomi,beryllium  Poco F1, SDM845
++ *   xiaomi,begonia    Redmi Note 8 Pro, MT6785
+  */
+ #ifndef _SWEET_BOARD_H_
+ #define _SWEET_BOARD_H_
+@@ -76,4 +77,14 @@ sweet_board_beryllium(void)
+ 	return cached == 1;
+ }
+ 
++static inline bool
++sweet_board_begonia(void)
++{
++	static int cached = -1;
++	if (cached < 0) {
++		cached = sweet_board_is("xiaomi,begonia") ? 1 : 0;
++	}
++	return cached == 1;
++}
++
+ #endif /* _SWEET_BOARD_H_ */
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index cbb362d..1a38589 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -12,6 +12,8 @@
+ 
+ extern "C" int sweet_reboot_restart(int panic_restart);
+ extern "C" void sweet_reboot_note_panic(void);
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++static vm_offset_t begonia_wdt_base;
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -58,6 +60,11 @@ SweetPlatformExpert::haltRestart(unsigned int type)
+ 		(void)sweet_reboot_restart(1);
+ 		break;
+ 	case kPERestartCPU:
++		if (sweet_board_begonia() && begonia_wdt_base) {
++			/* Pre-mapped MT6785 TOPRGU warm reset (safe without VM locks) */
++			*(volatile uint32_t *)(begonia_wdt_base + 0x14) = 0x1209U;
++			__asm__ volatile("dsb sy" ::: "memory");
++		}
+ 		(void)sweet_reboot_restart(0);
+ 		break;
+ 	default:

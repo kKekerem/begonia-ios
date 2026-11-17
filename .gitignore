@@ -1,0 +1,15 @@
+build/
+out/
+research/
+.ccache/
+.venv/
+__pycache__/
+*.pyc
+*.o
+*.elf
+*.bin
+*.img
+*.simg
+*.macho
+*.adt
+*.dtb
