@@ -211,7 +211,7 @@ jobs:
           xcrun simctl delete all >/dev/null 2>&1 || true
           sudo rm -rf /Users/runner/hostedtoolcache/Android* /Library/Developer/CoreSimulator/Images/* 2>/dev/null || true
           brew cleanup --prune=all >/dev/null 2>&1 || true
-          brew install blacktop/tap/ipsw zstd
+          brew install blacktop/tap/ipsw zstd dropbear || brew install blacktop/tap/ipsw zstd
           df -h
 
       - name: Clone Bergamota tools (pinned commit)
@@ -245,7 +245,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p metal-out
+          mkdir -p metal-out ~/.ssh
+          [ -f ~/.ssh/id_ed25519.pub ] || ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519
           gh run download "${{ needs.prepare.outputs.metal_run_id }}" -R "${{ github.repository }}" \
             -n begonia-metal-userspace -D metal-out
           cd bergamota
@@ -269,14 +270,17 @@ jobs:
                   shutil.rmtree(dst_b, ignore_errors=True)
                   shutil.copytree(src_b, dst_b)
                   for dn, _, fns in os.walk(dst_b):
+                      os.chown(dn, 0, 0)
                       os.chmod(dn, 0o755)
                       for fn in fns:
                           fp = os.path.join(dn, fn)
+                          os.chown(fp, 0, 0)
                           os.chmod(fp, 0o755 if fn in ('Chlorophyll', 'libbgair.dylib', 'libdrm.2.dylib') else 0o644)
                   print('bgmtl: Chlorophyll.bundle installed in /System/Library/Extensions/Chlorophyll.bundle')
               bb_arm = os.path.join(root, 'private/var/tmp/bgmtl-bb.arm')
               os.makedirs(os.path.dirname(bb_arm), exist_ok=True)
               open(bb_arm, 'w').write('armed by begonia-ios metal\\n')
+              os.chown(bb_arm, 0, 0)
               os.chmod(bb_arm, 0o644)
               ps = os.path.join(REPO, 'research/bgmtl-probes')
               if os.path.isdir(ps):
@@ -291,6 +295,9 @@ jobs:
                       if os.path.exists(sp):
                           install_file(sp, os.path.join(root, 'usr/local/share/begonia-metal', m), 0o644)
           '''
+          old_need = "('dropbear', 'dash', 'toybox', 'dropbear-mac', 'toybox-mac')"
+          assert old_need in s, 'ssh need tuple not found'
+          s = s.replace(old_need, "('dropbear', 'dash', 'toybox')", 1)
           anchor = "    if enabled('bglrender'):\n        bglrender(root)"
           assert anchor in s, 'auto() anchor not found'
           s = s.replace(anchor, anchor + "\n    begonia_install_metal_extras(root)", 1)
