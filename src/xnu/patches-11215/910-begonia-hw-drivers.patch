@@ -796,7 +796,7 @@ new file mode 100644
 index 0000000..4db78b9
 --- /dev/null
 +++ b/bsd/dev/begonia_mali_mmu.c
-@@ -0,0 +1,337 @@
+@@ -0,0 +1,338 @@
 +/*
 + * Mali-G76 AArch64 Stage-1 4K GPU MMU & VA allocator for begonia (MT6785).
 + */
@@ -804,6 +804,7 @@ index 0000000..4db78b9
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <libkern/libkern.h>
++#include <kern/clock.h>
 +#include <kern/locks.h>
 +#include <machine/machine_routines.h>
 +#include <mach/vm_param.h>
