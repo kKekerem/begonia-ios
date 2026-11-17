@@ -1,5 +1,5 @@
 diff --git a/air/air_metal.c b/air/air_metal.c
-index 67912be..f496a73 100644
+index 67912be..cce7667 100644
 --- a/air/air_metal.c
 +++ b/air/air_metal.c
 @@ -45,6 +45,11 @@
@@ -74,3 +74,24 @@ index 67912be..f496a73 100644
        static const driOptionDescription freedreno_options[] = {
  #include "freedreno/driinfo_freedreno.h"
        };
+@@ -7235,7 +7252,9 @@ fail:
+ 
+ /* Chlorophyll: freedreno's debug flags, present only in a build that links the freedreno driver (the host build runs
+  * softpipe). FD_DBG_SYSMEM (bit 9) makes every batch render in sysmem instead of tiling through GMEM. */
++#ifdef GALLIUM_FREEDRENO
+ extern int fd_mesa_debug __attribute__((weak_import));
++#endif
+ 
+ int
+ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
+@@ -7577,8 +7596,10 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
+     * patched from the resource (patch_fb_read_sysmem) is exact. Sticky for the process: such a batch can be flushed
+     * by a later call, and a client that fetches at all (CoreAnimation) does so every frame.
+     */
++#ifdef GALLIUM_FREEDRENO
+    if (render->finfo.fbfetch_targets && &fd_mesa_debug)
+       fd_mesa_debug |= (1 << 9);
++#endif
+ 
+    fb_bind(device, &fb, draw->color, draw->color_count, draw->depth);
+ 
