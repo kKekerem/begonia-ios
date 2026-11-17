@@ -249,8 +249,8 @@ jobs:
           gh run download "${{ needs.prepare.outputs.metal_run_id }}" -R "${{ github.repository }}" \
             -n begonia-metal-userspace -D metal-out
           cd bergamota
-          python3 -I tools/renegade/renegade fetch-tools
-          python3 -I tools/renegade/berga_tools.py status
+          bash tools/renegade/renegade fetch-tools
+          python3 -I tools/renegade/berga_tools.py --status
           rm -rf research/bgmtl research/bergamota-gl research/Chlorophyll.bundle research/bgmtl-probes
           mkdir -p research/bgmtl research/bergamota-gl research/Chlorophyll.bundle research/bgmtl-probes
           cp -R ../metal-out/bgmtl/. research/bgmtl/
