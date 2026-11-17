@@ -296,10 +296,10 @@ index 0000000..70e5b2c
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
 new file mode 100644
-index 0000000..893d5ad
+index 0000000..96042eb
 --- /dev/null
 +++ b/bsd/dev/begonia_mali.c
-@@ -0,0 +1,492 @@
+@@ -0,0 +1,497 @@
 +/*
 + * ARM Mali-G76 MC4 (r0p0, 0x7211 @ 0x13040000) driver for Redmi Note 8 Pro (begonia / MT6785).
 + */
@@ -353,7 +353,13 @@ index 0000000..893d5ad
 +#define INFRA_PROT_1_CLR        0x02acu
 +#define MFG1_PROT_STEP2_MASK    ((1u << 21) | (1u << 22))
 +#define MFG1_PROT_STEP1_MASK    ((1u << 19) | (1u << 20) | (1u << 21))
++#define SPM_POWERON_CONFIG_EN   0x0000u
++#define SPM_PROJECT_CODE        0x0b16u
 +#define MFG_CG_CLR              0x0008u
++#define MFG_ASYNC_CON           0x0020u
++#define MFG_ASYNC_CON_1         0x0024u
++#define MFG_GLOBAL_CON          0x00b0u
++#define MFG_TIMESTAMP_EN        0x0130u
 +
 +#define GPU_ID                  0x000u
 +#define GPU_L2_FEATURES         0x004u
@@ -612,6 +618,9 @@ index 0000000..893d5ad
 +	setup_clocks();
 +	g_stage = 1;
 +
++	if ((rd32(spm, SPM_POWERON_CONFIG_EN) & 1u) == 0u) {
++		wr32(spm, SPM_POWERON_CONFIG_EN, (SPM_PROJECT_CODE << 16) | 1u);
++	}
 +	if (!mtcmos_on(0x328u, 1u << 4, 0u, 0u, false) ||
 +	    !mtcmos_on(0x32cu, 1u << 7, 0u, 0u, true) ||
 +	    !mtcmos_on(0x330u, 1u << 20, 1u << 8, 1u << 12, false) ||
@@ -623,6 +632,10 @@ index 0000000..893d5ad
 +		return;
 +	}
 +	wr32(mfgcfg, MFG_CG_CLR, 1u);
++	wr32(mfgcfg, MFG_GLOBAL_CON, rd32(mfgcfg, MFG_GLOBAL_CON) & ~((1u << 8) | (1u << 10)));
++	wr32(mfgcfg, MFG_ASYNC_CON, rd32(mfgcfg, MFG_ASYNC_CON) | (1u << 23) | (1u << 25));
++	wr32(mfgcfg, MFG_ASYNC_CON_1, rd32(mfgcfg, MFG_ASYNC_CON_1) | 1u);
++	wr32(mfgcfg, MFG_TIMESTAMP_EN, 1u);
 +	delay(10);
 +	g_stage = 2;
 +
@@ -709,30 +722,22 @@ index 0000000..893d5ad
 +		*value = rd32(mali, GPU_JS_FEATURES(which - 22u));
 +		return true;
 +	}
-+	switch (which) {
-+	case 0: *value = g_gpu_id >> 16; return true;
-+	case 1: *value = g_gpu_id & 0xffffu; return true;
-+	case 2: *value = g_shader_mask; return true;
-+	case 3: *value = g_tiler_mask; return true;
-+	case 4: *value = g_l2_mask; return true;
-+	case 5: *value = rd32(mali, STACK_PRESENT_LO); return true;
-+	case 6: *value = rd32(mali, GPU_AS_PRESENT); return true;
-+	case 7: *value = rd32(mali, GPU_JS_PRESENT); return true;
-+	case 8: *value = rd32(mali, GPU_L2_FEATURES); return true;
-+	case 9: *value = rd32(mali, GPU_CORE_FEATURES); return true;
-+	case 10: *value = rd32(mali, GPU_TILER_FEATURES); return true;
-+	case 11: *value = rd32(mali, GPU_MEM_FEATURES); return true;
-+	case 12: *value = rd32(mali, GPU_MMU_FEATURES); return true;
-+	case 13: *value = rd32(mali, GPU_THREAD_FEATURES); return true;
-+	case 14: *value = rd32(mali, GPU_THREAD_MAX_THREADS); return true;
-+	case 15: *value = rd32(mali, GPU_THREAD_MAX_WG_SIZE); return true;
-+	case 16: *value = rd32(mali, GPU_THREAD_MAX_BARRIER); return true;
-+	case 17: *value = rd32(mali, COHERENCY_FEATURES); return true;
-+	case 38: *value = 1u; return true;
-+	case 39: *value = rd32(mali, GPU_THREAD_TLS_ALLOC); return true;
-+	case 40: *value = rd32(mali, GPU_AFBC_FEATURES); return true;
-+	default: return false;
-+	}
++	static const uint16_t reg_map[18] = {
++		0, 0, 0, 0, 0, STACK_PRESENT_LO, GPU_AS_PRESENT, GPU_JS_PRESENT,
++		GPU_L2_FEATURES, GPU_CORE_FEATURES, GPU_TILER_FEATURES, GPU_MEM_FEATURES,
++		GPU_MMU_FEATURES, GPU_THREAD_FEATURES, GPU_THREAD_MAX_THREADS,
++		GPU_THREAD_MAX_WG_SIZE, GPU_THREAD_MAX_BARRIER, COHERENCY_FEATURES,
++	};
++	if (which == 0u) { *value = g_gpu_id >> 16; return true; }
++	if (which == 1u) { *value = g_gpu_id & 0xffffu; return true; }
++	if (which == 2u) { *value = g_shader_mask; return true; }
++	if (which == 3u) { *value = g_tiler_mask; return true; }
++	if (which == 4u) { *value = g_l2_mask; return true; }
++	if (which < 18u) { *value = rd32(mali, reg_map[which]); return true; }
++	if (which == 38u) { *value = 1u; return true; }
++	if (which == 39u) { *value = rd32(mali, GPU_THREAD_TLS_ALLOC); return true; }
++	if (which == 40u) { *value = rd32(mali, GPU_AFBC_FEATURES); return true; }
++	return false;
 +}
 +
 +uint64_t
@@ -1583,7 +1588,7 @@ index e0af1f0..bad5468 100644
  	}
  	if (sweet_board_beryllium()) {
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 1a16f3f..fa038d5 100644
+index 1a16f3f..d9e4a98 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -470,6 +470,9 @@ public:
@@ -1596,7 +1601,7 @@ index 1a16f3f..fa038d5 100644
  	void          blInit(void);
  	bool          blStep(int dir);
  	bool          blSet(bool on);   /* 0242: the backlight straight to iOS's state (no ramp), retried; false: it did not take */
-@@ -2505,9 +2508,62 @@ sweet_wled_read16(unsigned string, uint16_t *out)
+@@ -2505,9 +2508,67 @@ sweet_wled_read16(unsigned string, uint16_t *out)
  	return 0;
  }
  
@@ -1628,6 +1633,11 @@ index 1a16f3f..fa038d5 100644
  AppleCLCD::blInit(void)
  {
 +	if (sweet_board_begonia()) {
++		vm_offset_t infra = ml_io_map(0x10001000u, 0x1000u);
++		if (infra != 0) {
++			*(volatile uint32_t *)(infra + 0x0a8u) = (1u << 2);
++			__asm__ volatile("dsb sy" ::: "memory");
++		}
 +		fBlPwm = ml_io_map(BEGONIA_DISP_PWM0_PA, 0x1000u);
 +		if (fBlPwm == 0) {
 +			IOLog("SWEET FB: begonia disp_pwm0 map failed; pixel fallback\n");
@@ -1659,7 +1669,7 @@ index 1a16f3f..fa038d5 100644
  	uint8_t mod = 0, sync = 0;
  	uint16_t raw[SWEET_WLED_STRINGS];
  
-@@ -2600,6 +2656,14 @@ AppleARMBacklight::setProperties(OSObject *properties)
+@@ -2600,6 +2661,14 @@ AppleARMBacklight::setProperties(OSObject *properties)
  bool
  AppleCLCD::blSet(bool on)
  {
@@ -1674,7 +1684,7 @@ index 1a16f3f..fa038d5 100644
  	if (!on) {
  		uint16_t now[SWEET_WLED_STRINGS];
  		if (sweet_wled_read16(0, &now[0]) == 0 && sweet_wled_read16(1, &now[1]) == 0 &&
-@@ -2641,6 +2705,24 @@ AppleCLCD::blStep(int dir)
+@@ -2641,6 +2710,24 @@ AppleCLCD::blStep(int dir)
  	const uint32_t N = SWEET_FB_BL_STEPS;
  	static uint32_t logged;
  
