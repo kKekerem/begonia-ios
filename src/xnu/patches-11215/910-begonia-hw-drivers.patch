@@ -15,10 +15,10 @@ index ea5a65a..0d3f12b 100644
  bsd/dev/mem.c				standard
 diff --git a/bsd/dev/begonia_drivers.h b/bsd/dev/begonia_drivers.h
 new file mode 100644
-index 0000000..0e94ba8
+index 0000000..5404234
 --- /dev/null
 +++ b/bsd/dev/begonia_drivers.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,53 @@
 +/*
 + * Internal driver interfaces for Redmi Note 8 Pro (begonia / MT6785).
 + */
@@ -44,6 +44,8 @@ index 0000000..0e94ba8
 +bool begonia_mali_ready(void);
 +uint32_t begonia_mali_gpu_id(void);
 +uint32_t begonia_mali_va_bits(void);
++uint64_t begonia_mali_last_seq(void);
++uint32_t begonia_mali_faults(void);
 +bool begonia_mali_param(uint32_t which, uint64_t *value);
 +uint64_t begonia_mali_va_alloc(uint64_t size);
 +void begonia_mali_va_free(uint64_t gpu_va, uint64_t size);
@@ -72,10 +74,10 @@ index 0000000..0e94ba8
 +#endif /* _BEGONIA_DRIVERS_H_ */
 diff --git a/bsd/dev/begonia_keys.c b/bsd/dev/begonia_keys.c
 new file mode 100644
-index 0000000..70e5b2c
+index 0000000..27fc3e1
 --- /dev/null
 +++ b/bsd/dev/begonia_keys.c
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,212 @@
 +/*
 + * Polled physical keys & MT6359 PMIC wrapper (WACS2) for Redmi Note 8 Pro (begonia / MT6785).
 + *   Volume Up / Down: MT6785 keypad controller kp@10010000 (KP_MEM1 bits 0..1, active-low)
@@ -219,8 +221,7 @@ index 0000000..70e5b2c
 +		raw[2] = (kmem & (1u << 1)) == 0 ? 1 : 0;
 +
 +		if (!pok && (pmic_errs++ % 250u) == 0) {
-+			printf("BEGONIA KEYS: PMIC TOPSTATUS read failed
-+");
++			printf("BEGONIA KEYS: PMIC TOPSTATUS read failed\n");
 +		} else if (pok) {
 +			pmic_errs = 0;
 +		}
@@ -229,8 +230,7 @@ index 0000000..70e5b2c
 +			if (raw[k] == prev_raw[k] && raw[k] != stable[k]) {
 +				stable[k] = raw[k];
 +				if (keys_log) {
-+					printf("BEGONIA KEYS: %s %s (kmem=%#x top=%#x)
-+",
++					printf("BEGONIA KEYS: %s %s (kmem=%#x top=%#x)\n",
 +					    names[k], stable[k] ? "down" : "up", kmem, top);
 +				}
 +				sweet_hid_key(k, stable[k]);
@@ -254,29 +254,25 @@ index 0000000..70e5b2c
 +	(void)PE_parse_boot_argn("begoniakeys", &enabled, sizeof(enabled));
 +	(void)PE_parse_boot_argn("begoniakeylog", &keys_log, sizeof(keys_log));
 +	if (!enabled) {
-+		printf("BEGONIA KEYS: disabled (begoniakeys=0)
-+");
++		printf("BEGONIA KEYS: disabled (begoniakeys=0)\n");
 +		return;
 +	}
 +	kpd_base = ml_io_map(BEGONIA_KPD_PHYS, 0x1000u);
 +	if (kpd_base == 0 || !pwrap_ensure_mapped()) {
-+		printf("BEGONIA KEYS: ml_io_map failed (kpd=%#lx pwrap=%#lx)
-+",
++		printf("BEGONIA KEYS: ml_io_map failed (kpd=%#lx pwrap=%#lx)\n",
 +		    (unsigned long)kpd_base, (unsigned long)pwrap_base);
 +		return;
 +	}
 +	uint32_t top = 0;
 +	bool pok = begonia_pmic_read(MT6359_TOPSTATUS, &top);
-+	printf("BEGONIA KEYS: kp@%#x kmem1=%#x pwrap@%#x topstatus=%#x (ok=%d)
-+",
++	printf("BEGONIA KEYS: kp@%#x kmem1=%#x pwrap@%#x topstatus=%#x (ok=%d)\n",
 +	    BEGONIA_KPD_PHYS, mm_rd32(kpd_base, BEGONIA_KP_MEM1),
 +	    BEGONIA_PWRAP_PHYS, top, pok ? 1 : 0);
 +
 +	if (kernel_thread_start(begonia_keys_thread, NULL, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);
 +	} else {
-+		printf("BEGONIA KEYS: kernel_thread_start failed
-+");
++		printf("BEGONIA KEYS: kernel_thread_start failed\n");
 +	}
 +}
 +
@@ -296,10 +292,10 @@ index 0000000..70e5b2c
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
 new file mode 100644
-index 0000000..96042eb
+index 0000000..04d06a8
 --- /dev/null
 +++ b/bsd/dev/begonia_mali.c
-@@ -0,0 +1,497 @@
+@@ -0,0 +1,495 @@
 +/*
 + * ARM Mali-G76 MC4 (r0p0, 0x7211 @ 0x13040000) driver for Redmi Note 8 Pro (begonia / MT6785).
 + */
@@ -478,8 +474,7 @@ index 0000000..96042eb
 +	}
 +	delay(300);
 +	(void)begonia_pmic_read(MT6359_VGPU11_DBG1, &dbg1);
-+	printf("BEGONIA MALI: PMIC VSRAM_GPU=850mV VGPU=700mV DBG1=%#x
-+", dbg1);
++	printf("BEGONIA MALI: PMIC VSRAM_GPU=850mV VGPU=700mV DBG1=%#x\n", dbg1);
 +	return true;
 +}
 +
@@ -574,8 +569,7 @@ index 0000000..96042eb
 +	(void)wait_mask(mali, JOB_INT_RAWSTAT, (1u << 1) | (1u << 17), 1u << 1, 100u);
 +	sweet_dma_sync_va((void *)kva, PAGE_SIZE);
 +	bool ok = (*dst == magic);
-+	printf("BEGONIA MALI: selftest (%s) irq=%#x fault=%#x word=%#x (%s)
-+",
++	printf("BEGONIA MALI: selftest (%s) irq=%#x fault=%#x word=%#x (%s)\n",
 +	    tag, rd32(mali, JOB_INT_RAWSTAT), rd32(mali, AS0 + AS_FAULTSTATUS),
 +	    *dst, ok ? "PASS" : "FAIL");
 +	wr32(mali, JOB_INT_CLEAR, 0xffffffffu);
@@ -594,8 +588,7 @@ index 0000000..96042eb
 +	g_started = true;
 +	(void)PE_parse_boot_argn("begoniamali", &enabled, sizeof(enabled));
 +	if (!enabled) {
-+		printf("BEGONIA MALI: disabled (begoniamali=0)
-+");
++		printf("BEGONIA MALI: disabled (begoniamali=0)\n");
 +		return;
 +	}
 +
@@ -606,13 +599,11 @@ index 0000000..96042eb
 +	mfgcfg = ml_io_map(MFGCFG_PA, 0x1000u);
 +	mali = ml_io_map(MALI_PA, 0x10000u);
 +	if (!topck || !infra || !spm || !apmixed || !mfgcfg || !mali) {
-+		printf("BEGONIA MALI: ml_io_map failed
-+");
++		printf("BEGONIA MALI: ml_io_map failed\n");
 +		return;
 +	}
 +	if (!power_pmic_rails()) {
-+		printf("BEGONIA MALI: PMIC rail bringup failed
-+");
++		printf("BEGONIA MALI: PMIC rail bringup failed\n");
 +		return;
 +	}
 +	setup_clocks();
@@ -627,8 +618,7 @@ index 0000000..96042eb
 +	    !mtcmos_on(0x334u, 1u << 22, 1u << 8, 1u << 12, false) ||
 +	    !mtcmos_on(0x338u, 1u << 23, 1u << 8, 1u << 12, false) ||
 +	    !mtcmos_on(0x350u, 1u << 13, 1u << 8, 1u << 12, false)) {
-+		printf("BEGONIA MALI: MFG MTCMOS failed
-+");
++		printf("BEGONIA MALI: MFG MTCMOS failed\n");
 +		return;
 +	}
 +	wr32(mfgcfg, MFG_CG_CLR, 1u);
@@ -641,8 +631,7 @@ index 0000000..96042eb
 +
 +	g_gpu_id = rd32(mali, GPU_ID);
 +	if (g_gpu_id == 0u || g_gpu_id == 0xffffffffu) {
-+		printf("BEGONIA MALI: bad GPU_ID=%#x
-+", g_gpu_id);
++		printf("BEGONIA MALI: bad GPU_ID=%#x\n", g_gpu_id);
 +		return;
 +	}
 +	wr32(mali, GPU_INT_MASK, 0u);
@@ -666,13 +655,11 @@ index 0000000..96042eb
 +	if (!wait_mask(mali, L2_READY_LO, g_l2_mask, g_l2_mask, 50u) ||
 +	    !wait_mask(mali, TILER_READY_LO, g_tiler_mask, g_tiler_mask, 50u) ||
 +	    !wait_mask(mali, SHADER_READY_LO, g_shader_mask, g_shader_mask, 50u)) {
-+		printf("BEGONIA MALI: core power-on timeout
-+");
++		printf("BEGONIA MALI: core power-on timeout\n");
 +		return;
 +	}
 +	g_stage = 3;
-+	printf("BEGONIA MALI: GPU_ID=%#x (%u MHz) shaders=%#x tiler=%#x l2=%#x va=%u
-+",
++	printf("BEGONIA MALI: GPU_ID=%#x (%u MHz) shaders=%#x tiler=%#x l2=%#x va=%u\n",
 +	    g_gpu_id, g_freq_khz / 1000u, g_shader_mask, g_tiler_mask, g_l2_mask, g_va_bits);
 +
 +	if (kmem_alloc_contig(kernel_map, &test_kva, PAGE_SIZE, PAGE_MASK, 0, 0,
@@ -707,6 +694,8 @@ index 0000000..96042eb
 +bool begonia_mali_ready(void) { return g_ready; }
 +uint32_t begonia_mali_gpu_id(void) { return g_gpu_id; }
 +uint32_t begonia_mali_va_bits(void) { return g_va_bits; }
++uint64_t begonia_mali_last_seq(void) { return g_done_seq; }
++uint32_t begonia_mali_faults(void) { return g_faults; }
 +
 +bool
 +begonia_mali_param(uint32_t which, uint64_t *value)
@@ -737,6 +726,8 @@ index 0000000..96042eb
 +	if (which == 38u) { *value = 1u; return true; }
 +	if (which == 39u) { *value = rd32(mali, GPU_THREAD_TLS_ALLOC); return true; }
 +	if (which == 40u) { *value = rd32(mali, GPU_AFBC_FEATURES); return true; }
++	if (which == 41u) { uint64_t t; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t)); *value = t; return true; }
++	if (which == 42u) { uint64_t f; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f)); *value = f; return true; }
 +	return false;
 +}
 +
@@ -765,6 +756,9 @@ index 0000000..96042eb
 +
 +	if (!wait_mask(mali, JOB_INT_RAWSTAT, irqm, 1u << slot, 500u)) {
 +		g_faults++;
++		if (g_faults <= 8u)
++			printf("BEGONIA MALI: fault jc=%#llx slot=%u irq=%#x fstat=%#x\n",
++			    (unsigned long long)jc_va, slot, rd32(mali, JOB_INT_RAWSTAT), rd32(mali, AS0 + AS_FAULTSTATUS));
 +	}
 +	wr32(mali, JOB_INT_CLEAR, irqm);
 +	g_done_seq = seq;
@@ -799,7 +793,7 @@ index 0000000..96042eb
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/begonia_mali_mmu.c b/bsd/dev/begonia_mali_mmu.c
 new file mode 100644
-index 0000000..d61f22c
+index 0000000..5ea5908
 --- /dev/null
 +++ b/bsd/dev/begonia_mali_mmu.c
 @@ -0,0 +1,336 @@
@@ -839,7 +833,7 @@ index 0000000..d61f22c
 +#define PTE_ADDR_MASK           0x0000fffffffff000ull
 +
 +#define MALI_VA_BASE            0x10000000ull
-+#define MALI_VA_LIMIT           0x0800000000ull
++#define MALI_VA_LIMIT           0xf0000000ull
 +#define MALI_FREE_SLOTS         256u
 +#define PT_HASH_BUCKETS         1024u
 +
@@ -1141,10 +1135,10 @@ index 0000000..d61f22c
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/begonia_touch.c b/bsd/dev/begonia_touch.c
 new file mode 100644
-index 0000000..5a191bb
+index 0000000..f02abae
 --- /dev/null
 +++ b/bsd/dev/begonia_touch.c
-@@ -0,0 +1,400 @@
+@@ -0,0 +1,393 @@
 +/*
 + * Polled MT6785 SPI5 + Novatek NT36672A touchscreen driver for Redmi Note 8 Pro (begonia).
 + * Ports proven mtkloader SPI5 (0x11019000) + NVT (0x21C00) protocol to XNU HID events.
@@ -1448,12 +1442,10 @@ index 0000000..5a191bb
 +		}
 +	}
 +	if (!ready) {
-+		printf("BEGONIA TOUCH: NT36672A FW not active in SRAM (boot via mtkloader dualboot to load FW); waiting paused
-+");
++		printf("BEGONIA TOUCH: NT36672A FW not active in SRAM (boot via mtkloader dualboot to load FW); waiting paused\n");
 +		return;
 +	}
-+	printf("BEGONIA TOUCH: NT36672A ready on SPI5 (pid=%#x fw=v%u poll=%ums)
-+",
++	printf("BEGONIA TOUCH: NT36672A ready on SPI5 (pid=%#x fw=v%u poll=%ums)\n",
 +	    pid, fw_ver, touch_poll_ms);
 +
 +	for (;;) {
@@ -1480,8 +1472,7 @@ index 0000000..5a191bb
 +						lx[slot] = (uint16_t)x;
 +						ly[slot] = (uint16_t)y;
 +						if (touch_log) {
-+							printf("BEGONIA TOUCH: slot=%u down (%u,%u)
-+", slot, x, y);
++							printf("BEGONIA TOUCH: slot=%u down (%u,%u)\n", slot, x, y);
 +						}
 +						sweet_hid_touch((int)slot, 1, (int)x, (int)y);
 +					}
@@ -1489,8 +1480,7 @@ index 0000000..5a191bb
 +					active[slot] = false;
 +					miss[slot] = 0;
 +					if (touch_log) {
-+						printf("BEGONIA TOUCH: slot=%u up (%u,%u)
-+", slot, lx[slot], ly[slot]);
++						printf("BEGONIA TOUCH: slot=%u up (%u,%u)\n", slot, lx[slot], ly[slot]);
 +					}
 +					sweet_hid_touch((int)slot, 0, (int)lx[slot], (int)ly[slot]);
 +				}
@@ -1524,8 +1514,7 @@ index 0000000..5a191bb
 +		touch_poll_ms = 8u;
 +	}
 +	if (!enabled) {
-+		printf("BEGONIA TOUCH: disabled (begoniatouch=0)
-+");
++		printf("BEGONIA TOUCH: disabled (begoniatouch=0)\n");
 +		return;
 +	}
 +	topck_base = ml_io_map(BEGONIA_TOPCKGEN_PA, 0x1000u);
@@ -1533,15 +1522,13 @@ index 0000000..5a191bb
 +	gpio_base = ml_io_map(BEGONIA_GPIO_PA, 0x1000u);
 +	spi5_base = ml_io_map(BEGONIA_SPI5_PA, 0x1000u);
 +	if (!topck_base || !infra_base || !gpio_base || !spi5_base) {
-+		printf("BEGONIA TOUCH: ml_io_map failed
-+");
++		printf("BEGONIA TOUCH: ml_io_map failed\n");
 +		return;
 +	}
 +	if (kernel_thread_start(begonia_touch_thread, NULL, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);
 +	} else {
-+		printf("BEGONIA TOUCH: kernel_thread_start failed
-+");
++		printf("BEGONIA TOUCH: kernel_thread_start failed\n");
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
@@ -1587,6 +1574,54 @@ index e0af1f0..bad5468 100644
  		return;
  	}
  	if (sweet_board_beryllium()) {
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 27caa07..3da85a4 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1105,21 +1105,38 @@ sweet_ufs_init(void)
+ 	}
+ 	su.dma_pa = ptoa_64(pn);
+ 	printf("SWEET UFS: DMA 0x%llx (+0x%x)\n", su.dma_pa, (unsigned)su.dma_size);
+-	su.lun = 0;
++	uint32_t lun = sweet_board_begonia() ? 2u : 0u;
++	bool has_lun = PE_parse_boot_argn("ufslun", &lun, sizeof(lun));
++	su.lun = (uint8_t)(lun & 7u);
+ 	su.secsize = DEV_BSIZE;
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	error = ufs_take_over_host();
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
++		uint8_t tried = su.lun;
+ 		/* The first command after the bootloader may report a unit attention. */
+-		printf("SWEET UFS: host taken over, TEST UNIT READY\n");
++		printf("SWEET UFS: host taken over, TEST UNIT READY (LUN %u)\n", su.lun);
+ 		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+ 		}
+ 		printf("SWEET UFS: TUR %d\n", error);
+-	}
+-	if (!error) {
+-		error = ufs_find_partition(want);
++		if (!error) {
++			error = ufs_find_partition(want);
++		}
++		if (error && !has_lun) {
++			for (uint8_t l = 0; l < 4u && error != 0; l++) {
++				if (l == tried) {
++					continue;
++				}
++				su.lun = l;
++				int terr = 0;
++				for (int i = 0; i < 3 && (terr = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++				}
++				if (!terr) {
++					error = ufs_find_partition(want);
++				}
++			}
++		}
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 index 1a16f3f..d9e4a98 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
@@ -1711,10 +1746,10 @@ index 1a16f3f..d9e4a98 100644
  			return true;
 diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
 new file mode 100644
-index 0000000..65bf2cc
+index 0000000..cca05c4
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMali.cpp
-@@ -0,0 +1,493 @@
+@@ -0,0 +1,494 @@
 +/*
 + * SweetMali: IOKit service and user client for begonia Mali-G76 MC4 (MT6785).
 + */
@@ -1787,8 +1822,7 @@ index 0000000..65bf2cc
 +
 +OSDefineMetaClassAndStructors(SweetMaliUserClient, IOUserClient);
 +
-+extern "C" void
-+SweetMaliPublish(void)
++extern "C" void SweetMaliPublish(void)
 +{
 +	if (!begonia_mali_ready()) {
 +		return;
@@ -1806,15 +1840,13 @@ index 0000000..65bf2cc
 +	svc->setProperty(kIOUserClientClassKey, "SweetMaliUserClient");
 +	if (svc->attach(plat)) {
 +		svc->registerService();
-+		IOLog("BEGONIA MALI: IOKit service %s published (gpu_id=%#x, va=%u-bit)
-+",
++		IOLog("BEGONIA MALI: IOKit service %s published (gpu_id=%#x, va=%u-bit)\n",
 +		    SWEET_MALI_SERVICE_NAME, begonia_mali_gpu_id(), begonia_mali_va_bits());
 +	}
 +	svc->release();
 +}
 +
-+bool
-+SweetMaliUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++bool SweetMaliUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
 +{
 +	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
 +		return false;
@@ -1831,8 +1863,7 @@ index 0000000..65bf2cc
 +	return true;
 +}
 +
-+void
-+SweetMaliUserClient::free(void)
++void SweetMaliUserClient::free(void)
 +{
 +	if (fBos != NULL) {
 +		IOFreeData(fBos, sizeof(struct mali_gem_slot) * MALI_BUFFERS);
@@ -1841,8 +1872,7 @@ index 0000000..65bf2cc
 +	IOUserClient::free();
 +}
 +
-+struct mali_gem_slot *
-+SweetMaliUserClient::boSlot(uint32_t handle)
++struct mali_gem_slot *SweetMaliUserClient::boSlot(uint32_t handle)
 +{
 +	if (fBos == NULL || handle == 0u || handle > MALI_BUFFERS || fBos[handle - 1u].md == NULL) {
 +		return NULL;
@@ -1850,8 +1880,7 @@ index 0000000..65bf2cc
 +	return &fBos[handle - 1u];
 +}
 +
-+void
-+SweetMaliUserClient::freeSlot(struct mali_gem_slot *b)
++void SweetMaliUserClient::freeSlot(struct mali_gem_slot *b)
 +{
 +	if (b->last_seq != 0u) {
 +		(void)begonia_mali_wait(b->last_seq, 2ull * NSEC_PER_SEC);
@@ -1869,8 +1898,7 @@ index 0000000..65bf2cc
 +	bzero(b, sizeof(*b));
 +}
 +
-+IOReturn
-+SweetMaliUserClient::clientClose(void)
++IOReturn SweetMaliUserClient::clientClose(void)
 +{
 +	IOLockLock(gMaliClientLock);
 +	if (!fClosed) {
@@ -1887,8 +1915,7 @@ index 0000000..65bf2cc
 +	return kIOReturnSuccess;
 +}
 +
-+IOReturn
-+SweetMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
++IOReturn SweetMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
 +{
 +	IOReturn ret = kIOReturnBadArgument;
 +
@@ -1904,8 +1931,7 @@ index 0000000..65bf2cc
 +	return ret;
 +}
 +
-+IOReturn
-+SweetMaliUserClient::copyIn(uint64_t addr, void *dst, size_t len)
++IOReturn SweetMaliUserClient::copyIn(uint64_t addr, void *dst, size_t len)
 +{
 +	if (len == 0u) {
 +		return kIOReturnSuccess;
@@ -1927,8 +1953,7 @@ index 0000000..65bf2cc
 +	return ret;
 +}
 +
-+IOReturn
-+SweetMaliUserClient::mapSlot(struct mali_gem_slot *b, uint64_t from, uint64_t size,
++IOReturn SweetMaliUserClient::mapSlot(struct mali_gem_slot *b, uint64_t from, uint64_t size,
 +    bool readonly, uint32_t *handle)
 +{
 +	uint32_t slot_id = 0;
@@ -1969,8 +1994,7 @@ index 0000000..65bf2cc
 +	return kIOReturnSuccess;
 +}
 +
-+IOReturn
-+SweetMaliUserClient::createBO(struct sweet_mali_create_bo *r)
++IOReturn SweetMaliUserClient::createBO(struct sweet_mali_create_bo *r)
 +{
 +	uint64_t size = (r->size + PAGE_SIZE - 1u) & ~(uint64_t)(PAGE_SIZE - 1u);
 +	if (size == 0u || size > MALI_BUFFER_MAX) {
@@ -2002,8 +2026,7 @@ index 0000000..65bf2cc
 +	return kIOReturnSuccess;
 +}
 +
-+IOReturn
-+SweetMaliUserClient::surfaceBO(struct sweet_mali_surface_bo *r)
++IOReturn SweetMaliUserClient::surfaceBO(struct sweet_mali_surface_bo *r)
 +{
 +	SweetSurface *s = sweet_surface_copy(r->surface_id);
 +	if (s == NULL) {
@@ -2020,9 +2043,12 @@ index 0000000..65bf2cc
 +	r->width = s->width;
 +	r->height = s->height;
 +	r->pixel_format = s->pixelFormat;
++	uint32_t in_sync = r->flags & SWEET_MALI_SBO_IN_SYNC;
++	uint32_t out_flags = (s->wrapped ? (SWEET_MALI_SBO_READONLY | SWEET_MALI_SBO_CPU_CACHE | SWEET_MALI_SBO_WRAPPED) :
++	    (s->pooled ? SWEET_MALI_SBO_CPU_CACHE : 0u));
 +	r->planes = s->planeCount;
 +	r->gpu_va = 0;
-+
++	r->flags = out_flags;
 +	if (r->handle == SWEET_MALI_DESCRIBE_ONLY) {
 +		r->handle = 0;
 +		s->release();
@@ -2032,6 +2058,9 @@ index 0000000..65bf2cc
 +		if (fBos[i].md != NULL && fBos[i].surface == s) {
 +			r->handle = i + 1u;
 +			r->gpu_va = fBos[i].gpu_va;
++			r->flags = out_flags | SWEET_MALI_SBO_EXISTING;
++			if (in_sync && fBos[i].kva != NULL)
++				sweet_dma_sync_va(fBos[i].kva, (size_t)fBos[i].size);
 +			s->release();
 +			return kIOReturnSuccess;
 +		}
@@ -2049,15 +2078,17 @@ index 0000000..65bf2cc
 +		s->release();
 +		return ret;
 +	}
++	if (in_sync && fBos[r->handle - 1u].kva != NULL)
++		sweet_dma_sync_va(fBos[r->handle - 1u].kva, (size_t)fBos[r->handle - 1u].size);
 +	r->gpu_va = fBos[r->handle - 1u].gpu_va;
 +	return kIOReturnSuccess;
 +}
 +
-+IOReturn
-+SweetMaliUserClient::submitJobs(struct sweet_mali_submit *r)
++IOReturn SweetMaliUserClient::submitJobs(struct sweet_mali_submit *r)
 +{
 +	if (r->jc == 0u) {
-+		return kIOReturnBadArgument;
++		r->jc = begonia_mali_last_seq();
++		return kIOReturnSuccess;
 +	}
 +	uint64_t seq = begonia_mali_submit(r->jc, (r->requirements & SWEET_MALI_JD_REQ_FS) != 0u);
 +	if (seq == 0u) {
@@ -2084,8 +2115,7 @@ index 0000000..65bf2cc
 +	return kIOReturnSuccess;
 +}
 +
-+IOReturn
-+SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++IOReturn SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
 +    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
 +{
 +	union {
@@ -2190,11 +2220,17 @@ index 0000000..65bf2cc
 +		}
 +		break;
 +	}
-+	case SWEET_MALI_SEL_INFO:
++	case SWEET_MALI_SEL_INFO: {
++		uint32_t flts = begonia_mali_faults();
 +		req.info.version = SWEET_MALI_ABI_VERSION;
++		req.info.abi_minor = 1;
++		req.info.flags = (begonia_mali_ready() ? SWEET_MALI_INFO_READY : 0u) | (flts > 16u ? SWEET_MALI_INFO_LOST : 0u);
 +		req.info.gpu_id = begonia_mali_gpu_id();
 +		req.info.va_bits = begonia_mali_va_bits();
++		req.info.faults = flts;
++		req.info.last_seq = begonia_mali_last_seq();
 +		break;
++	}
 +	default:
 +		ret = kIOReturnUnsupported;
 +		break;
@@ -2210,10 +2246,10 @@ index 0000000..65bf2cc
 +#endif /* SWEET */
 diff --git a/iokit/Kernel/arm/SweetMaliABI.h b/iokit/Kernel/arm/SweetMaliABI.h
 new file mode 100644
-index 0000000..11c5b5b
+index 0000000..569bcc3
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMaliABI.h
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,106 @@
 +/*
 + * SweetMali: IOKit ABI for ARM Mali-G76 MC4 on Redmi Note 8 Pro (begonia / MT6785).
 + * Matches Linux Panfrost DRM ioctl selectors/structs plus SweetSurface import.
@@ -2243,6 +2279,15 @@ index 0000000..11c5b5b
 +
 +#define SWEET_MALI_JD_REQ_FS        (1u << 0)
 +#define SWEET_MALI_DESCRIBE_ONLY    0xffffffffu
++
++#define SWEET_MALI_INFO_READY       0x1u
++#define SWEET_MALI_INFO_LOST        0x2u
++
++#define SWEET_MALI_SBO_IN_SYNC      0x1u
++#define SWEET_MALI_SBO_READONLY     0x1u
++#define SWEET_MALI_SBO_CPU_CACHE    0x2u
++#define SWEET_MALI_SBO_WRAPPED      0x4u
++#define SWEET_MALI_SBO_EXISTING     0x8u
 +
 +struct sweet_mali_gem_close {
 +	uint32_t handle, pad;
@@ -2288,16 +2333,17 @@ index 0000000..11c5b5b
 +};
 +
 +struct sweet_mali_info {
-+	uint32_t version, gpu_id, va_bits, pad;
++	uint32_t version, abi_minor, flags, gpu_id;
++	uint32_t va_bits, faults;
++	uint64_t last_seq;
 +};
 +
 +struct sweet_mali_surface_bo {
-+	uint32_t surface_id;
-+	uint32_t handle;
-+	uint64_t size;
-+	uint64_t gpu_va;
++	uint32_t surface_id, handle;
++	uint64_t size, gpu_va;
 +	uint32_t offset, bytes_per_row;
 +	uint32_t width, height, pixel_format, planes;
++	uint32_t flags, pad;
 +};
 +
 +struct sweet_mali_bo_sync {
@@ -2311,17 +2357,25 @@ index 0000000..11c5b5b
 +
 +#endif /* _SWEET_MALI_ABI_H_ */
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-index 96ffe03..654ec0a 100644
+index 96ffe03..712df71 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -797,6 +797,10 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+@@ -670,6 +670,10 @@ do_reboot:
+ 	return true;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern "C" void begonia_platform_hw_init(void);
++#endif
++
+ kern_return_t
+ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+     dev_t * root, u_int32_t * oflags )
+@@ -797,6 +801,7 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  	}
  
  #if defined(ARM64_BOARD_CONFIG_SWEET)
-+	{
-+		extern "C" void begonia_platform_hw_init(void);
-+		begonia_platform_hw_init();
-+	}
++	begonia_platform_hw_init();
  //
  //	SWEET: root on a GPT partition of the internal UFS (bsd/dev/sweet_ufs.c)
  //
