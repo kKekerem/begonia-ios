@@ -158,12 +158,18 @@ def build_bootimg_v2(
     return out
 
 
-def pack_standalone(loader_bin: bytes, out_path: str, payload_bin: Optional[bytes] = None, dtb_bin: Optional[bytes] = None) -> bytes:
+def pack_standalone(
+    loader_bin: bytes,
+    out_path: str,
+    payload_bin: Optional[bytes] = None,
+    dtb_bin: Optional[bytes] = None,
+    recovery_dtbo: bytes = b"",
+) -> bytes:
     dtb = dtb_bin if dtb_bin is not None else build_minimal_fdt()
     ramdisk = payload_bin if payload_bin is not None else b""
     patched = _patch_loader_header(loader_bin, len(loader_bin), 0, 0, 0)
     kernel_gz = gzip.compress(patched, compresslevel=9, mtime=0)
-    img = build_bootimg_v2(kernel_gz=kernel_gz, ramdisk=ramdisk, second=b"", dtb=dtb)
+    img = build_bootimg_v2(kernel_gz=kernel_gz, ramdisk=ramdisk, second=b"", dtb=dtb, recovery_dtbo=recovery_dtbo)
     with open(out_path, "wb") as fp:
         fp.write(img)
     return img
@@ -280,7 +286,7 @@ def main() -> int:
                 dtb = fp.read()
         else:
             dtb = None
-        img = pack_standalone(loader, args.out, payload_bin=payload, dtb_bin=dtb)
+        img = pack_standalone(loader, args.out, payload_bin=payload, dtb_bin=dtb, recovery_dtbo=rec_dtbo)
 
     print(f"{args.out}: {len(img)} bytes")
     return 0
