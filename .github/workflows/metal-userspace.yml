@@ -1,0 +1,96 @@
+name: Begonia Mali Metal & GL Userspace
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/metal/**'
+      - '.github/workflows/metal-userspace.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: metal-userspace-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-metal-userspace:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies and select Xcode 16
+        run: |
+          brew install meson ninja bison pkg-config
+          XC=$(ls -d /Applications/Xcode_16.2*.app 2>/dev/null | sort -V | tail -1 || true)
+          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_16.*.app | sort -V | head -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+
+      - name: Prepare Python build venv (mako, pyyaml, meson)
+        run: |
+          mkdir -p /tmp/begonia-metal-work
+          python3 -m venv /tmp/begonia-metal-work/venv
+          /tmp/begonia-metal-work/venv/bin/pip -q install mako pyyaml packaging setuptools meson lxml
+
+      - name: Restore cached Mesa 25.0.7 + libdrm 2.4.124 + Chlorophyll sources
+        id: cache-srcs
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/begonia-metal-work/mesa-src
+            /tmp/begonia-metal-work/libdrm-src
+            /tmp/begonia-metal-work/chlorophyll
+            /tmp/begonia-metal-work/bergamota
+          key: metal-srcs-mesa2507-drm24124-chl787338f-berg37a7a7a
+
+      - name: Fetch pinned upstream sources if cache miss
+        run: |
+          set -euo pipefail
+          W=/tmp/begonia-metal-work
+          if [ ! -d "$W/bergamota/.git" ]; then
+            git clone --depth 1 https://github.com/ry-diffusion/Bergamota.git "$W/bergamota" || git clone https://github.com/ry-diffusion/Bergamota.git "$W/bergamota"
+            git -C "$W/bergamota" fetch --depth 1 origin 37a7a7a917fc09945ed2f7d1ae68b84d4525b4cb || true
+            git -C "$W/bergamota" checkout 37a7a7a917fc09945ed2f7d1ae68b84d4525b4cb
+          fi
+          if [ ! -d "$W/chlorophyll/.git" ]; then
+            git clone https://github.com/ry-diffusion/Chlorophyll.git "$W/chlorophyll"
+            git -C "$W/chlorophyll" checkout 787338fc7c297f54e2000bca02f4fa36f1154c5a
+          fi
+          [ -d "$W/mesa-src/.git" ] || git clone -q --depth 1 --branch mesa-25.0.7 https://gitlab.freedesktop.org/mesa/mesa.git "$W/mesa-src"
+          [ -d "$W/libdrm-src/.git" ] || git clone -q --depth 1 --branch libdrm-2.4.124 https://gitlab.freedesktop.org/mesa/drm.git "$W/libdrm-src"
+
+      - name: Build arm64e Mali-G76 Metal (Chlorophyll + Panfrost) & OpenGLES payload
+        run: |
+          set -euo pipefail
+          chmod +x src/metal/build-begonia-metal.sh
+          BEGONIA_METAL_WORK=/tmp/begonia-metal-work \
+            MESA_VENV=/tmp/begonia-metal-work/venv \
+            bash src/metal/build-begonia-metal.sh out-metal
+
+      - name: Verify Mach-O architectures, install names, and signatures
+        run: |
+          set -euo pipefail
+          for f in \
+            out-metal/bgmtl/libdrm.2.dylib \
+            out-metal/bgmtl/libbgair.dylib \
+            out-metal/bgmtl/bgmtl-inject.dylib \
+            out-metal/Chlorophyll.bundle/Chlorophyll \
+            out-metal/bergamota-gl/OpenGLES.framework/OpenGLES \
+            out-metal/bergamota-gl/libOSMesa.8.dylib \
+            out-metal/bergamota-gl/bgl-launch \
+            out-metal/probes/bgmtl_probe \
+            out-metal/probes/bgmtl_render_probe
+          do
+            echo "=== $f ==="
+            lipo -info "$f"
+            otool -L "$f"
+            codesign -v "$f"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: begonia-metal-userspace
+          path: out-metal/
+          retention-days: 14

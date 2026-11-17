@@ -1,0 +1,76 @@
+diff --git a/air/air_metal.c b/air/air_metal.c
+index 67912be..f496a73 100644
+--- a/air/air_metal.c
++++ b/air/air_metal.c
+@@ -45,6 +45,11 @@
+ #include "null/null_sw_winsys.h"
+ #ifdef GALLIUM_FREEDRENO
+ #include "freedreno/drm/freedreno_drm_public.h"
++#endif
++#ifdef GALLIUM_PANFROST
++#include "panfrost/pan_public.h"
++#endif
++#if defined(GALLIUM_FREEDRENO) || defined(GALLIUM_PANFROST)
+ /* for rwa_texture_from_surface: a resource over memory somebody else allocated is a
+  * winsys_handle, and the one modifier an IOSurface of this port's kernel can carry is
+  * linear (MINISURF has no tiling and no compression at all). */
+@@ -523,30 +528,42 @@ rwa_device_open(char *why, size_t why_size)
+    bool software = debug_get_bool_option("RWA_SOFTWARE", false);
+    device->software = software;
+ 
+-#ifdef GALLIUM_FREEDRENO
++#if defined(GALLIUM_PANFROST)
++   if (!software) {
++      int fd = drmOpenWithType("panfrost", NULL, DRM_NODE_RENDER);
++      if (fd < 0) {
++         say(why, why_size, "there is no GPU here: no panfrost device to open (boot with begoniamali=1)");
++         goto fail;
++      }
++      static const driOptionDescription panfrost_options[] = {
++#include "panfrost/driinfo_panfrost.h"
++      };
++      static driOptionCache info, cache;
++      static struct pipe_screen_config config;
++      static bool options_parsed = false;
++
++      if (!options_parsed) {
++         driParseOptionInfo(&info, panfrost_options, ARRAY_SIZE(panfrost_options));
++         driParseConfigFiles(&cache, &info, 0, "panfrost", NULL, NULL, NULL, 0, NULL, 0);
++         config.options = &cache;
++         config.options_info = &info;
++         options_parsed = true;
++      }
++
++      device->screen = panfrost_create_screen(fd, &config, NULL);
++      if (!device->screen) {
++         say(why, why_size, "the kernel's panfrost device opened but Panfrost made no screen for it");
++         goto fail;
++      }
++   }
++#elif defined(GALLIUM_FREEDRENO)
+    if (!software) {
+       int fd = drmOpenWithType("msm", NULL, DRM_NODE_RENDER);
+       if (fd < 0) {
+-         /* The ordinary case on this port, and not an error anybody should be
+-          * surprised by: without gpu=1 the kernel starts no HKGPU service, so
+-          * there is no msm device for the shim to open (tools/mesa/hackios-drm).
+-          */
+          say(why, why_size, "there is no GPU here: no msm device to open, which is what "
+                             "a kernel booted without gpu=1 looks like");
+          goto fail;
+       }
+-
+-      /* The driver option cache has to be real, not a zeroed struct: fd_screen_create
+-       * passes it straight to driParseConfigFiles, which dereferences it. A zeroed one
+-       * died at address 0x10 on the phone -- the first thing air_run ever did on a
+-       * machine that has a GPU, and invisible on any machine that has not. This is the
+-       * sequence osmesa_create_gpu_screen() uses in tools/mesa/freedreno-darwin.patch,
+-       * which is the one CoreAnimation goes through on this device daily.
+-       *
+-       * static, because fd_screen keeps the cache it was given rather than copying it.
+-       * One screen per process is what a Metal device amounts to; a second device would
+-       * share these, which is why the parse below is done once.
+-       */
+       static const driOptionDescription freedreno_options[] = {
+ #include "freedreno/driinfo_freedreno.h"
+       };

@@ -23,6 +23,11 @@ on:
         required: false
         type: string
         default: ""
+      metal_run_id:
+        description: "Specific metal-userspace.yml run ID providing Mali Metal & GL binaries (blank = latest success)"
+        required: false
+        type: string
+        default: ""
       release_tag:
         description: "GitHub Release tag for cloud-built IPSW outputs"
         required: false
@@ -38,6 +43,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       xnu_run_id: ${{ steps.resolve.outputs.xnu_run_id }}
+      metal_run_id: ${{ steps.resolve.outputs.metal_run_id }}
       ipsw_url: ${{ steps.resolve.outputs.ipsw_url }}
       release_tag: ${{ steps.resolve.outputs.release_tag }}
     steps:
@@ -64,6 +70,20 @@ jobs:
             exit 1
           fi
 
+          METAL_ID="${{ inputs.metal_run_id }}"
+          if [ -z "$METAL_ID" ] && [ "${{ inputs.build_full_rootfs }}" = "true" ]; then
+            for id in $(gh run list -R "${{ github.repository }}" --workflow metal-userspace.yml --status success --limit 15 --json databaseId --jq '.[].databaseId'); do
+              if gh api "repos/${{ github.repository }}/actions/runs/$id/artifacts" --jq '.artifacts[].name' | grep -qx "begonia-metal-userspace"; then
+                METAL_ID="$id"
+                break
+              fi
+            done
+          fi
+          if [ "${{ inputs.build_full_rootfs }}" = "true" ] && [ -z "$METAL_ID" ]; then
+            echo "error: no successful metal-userspace.yml run with begonia-metal-userspace artifact found" >&2
+            exit 1
+          fi
+
           IPSW_URL=$(curl -fsSL "https://api.ipsw.me/v4/ipsw/iPhone11,8/22H352" | jq -r '.url' || true)
           if [ -z "$IPSW_URL" ] || [ "$IPSW_URL" = "null" ]; then
             echo "error: failed to resolve iPhone11,8 22H352 IPSW URL" >&2
@@ -77,9 +97,10 @@ jobs:
           fi
 
           echo "xnu_run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "metal_run_id=$METAL_ID" >> "$GITHUB_OUTPUT"
           echo "ipsw_url=$IPSW_URL" >> "$GITHUB_OUTPUT"
           echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Resolved XNU run=${RUN_ID:-none}, IPSW=$IPSW_URL, Release=$TAG"
+          echo "Resolved XNU run=${RUN_ID:-none}, Metal run=${METAL_ID:-none}, IPSW=$IPSW_URL, Release=$TAG"
 
   ramdisk-payload:
     needs: prepare
@@ -129,7 +150,7 @@ jobs:
             out-ios18/kernel.development.sweet \
             out-ios18/begonia-ios18-n841.adt \
             out-ios18/begonia-xnu-kernel-only-payload.bin \
-            --cmdline "debug=0x14e serial=3 cpus=6 keepsyms=1 -v rd=ufsroot0 ufsroot=iosroot ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt=-1 wdt_test=no_user_checkin launchd_disable_all_timeouts=1 sweetfb_noconsole=1 sweetfb_hz=30 sweetfb_vsync=1 sweetfb_scale=1 sweetfb_flip=1 sweetarm64e=1 begoniamali=1 bglrender=soft" \
+            --cmdline "debug=0x14e serial=3 cpus=6 keepsyms=1 -v rd=ufsroot0 ufsroot=iosroot ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt=-1 wdt_test=no_user_checkin launchd_disable_all_timeouts=1 sweetfb_noconsole=1 sweetfb_hz=30 sweetfb_vsync=1 sweetfb_scale=1 sweetfb_flip=1 sweetarm64e=1 begoniamali=1 chlorophyll=1 bglrender=soft" \
             --compress
 
           (
@@ -219,22 +240,77 @@ jobs:
           done
           ls -lh "$O"
 
-      - name: Install berga-tools (dash /bin/sh, dropbear, toybox, sweetuicache, bglrender)
+      - name: Install berga-tools & stage Begonia Mali Metal/GL payload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          mkdir -p metal-out
+          gh run download "${{ needs.prepare.outputs.metal_run_id }}" -R "${{ github.repository }}" \
+            -n begonia-metal-userspace -D metal-out
           cd bergamota
           python3 -I tools/renegade/renegade fetch-tools
           python3 -I tools/renegade/berga_tools.py status
+          rm -rf research/bgmtl research/bergamota-gl research/Chlorophyll.bundle research/bgmtl-probes
+          mkdir -p research/bgmtl research/bergamota-gl research/Chlorophyll.bundle research/bgmtl-probes
+          cp -R ../metal-out/bgmtl/. research/bgmtl/
+          cp -R ../metal-out/bergamota-gl/. research/bergamota-gl/
+          cp -R ../metal-out/Chlorophyll.bundle/. research/Chlorophyll.bundle/
+          cp -R ../metal-out/probes/. research/bgmtl-probes/
+          python3 - <<'PY'
+          p = 'tools/renegade/root_tweaks18.py'
+          s = open(p).read()
+          hook = '''
+          def begonia_install_metal_extras(root):
+              import shutil
+              src_b = os.path.join(REPO, 'research/Chlorophyll.bundle')
+              if os.path.isdir(src_b):
+                  dst_b = os.path.join(root, 'System/Library/Extensions/Chlorophyll.bundle')
+                  shutil.rmtree(dst_b, ignore_errors=True)
+                  shutil.copytree(src_b, dst_b)
+                  for dn, _, fns in os.walk(dst_b):
+                      os.chmod(dn, 0o755)
+                      for fn in fns:
+                          fp = os.path.join(dn, fn)
+                          os.chmod(fp, 0o755 if fn in ('Chlorophyll', 'libbgair.dylib', 'libdrm.2.dylib') else 0o644)
+                  print('bgmtl: Chlorophyll.bundle installed in /System/Library/Extensions/Chlorophyll.bundle')
+              bb_arm = os.path.join(root, 'private/var/tmp/bgmtl-bb.arm')
+              os.makedirs(os.path.dirname(bb_arm), exist_ok=True)
+              open(bb_arm, 'w').write('armed by begonia-ios metal\\n')
+              os.chmod(bb_arm, 0o644)
+              ps = os.path.join(REPO, 'research/bgmtl-probes')
+              if os.path.isdir(ps):
+                  os.makedirs(os.path.join(root, 'usr/local/bin'), exist_ok=True)
+                  os.makedirs(os.path.join(root, 'usr/local/share/begonia-metal'), exist_ok=True)
+                  for b in ('bgmtl_probe', 'bgmtl_render_probe'):
+                      sp = os.path.join(ps, b)
+                      if os.path.exists(sp):
+                          install_file(sp, os.path.join(root, 'usr/local/bin', b), 0o755)
+                  for m in ('bg_kernels.metallib', 'bg_render.metallib'):
+                      sp = os.path.join(ps, m)
+                      if os.path.exists(sp):
+                          install_file(sp, os.path.join(root, 'usr/local/share/begonia-metal', m), 0o644)
+          '''
+          anchor = "    if enabled('bglrender'):\n        bglrender(root)"
+          assert anchor in s, 'auto() anchor not found'
+          s = s.replace(anchor, anchor + "\n    begonia_install_metal_extras(root)", 1)
+          s = s.replace("def auto(root):", hook + "\ndef auto(root):", 1)
+          open(p, 'w').write(s)
+          PY
+          ls -lh research/bgmtl research/bergamota-gl research/Chlorophyll.bundle
 
-      - name: Build patched HFS+ full iOS 18.7.8 RootFS (.simg)
+      - name: Build patched HFS+ full iOS 18.7.8 RootFS (.simg) with Metal
         run: |
           set -euo pipefail
           cd bergamota
-          EXTRA_FLAGS=(--size 18g --delete-sources --no-bluetooth --no-posterboard)
+          EXTRA_FLAGS=(--size 18g --delete-sources --no-bluetooth)
           if [ "${{ inputs.include_jb }}" != "true" ]; then
             EXTRA_FLAGS+=(--no-jb)
           fi
+          BGL_DIR="$(pwd)/research/bergamota-gl"
+          BGMTL_DIR="$(pwd)/research/bgmtl"
           RENEGADE_TARGET=ios18 RENEGADE_MIN_FREE_GB=2 \
+            RENEGADE_BGL="$BGL_DIR" RENEGADE_BGMTL_DIR="$BGMTL_DIR" \
             python3 -I tools/renegade/mkroot-full.py \
             "${EXTRA_FLAGS[@]}" \
             --stages copy,macho,cache,tweaks,seal,verify,simg
