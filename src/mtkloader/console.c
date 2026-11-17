@@ -7,8 +7,21 @@
 #include "fdt.h"
 #include "font8x16.h"
 
+static const uint8_t k_fmts[8][6] = {
+    { 4U, 16U,  8U,  0U, 24U, 0U }, /* 0: BGRA8888 */
+    { 4U,  0U,  8U, 16U, 24U, 0U }, /* 1: RGBA8888 */
+    { 4U, 24U, 16U,  8U,  0U, 0U }, /* 2: ABGR8888 */
+    { 4U,  8U, 16U, 24U,  0U, 0U }, /* 3: ARGB8888 */
+    { 3U, 16U,  8U,  0U,  0U, 0U }, /* 4: BGR888 */
+    { 3U,  0U,  8U, 16U,  0U, 0U }, /* 5: RGB888 */
+    { 2U,  0U,  0U,  0U,  0U, 0U }, /* 6: RGB565 */
+    { 2U,  0U,  0U,  0U,  0U, 1U }, /* 7: BGR565 */
+};
+
 static struct fb_info g_fb;
 static uint64_t g_ovl_base = MT6785_DISP_OVL0_BASE;
+static uint32_t g_ovl_layer;
+static uint32_t g_fmt_idx;
 static uint32_t g_scale = 2;
 static uint32_t g_col_x;
 static uint32_t g_row_y;
@@ -58,12 +71,56 @@ static void uart_putc_raw(char c)
     mmio_write32(MT6785_UART0_BASE + UART_THR, (uint8_t)c);
 }
 
-static void fb_px(uint32_t x, uint32_t y, uint32_t c)
+static uint32_t fb_pack_px(uint32_t argb)
 {
-    *(volatile uint32_t *)(g_fb.base + (uint64_t)y * g_fb.pitch + (uint64_t)x * 4ULL) = c;
+    const uint8_t *f = k_fmts[g_fmt_idx];
+    uint32_t a = (argb >> 24) & 0xffU;
+    uint32_t r = (argb >> 16) & 0xffU;
+    uint32_t g = (argb >> 8) & 0xffU;
+    uint32_t b = argb & 0xffU;
+    if (f[0] == 2U) {
+        return f[5]
+            ? (((b >> 3) << 11) | ((g >> 2) << 5) | (r >> 3))
+            : (((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+    }
+    uint32_t packed = (r << f[1]) | (g << f[2]) | (b << f[3]);
+    return (f[0] == 4U) ? (packed | (a << f[4])) : packed;
 }
 
-static void fb_hline(int32_t x0, int32_t x1, int32_t y, uint32_t c)
+static void fb_store_span(uintptr_t addr, uint32_t count, uint32_t packed)
+{
+    uint32_t bpp = k_fmts[g_fmt_idx][0];
+    if (bpp == 4U && (addr & 3U) == 0U) {
+        volatile uint32_t *row = (volatile uint32_t *)addr;
+        for (uint32_t i = 0; i < count; i++) {
+            row[i] = packed;
+        }
+        return;
+    }
+    if (bpp == 2U && (addr & 1U) == 0U) {
+        volatile uint16_t *row = (volatile uint16_t *)addr;
+        uint16_t c16 = (uint16_t)packed;
+        for (uint32_t i = 0; i < count; i++) {
+            row[i] = c16;
+        }
+        return;
+    }
+    volatile uint8_t *p = (volatile uint8_t *)addr;
+    for (uint32_t i = 0; i < count; i++) {
+        for (uint32_t b = 0; b < bpp; b++) {
+            p[b] = (uint8_t)(packed >> (b * 8U));
+        }
+        p += bpp;
+    }
+}
+
+static void fb_px(uint32_t x, uint32_t y, uint32_t argb)
+{
+    uintptr_t addr = g_fb.base + (uint64_t)y * g_fb.pitch + (uint64_t)x * k_fmts[g_fmt_idx][0];
+    fb_store_span(addr, 1U, fb_pack_px(argb));
+}
+
+static void fb_hline(int32_t x0, int32_t x1, int32_t y, uint32_t argb)
 {
     if (!g_fb.base || y < 0 || (uint32_t)y >= g_fb.height || x1 <= x0) {
         return;
@@ -74,10 +131,8 @@ static void fb_hline(int32_t x0, int32_t x1, int32_t y, uint32_t c)
     if ((uint32_t)x1 > g_fb.width) {
         x1 = (int32_t)g_fb.width;
     }
-    volatile uint32_t *row = (volatile uint32_t *)(g_fb.base + (uint64_t)(uint32_t)y * g_fb.pitch);
-    for (int32_t x = x0; x < x1; x++) {
-        row[x] = c;
-    }
+    uintptr_t addr = g_fb.base + (uint64_t)(uint32_t)y * g_fb.pitch + (uint64_t)(uint32_t)x0 * k_fmts[g_fmt_idx][0];
+    fb_store_span(addr, (uint32_t)(x1 - x0), fb_pack_px(argb));
 }
 
 void fb_fill_rect(uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, uint32_t c)
@@ -111,29 +166,43 @@ static uint32_t isqrt_u32(uint32_t v)
     return r;
 }
 
-void fb_fill_round_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t r, uint32_t argb)
+static uint32_t clamp_radius(uint32_t w, uint32_t h, uint32_t r)
 {
-    if (!g_fb.base || w == 0 || h == 0) {
-        return;
-    }
     if (r * 2U > w) {
         r = w / 2U;
     }
     if (r * 2U > h) {
         r = h / 2U;
     }
+    return r;
+}
+
+static uint32_t round_inset(uint32_t row, uint32_t h, uint32_t r)
+{
+    if (r == 0U) {
+        return 0U;
+    }
+    uint32_t dy;
+    if (row < r) {
+        dy = r - 1U - row;
+    } else if (row >= h - r) {
+        dy = row - (h - r);
+    } else {
+        return 0U;
+    }
     uint32_t rr = r * r;
+    uint32_t dx = isqrt_u32(rr > dy * dy ? rr - dy * dy : 0U);
+    return (r > dx) ? (r - dx) : 0U;
+}
+
+void fb_fill_round_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t r, uint32_t argb)
+{
+    if (!g_fb.base || w == 0 || h == 0) {
+        return;
+    }
+    r = clamp_radius(w, h, r);
     for (uint32_t row = 0; row < h; row++) {
-        uint32_t inset = 0;
-        if (row < r) {
-            uint32_t dy = r - 1U - row;
-            uint32_t dx = isqrt_u32(rr > dy * dy ? rr - dy * dy : 0U);
-            inset = (r > dx) ? (r - dx) : 0U;
-        } else if (row >= h - r) {
-            uint32_t dy = row - (h - r);
-            uint32_t dx = isqrt_u32(rr > dy * dy ? rr - dy * dy : 0U);
-            inset = (r > dx) ? (r - dx) : 0U;
-        }
+        uint32_t inset = round_inset(row, h, r);
         fb_hline((int32_t)(x + inset), (int32_t)(x + w - inset), (int32_t)(y + row), argb);
     }
 }
@@ -143,39 +212,14 @@ void fb_stroke_round_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32
     if (!g_fb.base || w == 0 || h == 0 || thick == 0) {
         return;
     }
-    if (r * 2U > w) {
-        r = w / 2U;
-    }
-    if (r * 2U > h) {
-        r = h / 2U;
-    }
+    r = clamp_radius(w, h, r);
     uint32_t r_in = (r > thick) ? (r - thick) : 0U;
-    uint32_t rr_out = r * r;
-    uint32_t rr_in = r_in * r_in;
     for (uint32_t row = 0; row < h; row++) {
-        uint32_t out_ins = 0;
-        if (row < r) {
-            uint32_t dy = r - 1U - row;
-            uint32_t dx = isqrt_u32(rr_out > dy * dy ? rr_out - dy * dy : 0U);
-            out_ins = (r > dx) ? (r - dx) : 0U;
-        } else if (row >= h - r) {
-            uint32_t dy = row - (h - r);
-            uint32_t dx = isqrt_u32(rr_out > dy * dy ? rr_out - dy * dy : 0U);
-            out_ins = (r > dx) ? (r - dx) : 0U;
-        }
+        uint32_t out_ins = round_inset(row, h, r);
         if (row < thick || row >= h - thick) {
             fb_hline((int32_t)(x + out_ins), (int32_t)(x + w - out_ins), (int32_t)(y + row), argb);
         } else {
-            uint32_t in_ins = thick;
-            if (r_in > 0U && row < r) {
-                uint32_t dy = r - 1U - row;
-                uint32_t dx = (dy < r_in) ? isqrt_u32(rr_in - dy * dy) : 0U;
-                in_ins = thick + ((r_in > dx) ? (r_in - dx) : 0U);
-            } else if (r_in > 0U && row >= h - r) {
-                uint32_t dy = row - (h - r);
-                uint32_t dx = (dy < r_in) ? isqrt_u32(rr_in - dy * dy) : 0U;
-                in_ins = thick + ((r_in > dx) ? (r_in - dx) : 0U);
-            }
+            uint32_t in_ins = thick + round_inset(row - thick, h - 2U * thick, r_in);
             fb_hline((int32_t)(x + out_ins), (int32_t)(x + in_ins), (int32_t)(y + row), argb);
             fb_hline((int32_t)(x + w - in_ins), (int32_t)(x + w - out_ins), (int32_t)(y + row), argb);
         }
@@ -232,14 +276,46 @@ void fb_draw_text(uint32_t x, uint32_t y, const char *s, uint32_t scale, uint32_
     }
 }
 
+static uint64_t le_read(uintptr_t addr, uint32_t nbytes)
+{
+    const volatile uint8_t *p = (const volatile uint8_t *)addr;
+    uint64_t v = 0;
+    for (uint32_t i = 0; i < nbytes; i++) {
+        v |= (uint64_t)p[i] << (i * 8U);
+    }
+    return v;
+}
+
+static void ovl_decode_fmt(uint32_t con, uint32_t pitch)
+{
+    uint32_t cfmt = (con >> 12) & 0xfU;
+    uint32_t btsw = (con >> 24) & 1U;
+    uint32_t rgbsw = (con >> 25) & 1U;
+    uint32_t man = (con >> 23) & 1U;
+
+    if (cfmt == 0U && pitch >= g_fb.width * 2U) {
+        g_fmt_idx = 6U + btsw;
+    } else if (cfmt == 1U && pitch >= g_fb.width * 3U) {
+        g_fmt_idx = 4U + btsw;
+    } else if (cfmt == 2U && pitch >= g_fb.width * 4U) {
+        g_fmt_idx = btsw;
+    } else if (cfmt == 3U && pitch >= g_fb.width * 4U) {
+        g_fmt_idx = man ? (btsw ? (3U - rgbsw) : rgbsw) : (2U + btsw);
+    } else if (pitch < g_fb.width * 3U) {
+        g_fmt_idx = 6U;
+    } else if (pitch < g_fb.width * 4U) {
+        g_fmt_idx = 4U;
+    } else {
+        g_fmt_idx = 0U;
+    }
+}
+
 /*
- * Probe live framebuffer from LK's /chosen atag,videolfb-* properties first, then check
- * OVL0 / OVL0_2L layer 0 address/pitch, falling back to begonia defaults.
+ * Probe LK framebuffer: /chosen atag,videolfb first, then atag,videolfb-fb_base_l,
+ * then unconditionally adopt any active OVL0 / OVL0_2L layer base, pitch & format.
  */
 void console_init(uintptr_t fdt, uint32_t scale)
 {
-    uint64_t fb_lo = 0, fb_hi = 0, vram_sz = 0;
-
     g_scale = scale ? scale : 1U;
     g_fb.width = BEGONIA_PANEL_W;
     g_fb.height = BEGONIA_PANEL_H;
@@ -247,31 +323,59 @@ void console_init(uintptr_t fdt, uint32_t scale)
     g_fb.base = BEGONIA_FB_FALLBACK;
     g_fb.size = (uint32_t)BEGONIA_FB_FALLBACK_SZ;
     g_fb.ovl_active = 0;
+    g_ovl_base = MT6785_DISP_OVL0_BASE;
+    g_ovl_layer = 0U;
+    g_fmt_idx = 0U;
 
-    if (fdt_chosen_u64(fdt, "atag,videolfb-fb_base_l", &fb_lo) && fb_lo != 0) {
+    uint32_t vlen = 0;
+    uintptr_t vprop = fdt_chosen_prop(fdt, "atag,videolfb", &vlen);
+    uint64_t fb_lo = 0, fb_hi = 0, vram_sz = 0;
+    if (vprop && vlen >= 20U) {
+        uint64_t base = le_read(vprop, 8U);
+        uint32_t vram = (uint32_t)le_read(vprop + 16U, 4U);
+        if (base >= 0x40000000ULL) {
+            g_fb.base = base;
+            if (vram >= g_fb.width * g_fb.height * 2U) {
+                g_fb.size = vram;
+            }
+        }
+    } else if (fdt_chosen_u64(fdt, "atag,videolfb-fb_base_l", &fb_lo) && fb_lo != 0ULL) {
         (void)fdt_chosen_u64(fdt, "atag,videolfb-fb_base_h", &fb_hi);
         g_fb.base = (fb_hi << 32) | (fb_lo & 0xffffffffULL);
-    }
-    if (fdt_chosen_u64(fdt, "atag,videolfb-vramSize", &vram_sz) && vram_sz >= (uint64_t)g_fb.pitch * g_fb.height) {
-        g_fb.size = (uint32_t)vram_sz;
+        if (fdt_chosen_u64(fdt, "atag,videolfb-vramSize", &vram_sz) &&
+            vram_sz >= (uint64_t)g_fb.pitch * g_fb.height) {
+            g_fb.size = (uint32_t)vram_sz;
+        }
     }
 
     const uint64_t ovl_bases[2] = { MT6785_DISP_OVL0_BASE, MT6785_DISP_OVL0_2L };
+    uint64_t best_area = 0;
     for (int i = 0; i < 2; i++) {
         uint32_t ovl_src = mmio_read32(ovl_bases[i] + OVL_SRC_CON);
-        uint32_t ovl_addr = mmio_read32(ovl_bases[i] + OVL_L0_ADDR);
-        uint32_t ovl_pitch = mmio_read32(ovl_bases[i] + OVL_L0_PITCH) & 0xffffU;
-        if ((ovl_src & 1U) != 0U && ovl_addr >= 0x40000000U &&
-            ovl_pitch >= g_fb.width * 4U && ovl_pitch <= 8192U) {
-            g_ovl_base = ovl_bases[i];
-            g_fb.ovl_active = 1U;
-            if (ovl_addr == (uint32_t)g_fb.base || fb_lo == 0ULL) {
-                if (fb_lo == 0ULL) {
-                    g_fb.base = (uint64_t)ovl_addr;
-                }
-                g_fb.pitch = ovl_pitch;
+        for (uint32_t l = 0; l < 4U; l++) {
+            if ((ovl_src & (1U << l)) == 0U) {
+                continue;
             }
-            break;
+            uint32_t off = l * OVL_LAYER_STRIDE;
+            uint32_t con = mmio_read32(ovl_bases[i] + OVL_L0_CON + off);
+            uint32_t addr = mmio_read32(ovl_bases[i] + OVL_L0_ADDR + off);
+            uint32_t pitch = mmio_read32(ovl_bases[i] + OVL_L0_PITCH + off) & 0xffffU;
+            uint32_t sz = mmio_read32(ovl_bases[i] + OVL_L0_SRC_SIZE + off);
+            if ((con & (3U << 28)) != 0U || addr < 0x40000000U ||
+                pitch < g_fb.width * 2U || pitch > 8192U) {
+                continue;
+            }
+            uint64_t area = (uint64_t)((sz & 0x1fffU) ? (sz & 0x1fffU) : g_fb.width) *
+                            (((sz >> 16) & 0x1fffU) ? ((sz >> 16) & 0x1fffU) : g_fb.height);
+            if (area > best_area) {
+                best_area = area;
+                g_ovl_base = ovl_bases[i];
+                g_ovl_layer = l;
+                g_fb.ovl_active = 1U;
+                g_fb.base = (uint64_t)addr;
+                g_fb.pitch = pitch;
+                ovl_decode_fmt(con, pitch);
+            }
         }
     }
 
@@ -290,10 +394,16 @@ void console_strip_ovl_alpha(void)
     if (!g_fb.ovl_active) {
         return;
     }
-    uint32_t con = mmio_read32(g_ovl_base + OVL_L0_CON);
+    uint32_t off = g_ovl_layer * OVL_LAYER_STRIDE;
+    uint32_t con = mmio_read32(g_ovl_base + OVL_L0_CON + off);
     uint32_t src = mmio_read32(g_ovl_base + OVL_SRC_CON);
-    mmio_write32(g_ovl_base + OVL_L0_CON, con & ~(1U << 8));
-    mmio_write32(g_ovl_base + OVL_SRC_CON, src & 1U);
+    uint32_t keep = 1U << g_ovl_layer;
+    if ((con & (1U << 8)) != 0U) {
+        mmio_write32(g_ovl_base + OVL_L0_CON + off, con & ~(1U << 8));
+    }
+    if ((src & ~keep) != 0U) {
+        mmio_write32(g_ovl_base + OVL_SRC_CON, src & keep);
+    }
     mmio_write32(DISP_MUTEX0_EN, 1U);
 }
 
@@ -308,6 +418,7 @@ void console_clear(uint32_t argb)
     g_col_x = 0;
     g_row_y = 0;
     fb_fill_rect(0, 0, g_fb.width, g_fb.height, argb);
+    __asm__ volatile("dsb sy" ::: "memory");
 }
 
 static void fb_newline(void)
@@ -337,20 +448,11 @@ void con_putc(char c)
         return;
     }
     uint32_t cw = 8U * g_scale;
-    if ((unsigned char)c < 0x20U || (unsigned char)c > 0x7eU) {
-        c = '?';
-    }
     if (g_col_x + cw > g_fb.width) {
         fb_newline();
     }
-    const unsigned char *glyph = font8x16[(unsigned char)c - 0x20U];
-    for (uint32_t r = 0; r < 16U * g_scale; r++) {
-        unsigned char bits = glyph[r / g_scale];
-        for (uint32_t col = 0; col < cw; col++) {
-            uint32_t color = (bits & (0x80U >> (col / g_scale))) ? g_fg : g_bg;
-            fb_px(g_col_x + col, g_row_y + r, color);
-        }
-    }
+    char str[2] = { c, '\0' };
+    fb_draw_text(g_col_x, g_row_y, str, g_scale, g_fg, g_bg, 0);
     g_col_x += cw;
 }
 

@@ -69,17 +69,19 @@
 
 #define OVL_SRC_CON             0x02cu
 #define OVL_L0_CON              0x030u
+#define OVL_L0_SRC_SIZE         0x038u
 #define OVL_L0_PITCH            0x044u
 #define OVL_L0_ADDR             0xf40u
+#define OVL_LAYER_STRIDE        0x020u
 #define DISP_MUTEX0_EN          (MT6785_DISP_MUTEX_BASE + 0x020u)
 #define DISP_MUTEX0_RST         (MT6785_DISP_MUTEX_BASE + 0x028u)
 
-/* Panel & fallback LK framebuffer (begonia fb0 stride = 1088*4 = 4352) */
+/* Panel & fallback LK framebuffer (begonia live DTB videolfb: 0x7d9b0000, vram 0x02250000) */
 #define BEGONIA_PANEL_W         1080u
 #define BEGONIA_PANEL_H         2340u
 #define BEGONIA_FB_STRIDE_DEF   4352u
-#define BEGONIA_FB_FALLBACK     0x7e605000ULL
-#define BEGONIA_FB_FALLBACK_SZ  0x017e8000ULL
+#define BEGONIA_FB_FALLBACK     0x7d9b0000ULL
+#define BEGONIA_FB_FALLBACK_SZ  0x02250000ULL
 
 /* Clocks, GPIO & SPI5 (Novatek NT36672A touchscreen controller on begonia) */
 #define MT6785_TOPCKGEN_BASE    0x10000000ULL
