@@ -291,10 +291,18 @@ dcache_clean_all:
 .macro exc_slot id
     .balign 0x80
     mov     x0, #\id
-    mrs     x1, esr_el1
+    /* The vectors are installed in VBAR_EL2 when LK enters at EL2: report that EL's syndrome. */
+    mrs     x9, CurrentEL
+    cmp     x9, #8
+    b.ne    1f
+    mrs     x1, esr_el2
+    mrs     x2, elr_el2
+    mrs     x3, far_el2
+    b       2f
+1:  mrs     x1, esr_el1
     mrs     x2, elr_el1
     mrs     x3, far_el1
-    bl      loader_exception_handler
+2:  bl      loader_exception_handler
     b       .
 .endm
 
