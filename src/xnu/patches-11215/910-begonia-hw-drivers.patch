@@ -663,7 +663,7 @@ index 0000000..04d06a8
 +	    g_gpu_id, g_freq_khz / 1000u, g_shader_mask, g_tiler_mask, g_l2_mask, g_va_bits);
 +
 +	if (kmem_alloc_contig(kernel_map, &test_kva, PAGE_SIZE, PAGE_MASK, 0, 0,
-+	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 +		return;
 +	}
 +	ppnum_t test_pn = pmap_find_phys(kernel_pmap, (addr64_t)test_kva);
