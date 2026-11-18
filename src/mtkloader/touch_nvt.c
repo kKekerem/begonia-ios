@@ -121,11 +121,14 @@ static int nvt_read_fw_info(struct touch_state *st)
 {
     uint8_t info[16];
     if (nvt_set_page(NVT_EVENT_BUF_ADDR | EVENT_MAP_FWINFO) != 0) {
+        st->dbg = (st->dbg & ~0xff0000U) | 0xee0000U;
         return 0;
     }
     if (nvt_spi_read(EVENT_MAP_FWINFO, info, sizeof(info)) != 0) {
+        st->dbg = (st->dbg & ~0xff0000U) | 0xef0000U;
         return 0;
     }
+    st->dbg = (st->dbg & 0xffffU) | ((uint32_t)info[0] << 16) | ((uint32_t)info[1] << 24);
     if ((uint8_t)(info[0] + info[1]) != 0xFFu || info[0] == 0u) {
         return 0;
     }
@@ -184,9 +187,13 @@ static int nvt_write_sram(const uint8_t *fw, uint32_t sram_addr, uint32_t size, 
     uint8_t pkt[129];
     uint32_t pos = 0;
     while (pos < size) {
+        uint32_t page_rem = 128u - ((sram_addr + pos) & 0x7fu);
         uint32_t n = size - pos;
-        if (n > 128u) {
-            n = 128u;
+        if (n > page_rem) {
+            n = page_rem;
+        }
+        if (n > 28u) {
+            n = 28u; /* fit 1 addr byte + data inside a single 32-byte SPI5 FIFO transfer */
         }
         if (nvt_set_page(sram_addr + pos) != 0) {
             return -1;
@@ -233,7 +240,7 @@ static void nvt_set_crc_bank(uint32_t des_addr, uint32_t sram_addr,
     (void)nvt_spi_write(b2, 5u);
 }
 
-static int nvt_download_fw(const uint8_t *fw)
+static int nvt_download_fw(const uint8_t *fw, struct touch_state *st)
 {
     struct nvt_part parts[NVT_MAX_PARTITIONS];
     uint32_t hdr_end = read_le32(fw);
@@ -242,6 +249,7 @@ static int nvt_download_fw(const uint8_t *fw)
     uint32_t ovly_num = (ovly & 0x10u) ? (ovly & 0x0fu) : 0u;
     uint32_t total = 2u + info_num + ovly_num;
     if (total > NVT_MAX_PARTITIONS) {
+        st->dbg = (st->dbg & ~0xffU) | 0x11U;
         return -1;
     }
 
@@ -275,9 +283,11 @@ static int nvt_download_fw(const uint8_t *fw)
         }
         uint32_t sz = parts[i].size + 1u;
         if (parts[i].bin_addr + sz > NVT_FW_BLOCK_SIZE) {
+            st->dbg = (st->dbg & ~0xffU) | 0x12U;
             return -1;
         }
         if (nvt_write_sram(fw, parts[i].sram_addr, sz, parts[i].bin_addr) != 0) {
+            st->dbg = (st->dbg & ~0xffU) | 0x13U;
             return -1;
         }
     }
@@ -306,12 +316,14 @@ static int nvt_download_fw(const uint8_t *fw)
         uint8_t rst_state = 0;
         if (nvt_set_page(NVT_EVENT_BUF_ADDR) == 0 &&
             nvt_spi_read(EVENT_MAP_RESET_COMPLETE, &rst_state, 1u) == 0) {
+            st->dbg = (st->dbg & ~0xff00U) | ((uint32_t)rst_state << 8);
             if (rst_state >= 0xA0u && rst_state <= 0xAFu) {
                 return 0;
             }
         }
         delay_ms(10u);
     }
+    st->dbg = (st->dbg & ~0xffU) | 0x14U;
     return -1;
 }
 
@@ -341,18 +353,27 @@ void touch_init(uintptr_t android_img_pa, uint64_t android_img_len, struct touch
         id_ok = nvt_probe_chip_id(out->chip_id);
     }
     if (!id_ok) {
+        out->dbg = 0x02U;
         return;
     }
 
     if (nvt_read_fw_info(out)) {
         out->ready = 1;
+        out->dbg |= 0x01U;
         return;
     }
 
     const uint8_t *fw = find_builtin_nvt_fw(android_img_pa, android_img_len);
-    if (fw && nvt_download_fw(fw) == 0 && nvt_read_fw_info(out)) {
+    if (!fw) {
+        out->dbg = (out->dbg & ~0xffU) | 0x03U;
+        return;
+    }
+    if (nvt_download_fw(fw, out) == 0 && nvt_read_fw_info(out)) {
         out->fw_uploaded = 1;
         out->ready = 1;
+        out->dbg = (out->dbg & ~0xffU) | 0x07U;
+    } else if ((out->dbg & 0xffU) == 0U) {
+        out->dbg |= 0x06U;
     }
 }
 

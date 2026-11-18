@@ -5,6 +5,7 @@
  */
 .global _start
 .global jump_to_kernel
+.global dcache_clean_all
 .global chain_stub
 .global chain_stub_end
 .global psci_system_reset
@@ -144,6 +145,30 @@ mmu_off_jump:
     isb
     tlbi    alle2
     msr     vbar_el2, xzr
+    dsb     sy
+    ic      iallu
+    dsb     sy
+    isb
+    /* Drop EL2 -> EL1h cleanly with architectural EL1 reset state (XNU requires EL1). */
+    movz    x9, #0x0800
+    movk    x9, #0x30d0, lsl #16
+    msr     sctlr_el1, x9
+    msr     vbar_el1, xzr
+    msr     cntvoff_el2, xzr
+    mov     x9, #0x3                /* CNTHCTL_EL2: EL1PCTEN | EL1PCEN */
+    msr     cnthctl_el2, x9
+    mov     x9, #0x33ff             /* CPTR_EL2: no FP/SIMD trap */
+    msr     cptr_el2, x9
+    mov     x9, #(1 << 31)          /* HCR_EL2.RW = 1 (AArch64 EL1) */
+    msr     hcr_el2, x9
+    mov     x9, #0x3c5              /* EL1h, DAIF masked */
+    msr     spsr_el2, x9
+    msr     elr_el2, x1
+    mov     x1, xzr
+    mov     x2, xzr
+    mov     x3, xzr
+    isb
+    eret
 4:  dsb     sy
     ic      iallu
     dsb     sy

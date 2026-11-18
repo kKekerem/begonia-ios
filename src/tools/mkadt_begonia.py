@@ -34,8 +34,9 @@ PANEL_H = 2340
 
 # Clean contiguous high DRAM window on MT6785 (mblock[17]: 0xc0000000, size 0x3fe00000),
 # avoiding modem/SCP/ATF carve-outs in 0x40000000..0xbfffffff.
-DEFAULT_DRAM_BASE = 0xC0000000
-DEFAULT_DRAM_SIZE = 0x3FC00000  # 1020 MiB contiguous window
+# Offset +0x01004000 matches XNU's 32 MiB L2 block alignment for __TEXT (0xfffffe0007004000).
+DEFAULT_DRAM_BASE = 0xC1004000
+DEFAULT_DRAM_SIZE = 0x3EBFC000  # ends at 0xFFC00000 (~1004 MiB, 16 KiB aligned)
 
 BEGONIA_ECID = 0x4245474F4E494101
 BOOT_MANIFEST_HASH = hashlib.sha384(b"begonia-ios boot manifest").digest()

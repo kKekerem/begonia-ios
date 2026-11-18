@@ -35,6 +35,17 @@ void fb_fill_circle(int32_t cx, int32_t cy, int32_t r, uint32_t argb);
 uint32_t fb_text_width(const char *s, uint32_t scale);
 void fb_draw_text(uint32_t x, uint32_t y, const char *s, uint32_t scale, uint32_t fg, uint32_t bg, int transparent_bg);
 
+/*
+ * Persistent log: everything the console prints is also written into Linux's ramoops console
+ * zone (begonia: ramoops @0x4d010000, 143 x 4 KiB dump records, then console 0x40000, ecc 0).
+ * DRAM survives begonia's watchdog / full PMIC resets, so after any hang or reset the next
+ * Android boot shows the loader's output in /sys/fs/pstore/console-ramoops.
+ */
+#define PLOG_ZONE_PA    0x4D09F000ULL
+#define PLOG_ZONE_SIZE  0x40000ULL
+void plog_init(void);
+void plog_putc(char c);
+
 void con_putc(char c);
 void con_puts(const char *s);
 void con_hex(uint64_t v);

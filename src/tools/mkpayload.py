@@ -246,6 +246,13 @@ def main() -> int:
     else:
         rd = None
     payload = build_payload(kbytes, abytes, cmdline=args.cmdline, ramdisk_bytes=rd, compress=args.compress)
+    _, _, _, virt_base, _, _, _, _, phys_base, _ = struct.unpack_from("<8sII7Q", payload, 0)
+    if (phys_base ^ virt_base) & 0x1FFFFFF:
+        print(
+            f"warning: phys_base ({phys_base:#x}) and virt_base ({virt_base:#x}) "
+            "differ mod 32 MiB; XNU bootstrap MMU mapping requires matching 32 MiB offsets",
+            file=sys.stderr,
+        )
     with open(args.out, "wb") as fp:
         fp.write(payload)
     print(f"{args.out}: {len(payload)} bytes")

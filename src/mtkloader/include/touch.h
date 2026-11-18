@@ -15,6 +15,7 @@ struct touch_state {
     uint16_t pid;
     uint8_t fw_ver;
     uint8_t chip_id[6];
+    uint32_t dbg;
 };
 
 /*

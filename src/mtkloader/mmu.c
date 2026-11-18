@@ -53,15 +53,20 @@ static uint64_t *pt_alloc_page(void)
     return (uint64_t *)(uintptr_t)pa;
 }
 
-static uint64_t leaf_attrs(uint32_t attr)
+extern void dcache_clean_all(void);
+
+static uint64_t leaf_attrs(uint32_t attr, uint64_t el)
 {
+    /* Non-VHE EL2 uses bit 54 as XN (bit 53 RES0); EL1 uses bit 53=PXN, bit 54=UXN. */
+    uint64_t xn_all = (el == 2ULL) ? DESC_UXN : (DESC_PXN | DESC_UXN);
+    uint64_t wb_xn  = (el == 2ULL) ? 0ULL : DESC_UXN;
     if (attr == MMU_ATTR_WB) {
-        return DESC_AF | DESC_SH_ISH | (2ULL << 2) | DESC_UXN;
+        return DESC_AF | DESC_SH_ISH | (2ULL << 2) | wb_xn;
     }
     if (attr == MMU_ATTR_NC) {
-        return DESC_AF | DESC_SH_OSH | (1ULL << 2) | DESC_PXN | DESC_UXN;
+        return DESC_AF | DESC_SH_OSH | (1ULL << 2) | xn_all;
     }
-    return DESC_AF | DESC_SH_OSH | (0ULL << 2) | DESC_PXN | DESC_UXN;
+    return DESC_AF | DESC_SH_OSH | (0ULL << 2) | xn_all;
 }
 
 static uint64_t *ensure_l2(uint64_t *l1, uint64_t va)
@@ -100,7 +105,7 @@ static uint64_t *ensure_l3(uint64_t *l2, uint32_t l2_idx)
     return l3;
 }
 
-static int map_range(uint64_t *l1, const struct mmu_range *r)
+static int map_range(uint64_t *l1, const struct mmu_range *r, uint64_t el)
 {
     if (r->size == 0) {
         return 0;
@@ -114,7 +119,7 @@ static int map_range(uint64_t *l1, const struct mmu_range *r)
     if (end > MAX_VA_BYTES) {
         return -1;
     }
-    uint64_t attrs = leaf_attrs(r->attr);
+    uint64_t attrs = leaf_attrs(r->attr, el);
 
     for (uint64_t cur = base; cur < end;) {
         uint64_t *l2 = ensure_l2(l1, cur);
@@ -180,7 +185,7 @@ static void disable_active_mmu(uint64_t el)
         if (!(sctlr & (SCTLR_M | SCTLR_C | SCTLR_I))) {
             return;
         }
-        mmu_flush_dcache_range(MMU_PT_POOL_PA, (uint64_t)MMU_PT_MAX_PGS << PAGE_SHIFT);
+        dcache_clean_all();
         sctlr &= ~(SCTLR_M | SCTLR_C | SCTLR_I);
         __asm__ volatile("msr sctlr_el2, %0; isb; tlbi alle2; ic iallu; dsb sy; isb"
                          :: "r"(sctlr) : "memory");
@@ -190,7 +195,7 @@ static void disable_active_mmu(uint64_t el)
     if (!(sctlr & (SCTLR_M | SCTLR_C | SCTLR_I))) {
         return;
     }
-    mmu_flush_dcache_range(MMU_PT_POOL_PA, (uint64_t)MMU_PT_MAX_PGS << PAGE_SHIFT);
+    dcache_clean_all();
     sctlr &= ~(SCTLR_M | SCTLR_C | SCTLR_I);
     __asm__ volatile("msr sctlr_el1, %0; isb; tlbi vmalle1; ic iallu; dsb sy; isb"
                      :: "r"(sctlr) : "memory");
@@ -216,11 +221,11 @@ int mmu_enable_ranges(const struct mmu_range *ranges, size_t count)
         (uint64_t)MMU_PT_MAX_PGS << PAGE_SHIFT,
         MMU_ATTR_WB
     };
-    if (map_range(l1, &pt_range) != 0) {
+    if (map_range(l1, &pt_range, el) != 0) {
         return -1;
     }
     for (size_t i = 0; i < count; i++) {
-        int rc = map_range(l1, &ranges[i]);
+        int rc = map_range(l1, &ranges[i], el);
         if (rc != 0) {
             return rc;
         }

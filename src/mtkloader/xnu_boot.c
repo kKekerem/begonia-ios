@@ -225,15 +225,19 @@ const char *xnu_payload_boot(uintptr_t start, uintptr_t end)
     con_puts(" size=");
     con_hex(p->mem_size);
     con_putc('\n');
+    if (((p->phys_base ^ p->virt_base) & 0x1ffffffULL) != 0ULL) {
+        con_puts("WARN: phys/virt 32M offset mismatch!\n");
+    }
 
-    struct mmu_range mmu_ranges[5] = {
+    struct mmu_range mmu_ranges[6] = {
         { 0x0C000000ULL, 0x0A000000ULL, MMU_ATTR_DEV },
         { (uint64_t)(uintptr_t)_start, (uint64_t)(__loader_end - _start), MMU_ATTR_WB },
         { (uint64_t)start, (uint64_t)(end - start), MMU_ATTR_WB },
         { p->phys_base, (uint64_t)(top_pa - p->phys_base), MMU_ATTR_WB },
+        { PLOG_ZONE_PA, PLOG_ZONE_SIZE, MMU_ATTR_NC },
         { fb ? fb->base : 0ULL, fb ? (uint64_t)fb->size : 0ULL, MMU_ATTR_NC }
     };
-    size_t nranges = (fb && fb->base && fb->size) ? 5U : 4U;
+    size_t nranges = (fb && fb->base && fb->size) ? 6U : 5U;
     int mmu_rc = mmu_enable_ranges(mmu_ranges, nranges);
     if (mmu_rc != 0) {
         con_puts("WARN: XNU MMU setup failed rc=");

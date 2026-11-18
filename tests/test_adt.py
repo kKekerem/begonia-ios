@@ -66,6 +66,10 @@ class TestBegoniaADT(unittest.TestCase):
         self.assertIsNotNone(sweet_ufs)
         self.assertEqual(struct.unpack("<2Q", sweet_ufs.prop("reg")), (0x11270000, 0x2300))
 
+    def test_default_dram_matches_xnu_l2_alignment(self) -> None:
+        self.assertEqual(mkadt_begonia.DEFAULT_DRAM_BASE & 0x1FFFFFF, 0x01004000)
+        self.assertEqual((mkadt_begonia.DEFAULT_DRAM_BASE + mkadt_begonia.DEFAULT_DRAM_SIZE) & 0x3FFF, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

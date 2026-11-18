@@ -379,6 +379,13 @@ void console_init(uintptr_t fdt, uint32_t scale)
         }
     }
 
+    /* Clamp mapped FB size to active scanout so LK sub-buffers never cross into tee-secmem. */
+    uint64_t active_sz = (uint64_t)g_fb.pitch * g_fb.height;
+    if (active_sz >= (uint64_t)g_fb.width * g_fb.height * 2ULL &&
+        active_sz < (uint64_t)g_fb.size) {
+        g_fb.size = (uint32_t)active_sz;
+    }
+
     g_col_x = 0;
     g_row_y = 0;
     console_clear(g_bg);
@@ -435,8 +442,43 @@ static void fb_newline(void)
     }
 }
 
+/* persistent_ram_buffer as Linux 4.14 ramoops reads it: sig, start, size, data[]. */
+#define PLOG_SIG        0x43474244U
+#define PLOG_DATA_CAP   ((uint32_t)(PLOG_ZONE_SIZE - 12U))
+static int g_plog_on;
+static uint32_t g_plog_pos;
+static uint32_t g_plog_size;
+
+void plog_init(void)
+{
+    volatile uint32_t *h = (volatile uint32_t *)(uintptr_t)PLOG_ZONE_PA;
+    h[0] = PLOG_SIG;
+    h[1] = 0U;
+    h[2] = 0U;
+    g_plog_pos = 0U;
+    g_plog_size = 0U;
+    g_plog_on = 1;
+}
+
+void plog_putc(char c)
+{
+    if (!g_plog_on) {
+        return;
+    }
+    volatile uint32_t *h = (volatile uint32_t *)(uintptr_t)PLOG_ZONE_PA;
+    volatile uint8_t *d = (volatile uint8_t *)(uintptr_t)(PLOG_ZONE_PA + 12U);
+    d[g_plog_pos] = (uint8_t)c;
+    g_plog_pos = (g_plog_pos + 1U) % PLOG_DATA_CAP;
+    if (g_plog_size < PLOG_DATA_CAP) {
+        g_plog_size++;
+    }
+    h[1] = g_plog_pos;
+    h[2] = g_plog_size;
+}
+
 void con_putc(char c)
 {
+    plog_putc(c);
     if (c == '\n') {
         uart_putc_raw('\r');
         uart_putc_raw('\n');
