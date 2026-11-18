@@ -168,7 +168,7 @@ jobs:
             out-ios18/begonia-ios18-n841.adt \
             out-ios18/begonia-xnu-ramdisk-payload.bin \
             --ramdisk out-ios18/ios18-begonia-ramdisk.hfs \
-            --cmdline "debug=0x14e serial=3 rd=md0 wdt=-1 -v cpus=6 begoniamali=1" \
+            --cmdline "debug=0x14e serial=3 rd=md0 wdt=-1 -v cpus=6 sweetarm64e=1 begoniamali=1" \
             --compress
 
           zstd -T0 -9 out-ios18/ios18-begonia-ramdisk.hfs -o out-ios18/ios18-begonia-ramdisk.hfs.zst
