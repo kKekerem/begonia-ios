@@ -49,6 +49,7 @@ CFLAGS=(
     -Wextra
     -Werror
     -I"$SRC/include"
+    ${LOADER_CFLAGS:-}
 )
 
 OBJS=()

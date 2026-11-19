@@ -22,6 +22,10 @@
 /* Auto-boot: with no button press or tap, Android starts after this many seconds, so an
  * unattended reboot (OTA, crash, adb reboot) never stops at the picker. Any input cancels it. */
 #define AUTO_BOOT_SECONDS 10U
+/* iOS test images (recovery slot, built with -DAUTO_BOOT_XNU=1) start iOS instead when it is present. */
+#ifndef AUTO_BOOT_XNU
+#define AUTO_BOOT_XNU 0
+#endif
 #define COUNTDOWN_Y     1520U
 
 #define BTN_UP          (1U << 0)
@@ -344,7 +348,7 @@ void boot_menu_wait_any_input(struct touch_state *touch)
     }
 }
 
-static void draw_countdown(uint32_t left)
+static void draw_countdown(uint32_t left, int xnu)
 {
     fb_fill_rect(40U, COUNTDOWN_Y - 10U, 1000U, 56U, COL_BG);
     if (left == 0U) {
@@ -352,7 +356,7 @@ static void draw_countdown(uint32_t left)
     }
     char line[80];
     uint32_t pos = 0;
-    str_append(line, &pos, "Android 17 starts in ");
+    str_append(line, &pos, xnu ? "iOS 18 starts in " : "Android 17 starts in ");
     if (left >= 10U) {
         line[pos++] = (char)('0' + (left / 10U) % 10U);
     }
@@ -373,10 +377,11 @@ enum boot_target boot_menu_select(int has_android, int has_xnu, struct touch_sta
 
     uint64_t freq = timer_freq();
     uint64_t t0 = timer_ticks();
-    uint32_t auto_left = has_android ? AUTO_BOOT_SECONDS : 0U;
+    int auto_xnu = AUTO_BOOT_XNU && has_xnu;
+    uint32_t auto_left = (has_android || auto_xnu) ? AUTO_BOOT_SECONDS : 0U;
     uint32_t loops = 0;
     if (auto_left) {
-        draw_countdown(auto_left);
+        draw_countdown(auto_left, auto_xnu);
     }
 
     for (;;) {
@@ -387,12 +392,12 @@ enum boot_target boot_menu_select(int has_android, int has_xnu, struct touch_sta
         if (auto_left) {
             uint64_t elapsed = freq ? (timer_ticks() - t0) / freq : (uint64_t)(loops / 50U);
             if (elapsed >= AUTO_BOOT_SECONDS) {
-                return BOOT_TARGET_ANDROID;
+                return auto_xnu ? BOOT_TARGET_XNU : BOOT_TARGET_ANDROID;
             }
             uint32_t left = AUTO_BOOT_SECONDS - (uint32_t)elapsed;
             if (left != auto_left) {
                 auto_left = left;
-                draw_countdown(left);
+                draw_countdown(left, auto_xnu);
             }
         }
 
@@ -403,7 +408,7 @@ enum boot_target boot_menu_select(int has_android, int has_xnu, struct touch_sta
             stable_btn = s1;
             if (pressed && auto_left) {
                 auto_left = 0U;
-                draw_countdown(0U);
+                draw_countdown(0U, auto_xnu);
             }
             if (pressed & (BTN_UP | BTN_DOWN)) {
                 selected = (selected == BOOT_TARGET_ANDROID) ? BOOT_TARGET_XNU : BOOT_TARGET_ANDROID;
@@ -430,7 +435,7 @@ enum boot_target boot_menu_select(int has_android, int has_xnu, struct touch_sta
             }
             if (auto_left) {
                 auto_left = 0U;
-                draw_countdown(0U);
+                draw_countdown(0U, auto_xnu);
             }
             uint32_t tx = touch->x;
             uint32_t ty = touch->y;

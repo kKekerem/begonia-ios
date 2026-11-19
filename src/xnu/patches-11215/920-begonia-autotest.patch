@@ -1,0 +1,148 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -123,6 +123,7 @@ bsd/dev/sweet_a630_pas.c			standard
+ bsd/dev/begonia_touch.c			standard
+ bsd/dev/begonia_mali.c			standard
+ bsd/dev/begonia_mali_mmu.c		standard
++bsd/dev/begonia_autotest.c		standard
+ bsd/dev/beryllium_wlan.c		standard
+ bsd/dev/beryllium_bt_hci.c		standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/begonia_autotest.c
+@@ -0,0 +1,113 @@
++/*
++ * begonia_autotest.c (Loxy, 19 Nov 2026): unattended iOS test boots on begonia.
++ *
++ * begoniabgmtl=1  As soon as the root volume is mounted, arm Chlorophyll for backboardd:
++ *                 create /private/var/tmp/bgmtl-bb.arm and remove bgmtl-bb.off and bgmtl-bb.state,
++ *                 so every such boot tries the GPU compositor once; bgl-launch / the inject fall back
++ *                 to CPU rendering by themselves if the GPU fails (they write bgmtl-bb.off again).
++ *                 begoniabgmtl=0 removes bgmtl-bb.arm (GPU compositor off). Absent: files untouched.
++ * begoniareboot=N After N seconds (30..3600) print a marker, give the persistent console log
++ *                 (sweetlog) time to flush, then reboot the normal way (filesystems synced). The phone
++ *                 then comes back through the dual-boot picker, which starts Android by itself.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/vnode.h>
++#include <sys/fcntl.h>
++#include <sys/reboot.h>
++#include <libkern/libkern.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++
++extern vnode_t rootvnode;
++extern int reboot_kernel(int howto, char *message);
++extern int unlink1(vfs_context_t ctx, vnode_t start_dvp, user_addr_t path_arg,
++    enum uio_seg segflg, int unlink_flags);
++extern void IOSleep(unsigned int milliseconds);
++
++#define BGMTL_DIR   "/private/var/tmp/"
++
++static uint32_t autotest_bgmtl = 2;     /* 2 = not given */
++static uint32_t autotest_reboot;
++
++static void
++autotest_touch(const char *path)
++{
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx = vfs_context_kernel();
++	int err = vnode_open(path, O_CREAT | FWRITE | O_NOFOLLOW, 0644, 0, &vp, ctx);
++	if (err == 0) {
++		vnode_close(vp, FWRITE, ctx);
++	}
++	printf("BEGONIA AUTOTEST: create %s -> %d\n", path, err);
++}
++
++static void
++autotest_remove(const char *path)
++{
++	int err = unlink1(vfs_context_kernel(), NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++	printf("BEGONIA AUTOTEST: remove %s -> %d\n", path, err);
++}
++
++static void
++begonia_autotest_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint64_t t0 = mach_absolute_time();
++	uint64_t ns;
++
++	if (autotest_bgmtl != 2) {
++		/* wait for the root mount (rd=ufsroot0), at most 120 s */
++		for (int i = 0; i < 1200 && rootvnode == NULLVP; i++) {
++			IOSleep(100);
++		}
++		if (rootvnode == NULLVP) {
++			printf("BEGONIA AUTOTEST: no root volume after 120 s, bgmtl files untouched\n");
++		} else if (autotest_bgmtl == 1) {
++			autotest_remove(BGMTL_DIR "bgmtl-bb.off");
++			autotest_remove(BGMTL_DIR "bgmtl-bb.state");
++			autotest_touch(BGMTL_DIR "bgmtl-bb.arm");
++		} else {
++			autotest_remove(BGMTL_DIR "bgmtl-bb.arm");
++		}
++	}
++
++	if (autotest_reboot) {
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		uint64_t left_ms = (uint64_t)autotest_reboot * 1000ULL;
++		uint64_t spent_ms = ns / 1000000ULL;
++		if (left_ms > spent_ms) {
++			IOSleep((unsigned int)(left_ms - spent_ms));
++		}
++		printf("BEGONIA AUTOTEST: begoniareboot=%u reached, rebooting in 5 s\n", autotest_reboot);
++		IOSleep(5000);  /* sweetlog flushes about once a second */
++		reboot_kernel(RB_AUTOBOOT, (char *)"begoniareboot");
++	}
++	thread_terminate(current_thread());
++}
++
++void begonia_autotest_init(void);
++
++void
++begonia_autotest_init(void)
++{
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("begoniabgmtl", &autotest_bgmtl, sizeof(autotest_bgmtl));
++	(void)PE_parse_boot_argn("begoniareboot", &autotest_reboot, sizeof(autotest_reboot));
++	if (autotest_reboot && (autotest_reboot < 30 || autotest_reboot > 3600)) {
++		printf("BEGONIA AUTOTEST: begoniareboot=%u out of range 30..3600, ignored\n", autotest_reboot);
++		autotest_reboot = 0;
++	}
++	if (autotest_bgmtl == 2 && !autotest_reboot) {
++		return;
++	}
++	printf("BEGONIA AUTOTEST: bgmtl=%u reboot=%u s\n", autotest_bgmtl, autotest_reboot);
++	if (kernel_thread_start(begonia_autotest_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("BEGONIA AUTOTEST: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/begonia_keys.c b/bsd/dev/begonia_keys.c
+--- a/bsd/dev/begonia_keys.c
++++ b/bsd/dev/begonia_keys.c
+@@ -196,6 +196,8 @@
+ 	}
+ }
+ 
++void begonia_autotest_init(void);
++
+ void
+ begonia_platform_hw_init(void)
+ {
+@@ -208,5 +210,6 @@
+ 	begonia_keys_init();
+ 	begonia_touch_init();
+ 	begonia_mali_init();
++	begonia_autotest_init();
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
