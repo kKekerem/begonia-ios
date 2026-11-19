@@ -297,7 +297,7 @@ new file mode 100644
 index 0000000..04d06a8
 --- /dev/null
 +++ b/bsd/dev/begonia_mali.c
-@@ -0,0 +1,689 @@
+@@ -0,0 +1,730 @@
 +/*
 + * ARM Mali-G76 MC4 (r0p0, 0x7211 @ 0x13040000) driver for Redmi Note 8 Pro (begonia / MT6785).
 + */
@@ -754,21 +754,10 @@ index 0000000..04d06a8
 +	return ok;
 +}
 +
-+void
-+begonia_mali_init(void)
++static void
++begonia_mali_bringup(void)
 +{
-+	int enabled = 1;
 +	vm_offset_t test_kva = 0;
-+
-+	if (g_started || !sweet_board_begonia()) {
-+		return;
-+	}
-+	g_started = true;
-+	(void)PE_parse_boot_argn("begoniamali", &enabled, sizeof(enabled));
-+	if (!enabled) {
-+		printf("BEGONIA MALI: disabled (begoniamali=0)\n");
-+		return;
-+	}
 +
 +	topck = ml_io_map(TOPCKGEN_PA, 0x1000u);
 +	infra = ml_io_map(INFRACFG_PA, 0x1000u);
@@ -843,8 +832,16 @@ index 0000000..04d06a8
 +	uint64_t test_pa = ptoa_64(test_pn);
 +	begonia_mali_mmu_as0_set(mali, 0ull, 2u);
 +	if (!run_selftest_job(test_kva, test_pa, 0xc0ffee01u, "identity")) {
-+		kmem_free(kernel_map, test_kva, PAGE_SIZE);
-+		return;
++		/*
++		 * Identity translation is a debug mode that neither Linux panfrost nor
++		 * kbase ever uses: its failure says nothing about the page-table path
++		 * real jobs take. Reset whatever the test left running and go on.
++		 */
++		printf("BEGONIA MALI: identity selftest failed; trying the page-table path anyway\n");
++		if (!mali_hw_restart(false)) {
++			printf("BEGONIA MALI: reset after the identity selftest failed (test page kept)\n");
++			return;
++		}
 +	}
 +	g_stage = 4;
 +
@@ -854,14 +851,58 @@ index 0000000..04d06a8
 +		mapped = run_selftest_job(test_kva, 0x00100000ull, 0xc0ffee02u, "page-table");
 +		begonia_mali_unmap_range(0x00100000ull, 4096ull);
 +	}
-+	kmem_free(kernel_map, test_kva, PAGE_SIZE);
 +	if (!mapped) {
++		/* a test job may still be running: stop the GPU before its page goes back to the VM */
++		if (!mali_hw_restart(true)) {
++			printf("BEGONIA MALI: GPU reset failed after the selftest (test page kept)\n");
++			return;
++		}
++		kmem_free(kernel_map, test_kva, PAGE_SIZE);
 +		return;
 +	}
++	kmem_free(kernel_map, test_kva, PAGE_SIZE);
 +	g_stage = 5;
 +	g_ready = true;
 +	SweetMaliPublish();
 +	g_stage = 6;
++}
++
++static void
++begonia_mali_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	begonia_mali_bringup();
++	printf("BEGONIA MALI: bring-up done: stage %u/6, %s\n", g_stage, g_ready ? "GPU ready" : "no GPU");
++	/* returning ends the thread (Call_continuation -> thread_terminate) */
++}
++
++void
++begonia_mali_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++
++	if (g_started || !sweet_board_begonia()) {
++		return;
++	}
++	g_started = true;
++	(void)PE_parse_boot_argn("begoniamali", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("BEGONIA MALI: disabled (begoniamali=0)\n");
++		return;
++	}
++	/*
++	 * In its own kernel thread: begonia_platform_hw_init() runs inside
++	 * IOFindBSDRoot, and a GPU that never answers (MFG power, PLL, a stalled
++	 * register read) must not keep the root from being mounted. Users of the
++	 * GPU wait for the SweetMali service / begonia_mali_ready().
++	 */
++	if (kernel_thread_start(begonia_mali_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("BEGONIA MALI: bring-up started in a kernel thread\n");
++	} else {
++		printf("BEGONIA MALI: kernel_thread_start failed, bringing the GPU up inline\n");
++		begonia_mali_bringup();
++	}
 +}
 +
 +bool begonia_mali_ready(void) { return g_ready; }
