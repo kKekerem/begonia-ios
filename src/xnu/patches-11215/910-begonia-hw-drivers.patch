@@ -296,7 +296,7 @@ new file mode 100644
 index 0000000..04d06a8
 --- /dev/null
 +++ b/bsd/dev/begonia_mali.c
-@@ -0,0 +1,495 @@
+@@ -0,0 +1,564 @@
 +/*
 + * ARM Mali-G76 MC4 (r0p0, 0x7211 @ 0x13040000) driver for Redmi Note 8 Pro (begonia / MT6785).
 + */
@@ -370,6 +370,9 @@ index 0000000..04d06a8
 +#define GPU_INT_CLEAR           0x024u
 +#define GPU_INT_MASK            0x028u
 +#define GPU_CMD                 0x030u
++#define GPU_CMD_SOFT_RESET      0x01u
++#define GPU_CMD_HARD_RESET      0x02u
++#define GPU_IRQ_RESET_COMPLETED (1u << 8)
 +#define GPU_AFBC_FEATURES       0x04cu
 +#define GPU_THREAD_MAX_THREADS  0x0a0u
 +#define GPU_THREAD_MAX_WG_SIZE  0x0a4u
@@ -389,6 +392,12 @@ index 0000000..04d06a8
 +#define COHERENCY_FEATURES      0x300u
 +#define GPU_THREAD_TLS_ALLOC    0x310u
 +#define STACK_PRESENT_LO        0xe00u
++#define GPU_JM_CONFIG           0xf00u
++#define GPU_SHADER_CONFIG       0xf04u
++#define SC_TLS_HASH_ENABLE      (1u << 17)
++#define JM_IDVS_GROUP_SIZE_SHIFT 16u
++#define JM_IDVS_GROUP_SIZE_MASK (0x3fu << JM_IDVS_GROUP_SIZE_SHIFT)
++#define JM_DEFAULT_IDVS_GROUP_SIZE 0xfu
 +
 +#define JOB_INT_RAWSTAT         0x1000u
 +#define JOB_INT_CLEAR           0x1004u
@@ -400,8 +409,12 @@ index 0000000..04d06a8
 +#define JS_AFFINITY_NEXT_HI     0x54u
 +#define JS_CONFIG_NEXT          0x58u
 +#define JS_COMMAND_NEXT         0x60u
-+#define JS_CONFIG_VAL           ((3u << 8) | (1u << 10) | (3u << 12) | (8u << 16))
-+#define JS_CONFIG_IDENT         ((3u << 8) | (3u << 12) | (8u << 16))
++/*
++ * JS_CONFIG as panfrost_job_hw_submit writes it on G76: AS 0, START and END
++ * FLUSH_CLEAN_INVALIDATE, THREAD_PRI(8). No START_MMU (bit 10): that is the
++ * T60x HW_ISSUE_10649 workaround, which neither Linux nor kbase sets on Bifrost.
++ */
++#define JS_CONFIG_VAL           ((3u << 8) | (3u << 12) | (8u << 16))
 +#define AS0                     0x2400u
 +#define AS_FAULTSTATUS          0x1cu
 +
@@ -543,6 +556,68 @@ index 0000000..04d06a8
 +	return true;
 +}
 +
++/*
++ * panfrost_gpu_soft_reset: SOFT_RESET, and HARD_RESET when the soft one does
++ * not report RESET_COMPLETED. The interrupt masks stay 0: nothing here takes
++ * the Mali IRQs, every wait polls the RAWSTAT registers.
++ */
++static bool
++mali_soft_reset(void)
++{
++	wr32(mali, GPU_INT_MASK, 0u);
++	wr32(mali, GPU_INT_CLEAR, GPU_IRQ_RESET_COMPLETED);
++	wr32(mali, GPU_CMD, GPU_CMD_SOFT_RESET);
++	if (!wait_mask(mali, GPU_INT_RAWSTAT, GPU_IRQ_RESET_COMPLETED, GPU_IRQ_RESET_COMPLETED, 50u)) {
++		printf("BEGONIA MALI: soft reset timed out, trying a hard reset\n");
++		wr32(mali, GPU_CMD, GPU_CMD_HARD_RESET);
++		if (!wait_mask(mali, GPU_INT_RAWSTAT, GPU_IRQ_RESET_COMPLETED, GPU_IRQ_RESET_COMPLETED, 50u)) {
++			printf("BEGONIA MALI: hard reset timed out\n");
++			return false;
++		}
++	}
++	wr32(mali, GPU_INT_CLEAR, 0xffffffffu);
++	wr32(mali, GPU_INT_MASK, 0u);
++	wr32(mali, JOB_INT_MASK, 0u);
++	wr32(mali, JOB_INT_CLEAR, 0xffffffffu);
++	return true;
++}
++
++/*
++ * panfrost_gpu_init_quirks for G76 (hw_features_g76 has TLS_HASHING and
++ * IDVS_GROUP_SIZE). Read-modify-write as kbase does, so the reset defaults of
++ * the other bits stay. Without TLS hashing the cores index thread-local
++ * storage by thread, not by the THREAD_TLS_ALLOC slots Mesa sizes it for.
++ */
++static void
++mali_apply_quirks(void)
++{
++	wr32(mali, GPU_SHADER_CONFIG, rd32(mali, GPU_SHADER_CONFIG) | SC_TLS_HASH_ENABLE);
++	wr32(mali, GPU_JM_CONFIG, (rd32(mali, GPU_JM_CONFIG) & ~JM_IDVS_GROUP_SIZE_MASK) |
++	    (JM_DEFAULT_IDVS_GROUP_SIZE << JM_IDVS_GROUP_SIZE_SHIFT));
++}
++
++/* panfrost_gpu_power_on: the L2 first and ready, then the shader cores, then the tiler. */
++static bool
++mali_power_on_cores(void)
++{
++	wr32(mali, L2_PWRON_LO, g_l2_mask);
++	if (!wait_mask(mali, L2_READY_LO, g_l2_mask, g_l2_mask, 50u)) {
++		printf("BEGONIA MALI: L2 power-on timeout (ready=%#x)\n", rd32(mali, L2_READY_LO));
++		return false;
++	}
++	wr32(mali, SHADER_PWRON_LO, g_shader_mask);
++	if (!wait_mask(mali, SHADER_READY_LO, g_shader_mask, g_shader_mask, 50u)) {
++		printf("BEGONIA MALI: shader power-on timeout (ready=%#x)\n", rd32(mali, SHADER_READY_LO));
++		return false;
++	}
++	wr32(mali, TILER_PWRON_LO, g_tiler_mask);
++	if (!wait_mask(mali, TILER_READY_LO, g_tiler_mask, g_tiler_mask, 50u)) {
++		printf("BEGONIA MALI: tiler power-on timeout (ready=%#x)\n", rd32(mali, TILER_READY_LO));
++		return false;
++	}
++	return true;
++}
++
 +static bool
 +run_selftest_job(vm_offset_t kva, uint64_t gpu_va, uint32_t magic, const char *tag)
 +{
@@ -564,7 +639,7 @@ index 0000000..04d06a8
 +	wr32(mali, js + JS_HEAD_NEXT_HI, (uint32_t)(gpu_va >> 32));
 +	wr32(mali, js + JS_AFFINITY_NEXT_LO, g_shader_mask);
 +	wr32(mali, js + JS_AFFINITY_NEXT_HI, 0u);
-+	wr32(mali, js + JS_CONFIG_NEXT, magic == 0xc0ffee01u ? JS_CONFIG_IDENT : JS_CONFIG_VAL);
++	wr32(mali, js + JS_CONFIG_NEXT, JS_CONFIG_VAL);
 +	wr32(mali, js + JS_COMMAND_NEXT, 1u);
 +
 +	(void)wait_mask(mali, JOB_INT_RAWSTAT, (1u << 1) | (1u << 17), 1u << 1, 100u);
@@ -635,11 +710,9 @@ index 0000000..04d06a8
 +		printf("BEGONIA MALI: bad GPU_ID=%#x\n", g_gpu_id);
 +		return;
 +	}
-+	wr32(mali, GPU_INT_MASK, 0u);
-+	wr32(mali, GPU_INT_CLEAR, 0xffffffffu);
-+	wr32(mali, GPU_CMD, 1u);
-+	(void)wait_mask(mali, GPU_INT_RAWSTAT, 1u << 8, 1u << 8, 50u);
-+	wr32(mali, GPU_INT_CLEAR, 0xffffffffu);
++	if (!mali_soft_reset()) {
++		return;
++	}
 +
 +	g_l2_mask = rd32(mali, L2_PRESENT_LO);
 +	g_tiler_mask = rd32(mali, TILER_PRESENT_LO);
@@ -650,12 +723,8 @@ index 0000000..04d06a8
 +	}
 +	begonia_mali_mmu_init(mali, g_va_bits);
 +
-+	wr32(mali, L2_PWRON_LO, g_l2_mask);
-+	wr32(mali, TILER_PWRON_LO, g_tiler_mask);
-+	wr32(mali, SHADER_PWRON_LO, g_shader_mask);
-+	if (!wait_mask(mali, L2_READY_LO, g_l2_mask, g_l2_mask, 50u) ||
-+	    !wait_mask(mali, TILER_READY_LO, g_tiler_mask, g_tiler_mask, 50u) ||
-+	    !wait_mask(mali, SHADER_READY_LO, g_shader_mask, g_shader_mask, 50u)) {
++	mali_apply_quirks();
++	if (!mali_power_on_cores()) {
 +		printf("BEGONIA MALI: core power-on timeout\n");
 +		return;
 +	}
