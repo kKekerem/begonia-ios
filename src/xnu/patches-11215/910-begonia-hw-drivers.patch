@@ -18,7 +18,7 @@ new file mode 100644
 index 0000000..5404234
 --- /dev/null
 +++ b/bsd/dev/begonia_drivers.h
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,54 @@
 +/*
 + * Internal driver interfaces for Redmi Note 8 Pro (begonia / MT6785).
 + */
@@ -63,6 +63,7 @@ index 0000000..5404234
 +bool begonia_mali_mmu_map_unlocked(uint64_t gpu_va, uint64_t phys, bool readonly);
 +void begonia_mali_mmu_unmap_unlocked(uint64_t gpu_va, uint64_t size);
 +void begonia_mali_mmu_as0_set(vm_offset_t mali_regs, uint64_t transtab, uint32_t transcfg);
++void begonia_mali_mmu_as0_disable(vm_offset_t mali_regs);
 +void begonia_mali_mmu_flush_unlocked(vm_offset_t mali_regs);
 +
 +void SweetMaliPublish(void);
@@ -796,7 +797,7 @@ new file mode 100644
 index 0000000..4db78b9
 --- /dev/null
 +++ b/bsd/dev/begonia_mali_mmu.c
-@@ -0,0 +1,338 @@
+@@ -0,0 +1,415 @@
 +/*
 + * Mali-G76 AArch64 Stage-1 4K GPU MMU & VA allocator for begonia (MT6785).
 + */
@@ -821,10 +822,23 @@ index 0000000..4db78b9
 +#define AS_TRANSTAB_HI          0x04u
 +#define AS_MEMATTR_LO           0x08u
 +#define AS_MEMATTR_HI           0x0cu
++#define AS_LOCKADDR_LO          0x10u
++#define AS_LOCKADDR_HI          0x14u
 +#define AS_COMMAND              0x18u
 +#define AS_STATUS               0x28u
 +#define AS_TRANSCFG_LO          0x30u
 +#define AS_TRANSCFG_HI          0x34u
++
++/* AS_COMMAND values (Linux drivers/gpu/drm/panfrost/panfrost_regs.h) */
++#define AS_COMMAND_UPDATE       0x01u
++#define AS_COMMAND_LOCK         0x02u
++#define AS_COMMAND_FLUSH_PT     0x04u
++#define AS_COMMAND_FLUSH_MEM    0x05u
++#define AS_TRANSCFG_UNMAPPED    0x01u
++/* the smallest region AS_LOCKADDR can name: 32 KiB (log2 15) */
++#define AS_LOCK_REGION_MIN_LOG2 15u
++/* every GPU VA this allocator hands out is below 4 GiB */
++#define MALI_VA_SPAN            (1ull << 32)
 +
 +#define PTE_TABLE               3ull
 +#define PTE_PAGE                3ull
@@ -877,15 +891,52 @@ index 0000000..4db78b9
 +	*(volatile uint32_t *)(g_mali_regs + off) = v;
 +}
 +
-+static void
++static bool
 +mmu_wait_idle(void)
 +{
 +	for (uint32_t us = 0; us < 50000u; us += 10u) {
 +		if ((mmu_rd(AS0 + AS_STATUS) & 1u) == 0u) {
-+			return;
++			return true;
 +		}
 +		delay(10);
 +	}
++	return (mmu_rd(AS0 + AS_STATUS) & 1u) == 0u;
++}
++
++/*
++ * One MMU operation on AS0 for [start, start + size), as Linux panfrost does it
++ * (mmu_hw_do_operation_locked + lock_region): the region is locked first (a
++ * naturally aligned power of two, encoded as log2(size) - 1 in AS_LOCKADDR),
++ * then OP runs on it (FLUSH_PT / FLUSH_MEM: flush the GPU L2, then drop the
++ * TLB entries of the locked region and unlock it). The old bare UNLOCK (3)
++ * never programmed AS_LOCKADDR, so it flushed whatever region the register
++ * happened to name: stale translations of an unmapped and reused GPU VA could
++ * survive, and the GPU would keep reading and writing the freed pages.
++ */
++static bool
++mmu_lock_op(uint64_t start, uint64_t size, uint32_t op)
++{
++	uint64_t end = start + size;
++	uint64_t diff = start ^ (end - 1u);
++	uint32_t width = (diff != 0u) ? (64u - (uint32_t)__builtin_clzll(diff)) : 0u;
++
++	if (size == 0u) {
++		return true;
++	}
++	if (width < AS_LOCK_REGION_MIN_LOG2) {
++		width = AS_LOCK_REGION_MIN_LOG2;
++	}
++	width -= 1u;
++	uint64_t region = (start & ~((1ull << width) - 1u)) | width;
++
++	bool ok = mmu_wait_idle();
++	mmu_wr(AS0 + AS_LOCKADDR_LO, (uint32_t)region);
++	mmu_wr(AS0 + AS_LOCKADDR_HI, (uint32_t)(region >> 32));
++	mmu_wr(AS0 + AS_COMMAND, AS_COMMAND_LOCK);
++	ok = mmu_wait_idle() && ok;
++	mmu_wr(AS0 + AS_COMMAND, op);
++	ok = mmu_wait_idle() && ok;
++	return ok;
 +}
 +
 +static void *
@@ -990,21 +1041,48 @@ index 0000000..4db78b9
 +begonia_mali_mmu_as0_set(vm_offset_t mali_regs, uint64_t transtab, uint32_t transcfg)
 +{
 +	g_mali_regs = mali_regs;
++	/* panfrost_mmu_enable: flush what the old configuration may still cache before switching */
++	(void)mmu_lock_op(0u, ~0ull, AS_COMMAND_FLUSH_MEM);
 +	mmu_wr(AS0 + AS_TRANSTAB_LO, (uint32_t)transtab);
 +	mmu_wr(AS0 + AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
 +	mmu_wr(AS0 + AS_TRANSCFG_LO, transcfg);
 +	mmu_wr(AS0 + AS_TRANSCFG_HI, 0u);
 +	mmu_wr(AS0 + AS_MEMATTR_LO, 0x88888888u);
 +	mmu_wr(AS0 + AS_MEMATTR_HI, 0x88888888u);
-+	mmu_wr(AS0 + AS_COMMAND, 1u);
++	mmu_wr(AS0 + AS_COMMAND, AS_COMMAND_UPDATE);
 +	mmu_wait_idle();
 +}
 +
++/*
++ * panfrost_mmu_disable: AS0 to UNMAPPED. Every access through it then faults,
++ * which ends a job that is stalled on a page fault (Mali holds the faulting
++ * access until the driver resolves it; nothing here ever would).
++ */
++void
++begonia_mali_mmu_as0_disable(vm_offset_t mali_regs)
++{
++	g_mali_regs = mali_regs;
++	(void)mmu_lock_op(0u, ~0ull, AS_COMMAND_FLUSH_MEM);
++	mmu_wr(AS0 + AS_TRANSTAB_LO, 0u);
++	mmu_wr(AS0 + AS_TRANSTAB_HI, 0u);
++	mmu_wr(AS0 + AS_MEMATTR_LO, 0u);
++	mmu_wr(AS0 + AS_MEMATTR_HI, 0u);
++	mmu_wr(AS0 + AS_TRANSCFG_LO, AS_TRANSCFG_UNMAPPED);
++	mmu_wr(AS0 + AS_TRANSCFG_HI, 0u);
++	mmu_wr(AS0 + AS_COMMAND, AS_COMMAND_UPDATE);
++	mmu_wait_idle();
++}
++
++/* After page-table edits: flush the GPU L2 and the TLB of every VA this allocator can hand out. */
 +void
 +begonia_mali_mmu_flush_unlocked(__unused vm_offset_t mali_regs)
 +{
-+	mmu_wr(AS0 + AS_COMMAND, 3u);
-+	mmu_wait_idle();
++	if (g_mali_regs == 0u) {
++		return;
++	}
++	if (!mmu_lock_op(0u, MALI_VA_SPAN, AS_COMMAND_FLUSH_PT)) {
++		printf("BEGONIA MALI: MMU flush timed out (AS0 status %#x)\n", mmu_rd(AS0 + AS_STATUS));
++	}
 +}
 +
 +bool
