@@ -377,7 +377,8 @@ enum boot_target boot_menu_select(int has_android, int has_xnu, struct touch_sta
 
     uint64_t freq = timer_freq();
     uint64_t t0 = timer_ticks();
-    int auto_xnu = AUTO_BOOT_XNU && has_xnu;
+    int auto_xnu = AUTO_BOOT_XNU && has_xnu &&
+        !plog_contains("begonia XNU console") && !plog_contains("panic(cpu");
     uint32_t auto_left = (has_android || auto_xnu) ? AUTO_BOOT_SECONDS : 0U;
     uint32_t loops = 0;
     if (auto_left) {

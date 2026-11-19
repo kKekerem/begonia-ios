@@ -45,6 +45,7 @@ void fb_draw_text(uint32_t x, uint32_t y, const char *s, uint32_t scale, uint32_
 #define PLOG_ZONE_SIZE  0x40000ULL
 void plog_init(void);
 void plog_putc(char c);
+int plog_contains(const char *needle);
 
 void con_putc(char c);
 void con_puts(const char *s);

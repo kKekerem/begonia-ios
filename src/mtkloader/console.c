@@ -449,15 +449,49 @@ static int g_plog_on;
 static uint32_t g_plog_pos;
 static uint32_t g_plog_size;
 
+/*
+ * A valid zone is kept and appended to (19 Nov): after an iOS boot it holds the XNU console that XNU mirrors
+ * there (begonia_plog.c), and the next Android boot must still find it in pstore. Android's ramoops zaps the
+ * header (start = size = 0) when it boots, so the zone only grows between two Android boots.
+ */
 void plog_init(void)
 {
     volatile uint32_t *h = (volatile uint32_t *)(uintptr_t)PLOG_ZONE_PA;
-    h[0] = PLOG_SIG;
-    h[1] = 0U;
-    h[2] = 0U;
-    g_plog_pos = 0U;
-    g_plog_size = 0U;
+    if (h[0] == PLOG_SIG && h[1] < PLOG_DATA_CAP && h[2] <= PLOG_DATA_CAP) {
+        g_plog_pos = h[1];
+        g_plog_size = h[2];
+    } else {
+        h[0] = PLOG_SIG;
+        h[1] = 0U;
+        h[2] = 0U;
+        g_plog_pos = 0U;
+        g_plog_size = 0U;
+    }
     g_plog_on = 1;
+}
+
+/* 1 if the kept log (since the last Android boot) contains needle. */
+int plog_contains(const char *needle)
+{
+    const volatile uint8_t *d = (const volatile uint8_t *)(uintptr_t)(PLOG_ZONE_PA + 12U);
+    uint32_t n = 0U;
+    while (needle[n]) {
+        n++;
+    }
+    if (n == 0U || g_plog_size < n) {
+        return 0;
+    }
+    uint32_t start = (g_plog_pos + PLOG_DATA_CAP - g_plog_size) % PLOG_DATA_CAP;
+    for (uint32_t i = 0U; i + n <= g_plog_size; i++) {
+        uint32_t k = 0U;
+        while (k < n && d[(start + i + k) % PLOG_DATA_CAP] == (uint8_t)needle[k]) {
+            k++;
+        }
+        if (k == n) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 void plog_putc(char c)
