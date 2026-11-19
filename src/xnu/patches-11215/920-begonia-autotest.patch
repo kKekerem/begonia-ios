@@ -1,11 +1,12 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -123,6 +123,7 @@ bsd/dev/sweet_a630_pas.c			standard
+@@ -123,6 +123,8 @@ bsd/dev/sweet_a630_pas.c			standard
  bsd/dev/begonia_touch.c			standard
  bsd/dev/begonia_mali.c			standard
  bsd/dev/begonia_mali_mmu.c		standard
 +bsd/dev/begonia_autotest.c		standard
++bsd/dev/begonia_plog.c			standard
  bsd/dev/beryllium_wlan.c		standard
  bsd/dev/beryllium_bt_hci.c		standard
  bsd/dev/mem.c				standard
@@ -13,7 +14,7 @@ diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_autotest.c
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,112 @@
 +/*
 + * begonia_autotest.c (Loxy, 19 Nov 2026): unattended iOS test boots on begonia.
 + *
@@ -100,7 +101,6 @@ new file mode 100644
 +		IOSleep(5000);  /* sweetlog flushes about once a second */
 +		reboot_kernel(RB_AUTOBOOT, (char *)"begoniareboot");
 +	}
-+	thread_terminate(current_thread());
 +}
 +
 +void begonia_autotest_init(void);
@@ -127,22 +127,163 @@ new file mode 100644
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/begonia_plog.c b/bsd/dev/begonia_plog.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/begonia_plog.c
+@@ -0,0 +1,112 @@
++/*
++ * begonia_plog.c (Loxy, 19 Nov 2026): mirror the XNU console into the Linux ramoops console zone.
++ *
++ * The mtkloader already writes its own log there (PLOG_ZONE_PA, persistent_ram_buffer as Linux 4.14
++ * ramoops reads it: u32 sig "DBGC", u32 start, u32 size, data[]). XNU appends everything that reaches
++ * the console (kernel printf, daemons' /dev/console, the panic text) after it, so the next Android boot
++ * shows the loader log followed by the XNU console in /sys/fs/pstore/console-ramoops*. Unlike sweetlog
++ * this needs no UFS, so it also covers a boot that dies before or in the UFS driver. The zone is outside
++ * XNU's RAM window (dram-base 0xC1004000), mapped as device memory. Before IOKit maps it, up to 64 KiB
++ * are kept in a static buffer. begoniaplog=0 turns it off.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <libkern/libkern.h>
++#include <mach/vm_types.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define PLOG_ZONE_PA    0x4D09F000ULL
++#define PLOG_ZONE_SIZE  0x40000U
++#define PLOG_SIG        0x43474244U
++#define PLOG_CAP        (PLOG_ZONE_SIZE - 12U)
++#define EARLY_CAP       (64U * 1024U)
++
++static char plog_early[EARLY_CAP];
++static uint32_t plog_early_len;
++static volatile uint32_t *plog_hdr;
++static volatile uint8_t *plog_data;
++static uint32_t plog_pos, plog_size;
++static int plog_state;          /* 0 buffering, 1 live, -1 off */
++
++void begonia_plog_append(const char *c, int size);
++void begonia_plog_start(void);
++
++static void
++plog_put(const char *c, uint32_t n)
++{
++	uint32_t pos = plog_pos % PLOG_CAP;
++	for (uint32_t i = 0; i < n; i++) {
++		plog_data[pos] = (uint8_t)c[i];
++		pos = (pos + 1U) % PLOG_CAP;
++		if (plog_size < PLOG_CAP) {
++			plog_size++;
++		}
++	}
++	plog_pos = pos;
++	plog_hdr[1] = plog_pos;
++	plog_hdr[2] = plog_size;
++}
++
++void
++begonia_plog_append(const char *c, int size)
++{
++	if (size <= 0 || plog_state < 0) {
++		return;
++	}
++	if (plog_state == 0) {
++		uint32_t n = (uint32_t)size;
++		if (plog_early_len >= EARLY_CAP) {
++			return;
++		}
++		if (n > EARLY_CAP - plog_early_len) {
++			n = EARLY_CAP - plog_early_len;
++		}
++		for (uint32_t i = 0; i < n; i++) {
++			plog_early[plog_early_len + i] = c[i];
++		}
++		plog_early_len += n;
++		return;
++	}
++	plog_put(c, (uint32_t)size);
++}
++
++void
++begonia_plog_start(void)
++{
++	uint32_t on = 1;
++	static const char mark[] = "\n== begonia XNU console (plog) ==\n";
++
++	if (plog_state != 0) {
++		return;
++	}
++	(void)PE_parse_boot_argn("begoniaplog", &on, sizeof(on));
++	if (!on) {
++		plog_state = -1;
++		return;
++	}
++	vm_offset_t va = ml_io_map((vm_offset_t)PLOG_ZONE_PA, PLOG_ZONE_SIZE);
++	if (va == 0) {
++		plog_state = -1;
++		printf("BEGONIA PLOG: ml_io_map failed\n");
++		return;
++	}
++	plog_hdr = (volatile uint32_t *)va;
++	plog_data = (volatile uint8_t *)(va + 12U);
++	if (plog_hdr[0] == PLOG_SIG && plog_hdr[1] < PLOG_CAP && plog_hdr[2] <= PLOG_CAP) {
++		plog_pos = plog_hdr[1];         /* keep the loader's log, continue after it */
++		plog_size = plog_hdr[2];
++	} else {
++		plog_hdr[0] = PLOG_SIG;
++		plog_pos = 0;
++		plog_size = 0;
++	}
++	plog_put(mark, (uint32_t)(sizeof(mark) - 1U));
++	plog_put(plog_early, plog_early_len);
++	plog_state = 1;
++	printf("BEGONIA PLOG: XNU console mirrored to ramoops at 0x%llx (%u early bytes)\n",
++	    PLOG_ZONE_PA, plog_early_len);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/begonia_keys.c b/bsd/dev/begonia_keys.c
 --- a/bsd/dev/begonia_keys.c
 +++ b/bsd/dev/begonia_keys.c
-@@ -196,6 +196,8 @@
+@@ -196,6 +196,9 @@
  	}
  }
  
++void begonia_plog_start(void);
 +void begonia_autotest_init(void);
 +
  void
  begonia_platform_hw_init(void)
  {
-@@ -208,5 +210,6 @@
+@@ -205,8 +208,10 @@
+ 		return;
+ 	}
+ 	hw_started = true;
++	begonia_plog_start();
  	begonia_keys_init();
  	begonia_touch_init();
  	begonia_mali_init();
 +	begonia_autotest_init();
  }
  #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -277,6 +277,7 @@
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern void sweet_log_append(const char *c, int size);  /* bsd/dev/sweet_ufs.c */
++extern void begonia_plog_append(const char *c, int size);  /* bsd/dev/begonia_plog.c */
+ /*
+  * Set by AppleCLCD (boot-arg sweetfb_noconsole=1) once the GUI presents:
+  * console text still goes to the persistent log, but is not drawn over
+@@ -292,6 +293,7 @@
+ {
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_log_append(c, size);
++	begonia_plog_append(c, size);
+ 	if (sweet_fb_panic_hook != NULL && panic_active()) {
+ 		void (*hook)(void) = sweet_fb_panic_hook;
+ 		sweet_fb_panic_hook = NULL;
