@@ -13,7 +13,7 @@ enum boot_target {
     BOOT_TARGET_DIAG    = 2,
 };
 
-#define IOS_EXPECTED_VOLUME "gpt:/xnusys"
+#define IOS_EXPECTED_VOLUME "gpt:/iosroot"
 #define IOS_EXPECTED_KERNEL "/System/Library/Kernels/kernel.macho"
 
 /* Safely read a 16-bit MT6359 register over PWRAP WACS2. Returns 1 on success. */

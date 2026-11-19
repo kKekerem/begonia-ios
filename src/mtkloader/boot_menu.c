@@ -19,6 +19,10 @@
 #define COL_IOS_DK      0xff1e293bU
 #define COL_WARN        0xfffbbf24U
 #define COL_ERR         0xffef4444U
+/* Auto-boot: with no button press or tap, Android starts after this many seconds, so an
+ * unattended reboot (OTA, crash, adb reboot) never stops at the picker. Any input cancels it. */
+#define AUTO_BOOT_SECONDS 10U
+#define COUNTDOWN_Y     1520U
 
 #define BTN_UP          (1U << 0)
 #define BTN_DOWN        (1U << 1)
@@ -340,6 +344,24 @@ void boot_menu_wait_any_input(struct touch_state *touch)
     }
 }
 
+static void draw_countdown(uint32_t left)
+{
+    fb_fill_rect(40U, COUNTDOWN_Y - 10U, 1000U, 56U, COL_BG);
+    if (left == 0U) {
+        return;
+    }
+    char line[80];
+    uint32_t pos = 0;
+    str_append(line, &pos, "Android 17 starts in ");
+    if (left >= 10U) {
+        line[pos++] = (char)('0' + (left / 10U) % 10U);
+    }
+    line[pos++] = (char)('0' + left % 10U);
+    str_append(line, &pos, " s  -  tap or press a key to stay");
+    line[pos] = '\0';
+    draw_centered_text(540U, COUNTDOWN_Y, line, 2U, COL_ANDROID);
+}
+
 enum boot_target boot_menu_select(int has_android, int has_xnu, struct touch_state *touch)
 {
     int selected = has_android ? BOOT_TARGET_ANDROID : BOOT_TARGET_XNU;
@@ -349,14 +371,40 @@ enum boot_target boot_menu_select(int has_android, int has_xnu, struct touch_sta
 
     draw_menu(has_android, has_xnu, selected, touch);
 
+    uint64_t freq = timer_freq();
+    uint64_t t0 = timer_ticks();
+    uint32_t auto_left = has_android ? AUTO_BOOT_SECONDS : 0U;
+    uint32_t loops = 0;
+    if (auto_left) {
+        draw_countdown(auto_left);
+    }
+
     for (;;) {
         delay_ms(20U);
+        loops++;
+
+        /* 0. Auto-boot countdown (timer based; ~50 loops per second if CNTFRQ is not set) */
+        if (auto_left) {
+            uint64_t elapsed = freq ? (timer_ticks() - t0) / freq : (uint64_t)(loops / 50U);
+            if (elapsed >= AUTO_BOOT_SECONDS) {
+                return BOOT_TARGET_ANDROID;
+            }
+            uint32_t left = AUTO_BOOT_SECONDS - (uint32_t)elapsed;
+            if (left != auto_left) {
+                auto_left = left;
+                draw_countdown(left);
+            }
+        }
 
         /* 1. Hardware buttons */
         uint32_t s1 = sample_buttons();
         if (s1 == prev_btn) {
             uint32_t pressed = s1 & ~stable_btn;
             stable_btn = s1;
+            if (pressed && auto_left) {
+                auto_left = 0U;
+                draw_countdown(0U);
+            }
             if (pressed & (BTN_UP | BTN_DOWN)) {
                 selected = (selected == BOOT_TARGET_ANDROID) ? BOOT_TARGET_XNU : BOOT_TARGET_ANDROID;
                 draw_menu(has_android, has_xnu, selected, touch);
@@ -379,6 +427,10 @@ enum boot_target boot_menu_select(int has_android, int has_xnu, struct touch_sta
             prev_touch_down = touch->down;
             if (!tapped) {
                 continue;
+            }
+            if (auto_left) {
+                auto_left = 0U;
+                draw_countdown(0U);
             }
             uint32_t tx = touch->x;
             uint32_t ty = touch->y;
