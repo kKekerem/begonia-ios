@@ -3,9 +3,12 @@
  * DRM binary syncobj emulation over SweetMali 64-bit fence sequences.
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "sweet_mali_uapi.h"
 
 #define EXPORT __attribute__((visibility("default")))
@@ -24,9 +27,22 @@ HIDDEN int sweet_drm_call(uint32_t sel, void *data, size_t size);
 HIDDEN int64_t sweet_drm_abs_to_rel_ns(int64_t abs_ns);
 HIDDEN void sweet_drm_record_wait_err(const char *msg);
 
+#define SYNCFILE_MAX 256u
+
 static pthread_mutex_t g_sobj_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct { uint32_t state; uint64_t seq; } g_sobj[SOBJ_MAX];
 static uint32_t g_sobj_next = 1u;
+
+/*
+ * Sync files: Mesa 25.0.7 Panfrost makes every pipe fence by exporting the
+ * context's syncobj as a sync file and importing that into a fresh syncobj
+ * (panfrost_fence_create), and closes the fd right after. Here a sync file is
+ * an fd on /dev/null plus a record of the syncobj state it carries; the
+ * import consumes the record. Without this every fence was NULL, so
+ * Chlorophyll's compute dispatches (which require a fence) all failed.
+ */
+static struct { int used, fd; uint32_t state; uint64_t seq; dev_t rdev; } g_sf[SYNCFILE_MAX];
+static uint32_t g_sf_next;
 
 static int sobj_valid(uint32_t h) { return h > 0u && h < SOBJ_MAX && g_sobj[h].state != SOBJ_FREE; }
 static int sobj_err(int e) { errno = e; return -e; }
@@ -130,5 +146,56 @@ EXPORT int drmSyncobjQuery2(int fd, uint32_t *h, uint64_t *p, uint32_t n, uint32
 EXPORT int drmSyncobjTransfer(int fd, uint32_t d, uint64_t dp, uint32_t s, uint64_t sp, uint32_t f) { (void)fd;(void)d;(void)dp;(void)s;(void)sp;(void)f; return sobj_err(ENOSYS); }
 EXPORT int drmSyncobjHandleToFD(int fd, uint32_t h, int *ofd) { (void)fd;(void)h;(void)ofd; return sobj_err(ENOSYS); }
 EXPORT int drmSyncobjFDToHandle(int fd, int ofd, uint32_t *h) { (void)fd;(void)ofd;(void)h; return sobj_err(ENOSYS); }
-EXPORT int drmSyncobjExportSyncFile(int fd, uint32_t h, int *sfd) { (void)fd;(void)h;(void)sfd; return sobj_err(ENOSYS); }
-EXPORT int drmSyncobjImportSyncFile(int fd, uint32_t h, int sfd) { (void)fd;(void)h;(void)sfd; return sobj_err(ENOSYS); }
+EXPORT int drmSyncobjExportSyncFile(int fd, uint32_t h, int *sfd)
+{
+	(void)fd;
+	if (!sfd) return sobj_err(EINVAL);
+	pthread_mutex_lock(&g_sobj_lock);
+	if (!sobj_valid(h)) { pthread_mutex_unlock(&g_sobj_lock); return sobj_err(ENOENT); }
+	uint32_t st = g_sobj[h].state;
+	uint64_t seq = g_sobj[h].seq;
+	pthread_mutex_unlock(&g_sobj_lock);
+	if (st == SOBJ_UNSIG) return sobj_err(EINVAL);   /* DRM: a syncobj without a fence exports nothing */
+
+	int nfd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+	struct stat st_fd;
+	if (nfd < 0) return sobj_err(errno);
+	if (fstat(nfd, &st_fd) != 0) { int e = errno; close(nfd); return sobj_err(e); }
+	pthread_mutex_lock(&g_sobj_lock);
+	uint32_t slot = SYNCFILE_MAX;
+	for (uint32_t i = 0; i < SYNCFILE_MAX; i++) {
+		if (g_sf[i].used && g_sf[i].fd == nfd) { slot = i; break; }   /* a record left by an fd closed without import */
+	}
+	if (slot == SYNCFILE_MAX) {
+		slot = g_sf_next;
+		g_sf_next = (g_sf_next + 1u) % SYNCFILE_MAX;
+	}
+	g_sf[slot].used = 1;
+	g_sf[slot].fd = nfd;
+	g_sf[slot].state = st;
+	g_sf[slot].seq = seq;
+	g_sf[slot].rdev = st_fd.st_rdev;
+	pthread_mutex_unlock(&g_sobj_lock);
+	*sfd = nfd;
+	return 0;
+}
+
+EXPORT int drmSyncobjImportSyncFile(int fd, uint32_t h, int sfd)
+{
+	(void)fd;
+	struct stat st_fd;
+	if (sfd < 0 || fstat(sfd, &st_fd) != 0) return sobj_err(EINVAL);
+	pthread_mutex_lock(&g_sobj_lock);
+	if (!sobj_valid(h)) { pthread_mutex_unlock(&g_sobj_lock); return sobj_err(ENOENT); }
+	for (uint32_t i = 0; i < SYNCFILE_MAX; i++) {
+		if (g_sf[i].used && g_sf[i].fd == sfd && g_sf[i].rdev == st_fd.st_rdev) {
+			g_sobj[h].state = g_sf[i].state;
+			g_sobj[h].seq = g_sf[i].seq;
+			g_sf[i].used = 0;
+			pthread_mutex_unlock(&g_sobj_lock);
+			return 0;
+		}
+	}
+	pthread_mutex_unlock(&g_sobj_lock);
+	return sobj_err(EINVAL);   /* not one of ours */
+}
