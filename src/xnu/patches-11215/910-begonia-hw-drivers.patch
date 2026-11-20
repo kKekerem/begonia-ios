@@ -15,10 +15,9 @@ index ea5a65a..0d3f12b 100644
  bsd/dev/mem.c				standard
 diff --git a/bsd/dev/begonia_drivers.h b/bsd/dev/begonia_drivers.h
 new file mode 100644
-index 0000000..5404234
 --- /dev/null
 +++ b/bsd/dev/begonia_drivers.h
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,57 @@
 +/*
 + * Internal driver interfaces for Redmi Note 8 Pro (begonia / MT6785).
 + */
@@ -66,6 +65,8 @@ index 0000000..5404234
 +void begonia_mali_mmu_as0_set(vm_offset_t mali_regs, uint64_t transtab, uint32_t transcfg);
 +void begonia_mali_mmu_as0_disable(vm_offset_t mali_regs);
 +void begonia_mali_mmu_flush_unlocked(vm_offset_t mali_regs);
++void begonia_mali_mmu_set_memattr(uint32_t lo, uint32_t hi);
++bool begonia_mali_mmu_lookup(uint64_t gpu_va, uint64_t *pa);
 +
 +void SweetMaliPublish(void);
 +
@@ -294,10 +295,9 @@ index 0000000..27fc3e1
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
 new file mode 100644
-index 0000000..04d06a8
 --- /dev/null
 +++ b/bsd/dev/begonia_mali.c
-@@ -0,0 +1,730 @@
+@@ -0,0 +1,929 @@
 +/*
 + * ARM Mali-G76 MC4 (r0p0, 0x7211 @ 0x13040000) driver for Redmi Note 8 Pro (begonia / MT6785).
 + */
@@ -435,6 +435,57 @@ index 0000000..04d06a8
 +#define JS_CONFIG_VAL           ((3u << 8) | (3u << 12) | (8u << 16))
 +#define AS0                     0x2400u
 +#define AS_FAULTSTATUS          0x1cu
++#define AS_MEMATTR_LO           0x08u
++#define AS_STATUS               0x28u
++
++/* 20 Nov 2026: registers for the hang dump and the bring-up experiments (Linux panfrost_regs.h) */
++#define GPU_STATUS              0x034u
++#define GPU_FAULT_ADDR_LO       0x040u
++#define GPU_FAULT_ADDR_HI       0x044u
++#define GPU_PWR_KEY             0x050u
++#define GPU_PWR_KEY_UNLOCK      0x2968a819u
++#define GPU_PWR_OVERRIDE1       0x058u
++#define SHADER_PWRTRANS_LO      0x200u
++#define TILER_PWRTRANS_LO       0x210u
++#define L2_PWRTRANS_LO          0x220u
++#define SHADER_PWRACTIVE_LO     0x240u
++#define TILER_PWRACTIVE_LO      0x250u
++#define L2_PWRACTIVE_LO         0x260u
++#define COHERENCY_ENABLE        0x304u
++#define COHERENCY_NONE          31u
++#define STACK_READY_LO          0xe10u
++#define GPU_TILER_CONFIG        0xf08u
++#define GPU_L2_MMU_CONFIG       0xf0cu
++#define L2_MMU_3BIT_RD_SHIFT    12u
++#define L2_MMU_3BIT_WR_SHIFT    15u
++#define JS_TAIL_LO              0x08u
++#define JS_TAIL_HI              0x0cu
++#define JS_AFFINITY_LO          0x10u
++#define JS_CONFIG               0x18u
++#define JS_XAFFINITY            0x1cu
++#define JS_CONFIG_JOB_CHAIN_FLAG (1u << 11)
++#define MFG_QCHANNEL_CON        0x00b4u
++#define MALI_DUMP_MAX           6u
++
++/*
++ * Bring-up experiments (20 Nov 2026). The first GPU boot: every fragment job (slot 0) stayed ACTIVE with
++ * JS_HEAD == jc, no job/MMU/GPU fault, until the 500 ms timeout; WRITE_VALUE selftests on slot 1 passed.
++ * begoniamalix=<mask> applies these from the start; begoniamaliadapt=1 walks g_exp_order, one step after
++ * every second hang, and logs the first job that completes in each step.
++ */
++#define EXP_ONE_CORE            (1u << 0)   /* JS affinity = the first shader core only */
++#define EXP_PWR_OVERRIDE        (1u << 1)   /* GPU_PWR_OVERRIDE1 = 0xfff | 0x20 << 16 (Linux panfrost Amlogic quirk) */
++#define EXP_MEMATTR_NC          (1u << 2)   /* AS0 MEMATTR non-cacheable (Linux panfrost on a non-coherent SoC) */
++#define EXP_COHERENCY_NONE      (1u << 3)   /* COHERENCY_ENABLE = NONE (kbase writes it, panfrost does not) */
++#define EXP_L2_LIMITS           (1u << 4)   /* L2_MMU_CONFIG: at most 16 outstanding external reads and writes */
++#define EXP_NO_TLS_HASH         (1u << 5)   /* SHADER_CONFIG without SC_TLS_HASH_ENABLE */
++#define EXP_CHAIN_FLAG          (1u << 6)   /* JS_CONFIG JOB_CHAIN_FLAG toggled per job (JOBCHAIN_DISAMBIGUATION) */
++#define EXP_ALL                 0x7fu
++static const uint32_t g_exp_order[] = {
++	0u, EXP_ONE_CORE, EXP_PWR_OVERRIDE, EXP_MEMATTR_NC, EXP_COHERENCY_NONE,
++	EXP_L2_LIMITS, EXP_NO_TLS_HASH, EXP_CHAIN_FLAG, EXP_ALL,
++};
++#define EXP_STEPS               ((uint32_t)(sizeof(g_exp_order) / sizeof(g_exp_order[0])))
 +
 +SYSCTL_NODE(_kern, OID_AUTO, begonia, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "Redmi Note 8 Pro (begonia) drivers");
 +
@@ -446,6 +497,12 @@ index 0000000..04d06a8
 +static uint32_t g_clients, g_buffers, g_submits, g_faults, g_resets;
 +static uint64_t g_seq, g_done_seq;
 +static bool g_started, g_ready, g_lost;
++static uint32_t g_exp_mask, g_exp_adapt, g_exp_step, g_exp_step_faults, g_dumps;
++static uint32_t g_exp_done_logged = ~0u, g_lost_faults = MALI_LOST_FAULTS;
++static uint32_t g_slot_done[2];
++static bool g_chain_flag[2];
++
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 +
 +SYSCTL_UINT(_kern_begonia, OID_AUTO, mali, CTLFLAG_RD | CTLFLAG_LOCKED, &g_stage, 0, "Mali-G76 bringup stage (0..6)");
 +SYSCTL_UINT(_kern_begonia, OID_AUTO, mali_id, CTLFLAG_RD | CTLFLAG_LOCKED, &g_gpu_id, 0, "Mali GPU_ID");
@@ -612,9 +669,112 @@ index 0000000..04d06a8
 +static void
 +mali_apply_quirks(void)
 +{
-+	wr32(mali, GPU_SHADER_CONFIG, rd32(mali, GPU_SHADER_CONFIG) | SC_TLS_HASH_ENABLE);
++	uint32_t sc = rd32(mali, GPU_SHADER_CONFIG);
++	sc = (g_exp_mask & EXP_NO_TLS_HASH) ? (sc & ~SC_TLS_HASH_ENABLE) : (sc | SC_TLS_HASH_ENABLE);
++	wr32(mali, GPU_SHADER_CONFIG, sc);
 +	wr32(mali, GPU_JM_CONFIG, (rd32(mali, GPU_JM_CONFIG) & ~JM_IDVS_GROUP_SIZE_MASK) |
 +	    (JM_DEFAULT_IDVS_GROUP_SIZE << JM_IDVS_GROUP_SIZE_SHIFT));
++	/* the experiments below are reset defaults unless asked for (a soft reset clears them again) */
++	if (g_exp_mask & EXP_L2_LIMITS) {
++		uint32_t l2 = rd32(mali, GPU_L2_MMU_CONFIG) &
++		    ~((7u << L2_MMU_3BIT_RD_SHIFT) | (7u << L2_MMU_3BIT_WR_SHIFT));
++		wr32(mali, GPU_L2_MMU_CONFIG, l2 | (4u << L2_MMU_3BIT_RD_SHIFT) | (4u << L2_MMU_3BIT_WR_SHIFT));
++	}
++	if (g_exp_mask & EXP_COHERENCY_NONE) {
++		wr32(mali, COHERENCY_ENABLE, COHERENCY_NONE);
++	}
++	if (g_exp_mask & EXP_PWR_OVERRIDE) {
++		wr32(mali, GPU_PWR_KEY, GPU_PWR_KEY_UNLOCK);
++		wr32(mali, GPU_PWR_OVERRIDE1, 0xfffu | (0x20u << 16));
++	}
++	if (g_exp_mask & EXP_MEMATTR_NC) {
++		begonia_mali_mmu_set_memattr(0x4c4c4c4cu, 0x4c4c4c4cu);
++	} else {
++		begonia_mali_mmu_set_memattr(0x88888888u, 0x88888888u);
++	}
++}
++
++/* Words of GPU memory for the hang dump: GPU VA -> PA through AS0, a temporary device mapping. */
++static bool
++mali_peek(uint64_t gpu_va, uint32_t *out, uint32_t nwords)
++{
++	uint64_t pa = 0;
++	if (gpu_va == 0u || (gpu_va & 3u) != 0u || !begonia_mali_mmu_lookup(gpu_va, &pa)) {
++		return false;
++	}
++	uint32_t off = (uint32_t)(pa & 0xfffull);
++	if (off + nwords * 4u > 4096u) {
++		nwords = (4096u - off) / 4u;
++	}
++	vm_offset_t va = ml_io_map((vm_offset_t)(pa & ~0xfffull), 4096u);
++	if (va == 0u) {
++		return false;
++	}
++	for (uint32_t i = 0; i < nwords; i++) {
++		out[i] = *(volatile uint32_t *)(va + off + i * 4u);
++	}
++	ml_io_unmap(va, 4096u);
++	for (uint32_t i = nwords; i < 32u; i++) {
++		out[i] = 0xdeadbeefu;
++	}
++	return true;
++}
++
++static void
++mali_dump_mem(const char *tag, uint64_t gpu_va, uint32_t nwords)
++{
++	uint32_t w[32];
++	if (nwords > 32u) {
++		nwords = 32u;
++	}
++	if (!mali_peek(gpu_va, w, nwords)) {
++		printf("BEGONIA MALI DUMP: %s %#llx: not mapped\n", tag, (unsigned long long)gpu_va);
++		return;
++	}
++	for (uint32_t i = 0; i < nwords; i += 8u) {
++		printf("BEGONIA MALI DUMP: %s %#llx+%02x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		    tag, (unsigned long long)gpu_va, i * 4u, w[i], w[i + 1u], w[i + 2u], w[i + 3u],
++		    w[i + 4u], w[i + 5u], w[i + 6u], w[i + 7u]);
++	}
++}
++
++/* Everything the hardware says about a hung slot (called with mali_mtx held, before the reset). */
++static void
++mali_dump_hang(uint32_t slot, uint64_t jc_va)
++{
++	uint32_t js = JS_SLOT(slot);
++	uint64_t tail = rd32(mali, js + JS_TAIL_LO) | ((uint64_t)rd32(mali, js + JS_TAIL_HI) << 32);
++
++	printf("BEGONIA MALI DUMP: step %u mask %#x | gpu_status=%#x gpu_fault=%#x@%#x%08x gpu_irq=%#x job_irq=%#x js_state=%#x\n",
++	    g_exp_step, g_exp_mask, rd32(mali, GPU_STATUS), rd32(mali, GPU_FAULT_STATUS), rd32(mali, GPU_FAULT_ADDR_HI),
++	    rd32(mali, GPU_FAULT_ADDR_LO), rd32(mali, GPU_INT_RAWSTAT), rd32(mali, JOB_INT_RAWSTAT), rd32(mali, JOB_INT_JS_STATE));
++	printf("BEGONIA MALI DUMP: ready sh=%#x ti=%#x l2=%#x stack=%#x | trans sh=%#x ti=%#x l2=%#x | active sh=%#x ti=%#x l2=%#x\n",
++	    rd32(mali, SHADER_READY_LO), rd32(mali, TILER_READY_LO), rd32(mali, L2_READY_LO), rd32(mali, STACK_READY_LO),
++	    rd32(mali, SHADER_PWRTRANS_LO), rd32(mali, TILER_PWRTRANS_LO), rd32(mali, L2_PWRTRANS_LO),
++	    rd32(mali, SHADER_PWRACTIVE_LO), rd32(mali, TILER_PWRACTIVE_LO), rd32(mali, L2_PWRACTIVE_LO));
++	printf("BEGONIA MALI DUMP: shader_cfg=%#x tiler_cfg=%#x l2_mmu_cfg=%#x jm_cfg=%#x coh_feat=%#x coh_en=%#x stack_present=%#x\n",
++	    rd32(mali, GPU_SHADER_CONFIG), rd32(mali, GPU_TILER_CONFIG), rd32(mali, GPU_L2_MMU_CONFIG), rd32(mali, GPU_JM_CONFIG),
++	    rd32(mali, COHERENCY_FEATURES), rd32(mali, COHERENCY_ENABLE), rd32(mali, STACK_PRESENT_LO));
++	printf("BEGONIA MALI DUMP: js%u head=%#llx tail=%#llx aff=%#x cfg=%#x xaff=%#x status=%#x | as0 status=%#x fault=%#x memattr=%#x\n",
++	    slot, (unsigned long long)(rd32(mali, js + JS_HEAD_LO) | ((uint64_t)rd32(mali, js + JS_HEAD_HI) << 32)),
++	    (unsigned long long)tail, rd32(mali, js + JS_AFFINITY_LO), rd32(mali, js + JS_CONFIG), rd32(mali, js + JS_XAFFINITY),
++	    rd32(mali, js + JS_STATUS), rd32(mali, AS0 + AS_STATUS), rd32(mali, AS0 + AS_FAULTSTATUS), rd32(mali, AS0 + AS_MEMATTR_LO));
++	printf("BEGONIA MALI DUMP: mfg global=%#x async=%#x async1=%#x qchannel=%#x | slot done counts %u/%u\n",
++	    rd32(mfgcfg, MFG_GLOBAL_CON), rd32(mfgcfg, MFG_ASYNC_CON), rd32(mfgcfg, MFG_ASYNC_CON_1),
++	    rd32(mfgcfg, MFG_QCHANNEL_CON), g_slot_done[0], g_slot_done[1]);
++	mali_dump_mem("job", jc_va, 16u);
++	if (tail != 0u && tail != jc_va) {
++		mali_dump_mem("tail", tail, 16u);
++	}
++	if (slot == 0u) {
++		/* Bifrost fragment job: 32-byte header, then bounds (2 words), then the framebuffer pointer (flags in [5:0]) */
++		uint32_t w[32];
++		if (mali_peek(jc_va, w, 12u)) {
++			uint64_t fbd = ((uint64_t)w[10] | ((uint64_t)w[11] << 32)) & ~0x3full;
++			mali_dump_mem("fbd", fbd, 32u);
++			mali_dump_mem("fbd+80", fbd + 0x80u, 32u);
++		}
++	}
 +}
 +
 +/* panfrost_gpu_power_on: the L2 first and ready, then the shader cores, then the tiler. */
@@ -696,15 +856,25 @@ index 0000000..04d06a8
 +	bool mmu = (mmu_irq & MMU_IRQ_AS0) != 0u;
 +
 +	g_faults++;
-+	if (g_faults <= 8u || (g_faults % 64u) == 0u) {
++	if (g_faults <= 8u || g_exp_adapt || (g_faults % 64u) == 0u) {
 +		printf("BEGONIA MALI: job %s: slot=%u jc=%#llx head=%#llx js_status=%#x irq=%#x "
-+		    "mmu_irq=%#x as_fault=%#x addr=%#llx gpu_fault=%#x (fault %u)\n",
++		    "mmu_irq=%#x as_fault=%#x addr=%#llx gpu_fault=%#x (fault %u, step %u mask %#x)\n",
 +		    timeout ? "timeout" : "failed", slot, (unsigned long long)jc_va,
 +		    (unsigned long long)head, js_status, irq, mmu_irq, as_fault,
-+		    (unsigned long long)as_addr, gpu_fault, g_faults);
++		    (unsigned long long)as_addr, gpu_fault, g_faults, g_exp_step, g_exp_mask);
++	}
++	if (g_dumps < MALI_DUMP_MAX || (g_exp_adapt && g_exp_step_faults == 0u)) {
++		g_dumps++;
++		mali_dump_hang(slot, jc_va);
 +	}
 +	if (mmu) {
 +		begonia_mali_mmu_as0_disable(mali);
++	}
++	if (g_exp_adapt && ++g_exp_step_faults >= 2u && g_exp_step + 1u < EXP_STEPS) {
++		g_exp_step++;
++		g_exp_step_faults = 0u;
++		g_exp_mask = g_exp_order[g_exp_step];
++		printf("BEGONIA MALI: experiment step %u/%u: mask %#x\n", g_exp_step, EXP_STEPS - 1u, g_exp_mask);
 +	}
 +	if ((timeout || mmu) && !g_lost) {
 +		if (mali_hw_restart(true)) {
@@ -714,7 +884,7 @@ index 0000000..04d06a8
 +			printf("BEGONIA MALI: GPU reset failed: reporting the GPU LOST\n");
 +		}
 +	}
-+	if (g_faults > MALI_LOST_FAULTS && !g_lost) {
++	if (g_faults > g_lost_faults && !g_lost) {
 +		g_lost = true;
 +		printf("BEGONIA MALI: %u faults: reporting the GPU LOST\n", g_faults);
 +	}
@@ -890,6 +1060,17 @@ index 0000000..04d06a8
 +		printf("BEGONIA MALI: disabled (begoniamali=0)\n");
 +		return;
 +	}
++	(void)PE_parse_boot_argn("begoniamalix", &g_exp_mask, sizeof(g_exp_mask));
++	(void)PE_parse_boot_argn("begoniamaliadapt", &g_exp_adapt, sizeof(g_exp_adapt));
++	g_exp_mask &= EXP_ALL;
++	if (g_exp_adapt) {
++		g_exp_mask = 0u;
++		g_lost_faults = 96u;
++	}
++	if (g_exp_mask || g_exp_adapt) {
++		printf("BEGONIA MALI: experiments: mask %#x, adapt %u (LOST after %u faults)\n",
++		    g_exp_mask, g_exp_adapt, g_lost_faults);
++	}
 +	/*
 +	 * In its own kernel thread: begonia_platform_hw_init() runs inside
 +	 * IOFindBSDRoot, and a GPU that never answers (MFG power, PLL, a stalled
@@ -906,7 +1087,7 @@ index 0000000..04d06a8
 +}
 +
 +bool begonia_mali_ready(void) { return g_ready; }
-+bool begonia_mali_lost(void) { return g_lost || g_faults > MALI_LOST_FAULTS; }
++bool begonia_mali_lost(void) { return g_lost || g_faults > g_lost_faults; }
 +uint32_t begonia_mali_gpu_id(void) { return g_gpu_id; }
 +uint32_t begonia_mali_va_bits(void) { return g_va_bits; }
 +uint64_t begonia_mali_last_seq(void) { return g_done_seq; }
@@ -976,11 +1157,19 @@ index 0000000..04d06a8
 +			return 0u;
 +		}
 +	}
++	uint32_t affinity = (g_exp_mask & EXP_ONE_CORE) ? (g_shader_mask & (~g_shader_mask + 1u)) : g_shader_mask;
++	uint32_t cfg = JS_CONFIG_VAL;
++	if (g_exp_mask & EXP_CHAIN_FLAG) {
++		if (g_chain_flag[slot]) {
++			cfg |= JS_CONFIG_JOB_CHAIN_FLAG;
++		}
++		g_chain_flag[slot] = !g_chain_flag[slot];
++	}
 +	wr32(mali, js + JS_HEAD_NEXT_LO, (uint32_t)jc_va);
 +	wr32(mali, js + JS_HEAD_NEXT_HI, (uint32_t)(jc_va >> 32));
-+	wr32(mali, js + JS_AFFINITY_NEXT_LO, g_shader_mask);
++	wr32(mali, js + JS_AFFINITY_NEXT_LO, affinity);
 +	wr32(mali, js + JS_AFFINITY_NEXT_HI, 0u);
-+	wr32(mali, js + JS_CONFIG_NEXT, JS_CONFIG_VAL);
++	wr32(mali, js + JS_CONFIG_NEXT, cfg);
 +	wr32(mali, js + JS_COMMAND_NEXT, JS_COMMAND_START);
 +
 +	/* done or failed, whichever comes first: a failed chain used to cost the whole timeout */
@@ -996,6 +1185,16 @@ index 0000000..04d06a8
 +	}
 +	if (irq != done) {
 +		mali_job_fault(slot, jc_va, irq);
++	} else {
++		if (g_slot_done[slot]++ == 0u) {
++			printf("BEGONIA MALI: first slot %u job done (jc %#llx, %u faults so far, step %u mask %#x)\n",
++			    slot, (unsigned long long)jc_va, g_faults, g_exp_step, g_exp_mask);
++		}
++		if (slot == 0u && g_exp_adapt && g_exp_done_logged != g_exp_step) {
++			g_exp_done_logged = g_exp_step;
++			printf("BEGONIA MALI: experiment step %u (mask %#x): fragment job DONE (jc %#llx)\n",
++			    g_exp_step, g_exp_mask, (unsigned long long)jc_va);
++		}
 +	}
 +	wr32(mali, JOB_INT_CLEAR, irqm);
 +	g_done_seq = seq;
@@ -1030,10 +1229,9 @@ index 0000000..04d06a8
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/begonia_mali_mmu.c b/bsd/dev/begonia_mali_mmu.c
 new file mode 100644
-index 0000000..4db78b9
 --- /dev/null
 +++ b/bsd/dev/begonia_mali_mmu.c
-@@ -0,0 +1,419 @@
+@@ -0,0 +1,460 @@
 +/*
 + * Mali-G76 AArch64 Stage-1 4K GPU MMU & VA allocator for begonia (MT6785).
 + */
@@ -1111,6 +1309,8 @@ index 0000000..4db78b9
 +static struct pt_rec *g_pt_hash[PT_HASH_BUCKETS];
 +static uint64_t g_va_cursor = MALI_VA_BASE;
 +static struct va_free_slot g_va_free[MALI_FREE_SLOTS];
++/* AS0 MEMATTR: 0x88 = write-back, Midgard-inner shareability, implementation-defined allocation (kbase default) */
++static uint32_t g_memattr_lo = 0x88888888u, g_memattr_hi = 0x88888888u;
 +
 +static inline uint32_t
 +mmu_rd(uint32_t off)
@@ -1284,11 +1484,50 @@ index 0000000..4db78b9
 +	mmu_wr(AS0 + AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
 +	mmu_wr(AS0 + AS_TRANSCFG_LO, transcfg);
 +	mmu_wr(AS0 + AS_TRANSCFG_HI, 0u);
-+	mmu_wr(AS0 + AS_MEMATTR_LO, 0x88888888u);
-+	mmu_wr(AS0 + AS_MEMATTR_HI, 0x88888888u);
++	mmu_wr(AS0 + AS_MEMATTR_LO, g_memattr_lo);
++	mmu_wr(AS0 + AS_MEMATTR_HI, g_memattr_hi);
 +	mmu_wr(AS0 + AS_COMMAND, AS_COMMAND_UPDATE);
 +	mmu_wait_idle();
 +	lck_mtx_unlock(&mali_mmu_mtx);
++}
++
++/* 20 Nov 2026 bring-up experiments: the AS0 MEMATTR the next begonia_mali_mmu_as0_set() programs. */
++void
++begonia_mali_mmu_set_memattr(uint32_t lo, uint32_t hi)
++{
++	g_memattr_lo = lo;
++	g_memattr_hi = hi;
++}
++
++/* GPU VA -> PA through the AS0 tables (no allocation), for hang dumps. */
++bool
++begonia_mali_mmu_lookup(uint64_t gpu_va, uint64_t *pa)
++{
++	bool ok = false;
++
++	lck_mtx_lock(&mali_mmu_mtx);
++	uint64_t *tbl = g_pt_root_va;
++	if (tbl != NULL && g_mmu_va_bits > 39u) {
++		uint64_t e0 = tbl[(gpu_va >> 39) & 0x1ffu];
++		tbl = (e0 & 1ull) ? pt_find_va(e0) : NULL;
++	}
++	if (tbl != NULL) {
++		uint64_t e1 = tbl[(gpu_va >> 30) & 0x1ffu];
++		tbl = (e1 & 1ull) ? pt_find_va(e1) : NULL;
++	}
++	if (tbl != NULL) {
++		uint64_t e2 = tbl[(gpu_va >> 21) & 0x1ffu];
++		tbl = (e2 & 1ull) ? pt_find_va(e2) : NULL;
++	}
++	if (tbl != NULL) {
++		uint64_t e3 = tbl[(gpu_va >> 12) & 0x1ffu];
++		if ((e3 & 3ull) == PTE_PAGE) {
++			*pa = (e3 & PTE_ADDR_MASK) | (gpu_va & 0xfffull);
++			ok = true;
++		}
++	}
++	lck_mtx_unlock(&mali_mmu_mtx);
++	return ok;
 +}
 +
 +/*

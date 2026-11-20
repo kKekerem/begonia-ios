@@ -494,6 +494,22 @@ int plog_contains(const char *needle)
     return 0;
 }
 
+/*
+ * The loader runs with the MMU and D-cache off until it boots XNU, but LK left its cache lines
+ * behind (the Linux boot protocol only asks for a clean, not an invalidate). A stale line over a
+ * BSS buffer written now, with the cache off, would hide the new bytes once the MMU and the cache
+ * are on (20 Nov: the request's boot-args never reached XNU). Drop those lines first.
+ */
+static void dcache_invalidate_range(volatile void *p, uint32_t len)
+{
+    uintptr_t a = (uintptr_t)p & ~(uintptr_t)63U;
+    uintptr_t end = (uintptr_t)p + len;
+    for (; a < end; a += 64U) {
+        __asm__ volatile("dc ivac, %0" :: "r"(a) : "memory");
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
 static int boot_arg_char(uint8_t c)
 {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
@@ -519,6 +535,7 @@ int pstore_request_take(const char *needle, char *args, uint32_t args_cap)
     int found = 0;
 
     if (args_cap) {
+        dcache_invalidate_range(args, args_cap);
         args[0] = '\0';
     }
     while (needle[n]) {

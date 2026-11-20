@@ -313,6 +313,8 @@ const char *xnu_payload_boot(uintptr_t start, uintptr_t end)
         con_puts("boot-args + request: ");
         con_puts(g_xnu_extra_args);
         con_putc('\n');
+    } else {
+        con_puts("boot-args: no request args\n");
     }
     ba->memSizeActual = p->mem_size;
 
