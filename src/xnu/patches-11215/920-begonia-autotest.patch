@@ -15,7 +15,7 @@ diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_autotest.c
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,114 @@
 +/*
 + * begonia_autotest.c (Loxy, 19 Nov 2026): unattended iOS test boots on begonia.
 + *
@@ -44,6 +44,7 @@ new file mode 100644
 +extern int unlink1(vfs_context_t ctx, vnode_t start_dvp, user_addr_t path_arg,
 +    enum uio_seg segflg, int unlink_flags);
 +extern void IOSleep(unsigned int milliseconds);
++extern void begonia_wdt_stop_kicking(void);     /* begonia_reboot.c */
 +
 +#define BGMTL_DIR   "/private/var/tmp/"
 +
@@ -100,6 +101,7 @@ new file mode 100644
 +		}
 +		printf("BEGONIA AUTOTEST: begoniareboot=%u reached, rebooting in 5 s\n", autotest_reboot);
 +		IOSleep(5000);  /* sweetlog flushes about once a second */
++		begonia_wdt_stop_kicking();     /* begoniawdt guard: a shutdown that hangs ends in a watchdog reset */
 +		reboot_kernel(RB_AUTOBOOT, (char *)"begoniareboot");
 +	}
 +}
@@ -249,7 +251,7 @@ diff --git a/bsd/dev/begonia_reboot.c b/bsd/dev/begonia_reboot.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_reboot.c
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,246 @@
 +/*
 + * begonia_reboot.c (Loxy, 20 Nov 2026): restart, power off and panic restart on begonia (MT6785).
 + *
@@ -279,6 +281,7 @@ new file mode 100644
 +#include <sys/systm.h>
 +#include <sys/errno.h>
 +#include <mach/vm_types.h>
++#include <kern/thread.h>
 +#include <pexpert/pexpert.h>
 +#include <IOKit/IOPlatformExpert.h>
 +#include "sweet_board.h"
@@ -289,6 +292,9 @@ new file mode 100644
 +
 +#define RGU_PA                  0x10007000u     /* live DT toprgu@10007000, "mediatek,toprgu" */
 +#define RGU_MODE                0x00u
++#define RGU_LENGTH              0x04u
++#define RGU_LENGTH_KEY          0x0008u
++#define RGU_MODE_ENABLE         0x0001u
 +#define RGU_RESTART             0x08u
 +#define RGU_STATUS              0x0cu
 +#define RGU_SWRST               0x14u
@@ -312,8 +318,12 @@ new file mode 100644
 +static uint32_t br_panic_reset_s = 5;
 +static uint32_t br_debug;
 +static volatile uint32_t br_busy;
++static uint32_t br_wdt_secs;                    /* begoniawdt=N: hardware watchdog guard, 0 = off */
++static volatile bool br_wdt_kicking;
 +
 +void begonia_reboot_init(void);
++void begonia_wdt_stop_kicking(void);
++extern void IOSleep(unsigned int milliseconds);
 +
 +static inline void
 +br_w(uint32_t off, uint32_t v)
@@ -412,6 +422,53 @@ new file mode 100644
 +	}
 +}
 +
++/*
++ * Hardware watchdog guard for unattended test boots (begoniawdt=N, 1..31 s): the TOPRGU counter runs,
++ * a kernel thread restarts it every 2 s. A hard hang (every CPU stuck, nothing scheduled), or a panic
++ * whose reset did not happen, resets the SoC within N s like an Android kernel watchdog timeout would,
++ * and the picker starts Android. begonia_wdt_stop_kicking() (the autotest, right before its orderly
++ * reboot) turns a hang in the shutdown path into a reset as well.
++ */
++static void
++br_wdt_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	while (br_wdt_kicking) {
++		br_w(RGU_RESTART, RGU_RESTART_KEY);
++		IOSleep(2000);
++	}
++	printf("BEGONIA REBOOT: watchdog no longer kicked (reset in %u s unless the reboot completes)\n", br_wdt_secs);
++}
++
++void
++begonia_wdt_stop_kicking(void)
++{
++	br_wdt_kicking = false;
++}
++
++static void
++br_wdt_start(void)
++{
++	thread_t thread;
++	uint32_t mode;
++
++	/* WDT_LENGTH[15:5] counts 512 ticks of the 32 kHz clock: 64 per second; key 0x08 in [4:0] */
++	br_w(RGU_LENGTH, (((br_wdt_secs * 64u) << 5) & 0xffe0u) | RGU_LENGTH_KEY);
++	br_w(RGU_RESTART, RGU_RESTART_KEY);
++	br_w(RGU_NONRST2, br_r(RGU_NONRST2) | RGU_NONRST2_BYPASS_PWRKEY);
++	mode = br_r(RGU_MODE) & 0x00ffffffu;
++	mode &= ~(RGU_MODE_IRQ | RGU_MODE_DUAL | RGU_MODE_EXTRA_CNT | RGU_MODE_DDR_RESERVE);
++	br_wdt_kicking = true;
++	br_w(RGU_MODE, mode | RGU_MODE_KEY | RGU_MODE_EXTEN | RGU_MODE_ENABLE);
++	if (kernel_thread_start(br_wdt_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("BEGONIA REBOOT: hardware watchdog guard %u s (WDT_MODE %#x)\n", br_wdt_secs, br_r(RGU_MODE));
++	} else {
++		br_w(RGU_MODE, (br_r(RGU_MODE) & 0x00ffffffu & ~RGU_MODE_ENABLE) | RGU_MODE_KEY);
++		br_wdt_kicking = false;
++		printf("BEGONIA REBOOT: no kicker thread, watchdog guard off\n");
++	}
++}
++
 +/* Thread context (begonia_platform_hw_init, before the GPU / touch drivers). Idempotent. */
 +void
 +begonia_reboot_init(void)
@@ -432,6 +489,13 @@ new file mode 100644
 +	printf("BEGONIA REBOOT: restart/power off/panic -> TOPRGU (WDT_MODE 0x%08x, STATUS 0x%08x, NONRST2 0x%08x), "
 +	    "panic reset after %u s\n", br_rgu ? br_r(RGU_MODE) : 0, br_rgu ? br_r(RGU_STATUS) : 0,
 +	    br_rgu ? br_r(RGU_NONRST2) : 0, br_panic_reset_s);
++	(void)PE_parse_boot_argn("begoniawdt", &br_wdt_secs, sizeof(br_wdt_secs));
++	if (br_wdt_secs > 31u) {
++		br_wdt_secs = 31u;
++	}
++	if (br_rgu != NULL && br_wdt_secs != 0u) {
++		br_wdt_start();
++	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/begonia_keys.c b/bsd/dev/begonia_keys.c

@@ -297,7 +297,7 @@ diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_mali.c
-@@ -0,0 +1,929 @@
+@@ -0,0 +1,960 @@
 +/*
 + * ARM Mali-G76 MC4 (r0p0, 0x7211 @ 0x13040000) driver for Redmi Note 8 Pro (begonia / MT6785).
 + */
@@ -480,9 +480,11 @@ new file mode 100644
 +#define EXP_L2_LIMITS           (1u << 4)   /* L2_MMU_CONFIG: at most 16 outstanding external reads and writes */
 +#define EXP_NO_TLS_HASH         (1u << 5)   /* SHADER_CONFIG without SC_TLS_HASH_ENABLE */
 +#define EXP_CHAIN_FLAG          (1u << 6)   /* JS_CONFIG JOB_CHAIN_FLAG toggled per job (JOBCHAIN_DISAMBIGUATION) */
-+#define EXP_ALL                 0x7fu
++#define EXP_LONG_TIMEOUT        (1u << 7)   /* 5 s job timeout: ACTIVE + JS_HEAD == jc is also just a slow single job */
++#define EXP_ALL                 0xffu
++#define MALI_LONG_TIMEOUT_MS    5000u
 +static const uint32_t g_exp_order[] = {
-+	0u, EXP_ONE_CORE, EXP_PWR_OVERRIDE, EXP_MEMATTR_NC, EXP_COHERENCY_NONE,
++	0u, EXP_LONG_TIMEOUT, EXP_ONE_CORE, EXP_PWR_OVERRIDE, EXP_MEMATTR_NC, EXP_COHERENCY_NONE,
 +	EXP_L2_LIMITS, EXP_NO_TLS_HASH, EXP_CHAIN_FLAG, EXP_ALL,
 +};
 +#define EXP_STEPS               ((uint32_t)(sizeof(g_exp_order) / sizeof(g_exp_order[0])))
@@ -499,7 +501,8 @@ new file mode 100644
 +static bool g_started, g_ready, g_lost;
 +static uint32_t g_exp_mask, g_exp_adapt, g_exp_step, g_exp_step_faults, g_dumps;
 +static uint32_t g_exp_done_logged = ~0u, g_lost_faults = MALI_LOST_FAULTS;
-+static uint32_t g_slot_done[2];
++static uint32_t g_slot_done[2], g_slot_max_ms[2];
++static uint32_t g_job_timeout_ms = MALI_JOB_TIMEOUT_MS, g_req_mhz;
 +static bool g_chain_flag[2];
 +
 +extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
@@ -589,6 +592,16 @@ new file mode 100644
 +		delay(20);
 +		wr32(apmixed, MFGPLL_CON0, rd32(apmixed, MFGPLL_CON0) | 1u);
 +		delay(40);
++	} else if (g_req_mhz != 0u) {
++		/*
++		 * LK leaves MFGPLL running (269 MHz on begonia). begoniamalimhz=N (375..620) re-tunes it the way
++		 * mtk_gpufreq_core.c __mt_gpufreq_clock_switch does: mfg_sel is parked on mainpll_d5 (above),
++		 * CON1 = PCW_CHG | POSDIV /4 | DDS, 20 us, then back to mfgpll_ck (below). VGPU is 700 mV here
++		 * (power_pmic_rails), the OPP table's voltage for 620 MHz.
++		 */
++		dds = (uint32_t)((((uint64_t)g_req_mhz * 4ull) << 14) / 26ull) & 0x3fffffu;
++		wr32(apmixed, MFGPLL_CON1, (1u << 31) | (2u << 24) | dds);
++		delay(20);
 +	}
 +	con1 = rd32(apmixed, MFGPLL_CON1);
 +	g_freq_khz = (uint32_t)((((uint64_t)(con1 & 0x3fffffu) * 26000ull) >> 14) /
@@ -1062,14 +1075,23 @@ new file mode 100644
 +	}
 +	(void)PE_parse_boot_argn("begoniamalix", &g_exp_mask, sizeof(g_exp_mask));
 +	(void)PE_parse_boot_argn("begoniamaliadapt", &g_exp_adapt, sizeof(g_exp_adapt));
++	(void)PE_parse_boot_argn("begoniamalito", &g_job_timeout_ms, sizeof(g_job_timeout_ms));
++	(void)PE_parse_boot_argn("begoniamalimhz", &g_req_mhz, sizeof(g_req_mhz));
++	if (g_job_timeout_ms < 100u || g_job_timeout_ms > 10000u) {
++		g_job_timeout_ms = MALI_JOB_TIMEOUT_MS;
++	}
++	if (g_req_mhz != 0u && (g_req_mhz < 375u || g_req_mhz > 620u)) {
++		printf("BEGONIA MALI: begoniamalimhz=%u outside 375..620, clock left as LK set it\n", g_req_mhz);
++		g_req_mhz = 0u;
++	}
 +	g_exp_mask &= EXP_ALL;
 +	if (g_exp_adapt) {
 +		g_exp_mask = 0u;
 +		g_lost_faults = 96u;
 +	}
-+	if (g_exp_mask || g_exp_adapt) {
-+		printf("BEGONIA MALI: experiments: mask %#x, adapt %u (LOST after %u faults)\n",
-+		    g_exp_mask, g_exp_adapt, g_lost_faults);
++	if (g_exp_mask || g_exp_adapt || g_req_mhz || g_job_timeout_ms != MALI_JOB_TIMEOUT_MS) {
++		printf("BEGONIA MALI: experiments: mask %#x, adapt %u (LOST after %u faults), job timeout %u ms, clock %u MHz\n",
++		    g_exp_mask, g_exp_adapt, g_lost_faults, g_job_timeout_ms, g_req_mhz);
 +	}
 +	/*
 +	 * In its own kernel thread: begonia_platform_hw_init() runs inside
@@ -1170,10 +1192,12 @@ new file mode 100644
 +	wr32(mali, js + JS_AFFINITY_NEXT_LO, affinity);
 +	wr32(mali, js + JS_AFFINITY_NEXT_HI, 0u);
 +	wr32(mali, js + JS_CONFIG_NEXT, cfg);
++	uint64_t t_start = mach_absolute_time();
 +	wr32(mali, js + JS_COMMAND_NEXT, JS_COMMAND_START);
 +
 +	/* done or failed, whichever comes first: a failed chain used to cost the whole timeout */
-+	for (uint32_t us = 0; us < MALI_JOB_TIMEOUT_MS * 1000u; us += 10u) {
++	uint32_t timeout_ms = (g_exp_mask & EXP_LONG_TIMEOUT) ? MALI_LONG_TIMEOUT_MS : g_job_timeout_ms;
++	for (uint32_t us = 0; us < timeout_ms * 1000u; us += 10u) {
 +		irq = rd32(mali, JOB_INT_RAWSTAT) & irqm;
 +		if (irq != 0u) {
 +			break;
@@ -1183,12 +1207,19 @@ new file mode 100644
 +	if (irq == 0u) {
 +		irq = rd32(mali, JOB_INT_RAWSTAT) & irqm;
 +	}
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t_start, &ns);
++	uint32_t ms = (uint32_t)(ns / 1000000ull);
 +	if (irq != done) {
 +		mali_job_fault(slot, jc_va, irq);
 +	} else {
 +		if (g_slot_done[slot]++ == 0u) {
-+			printf("BEGONIA MALI: first slot %u job done (jc %#llx, %u faults so far, step %u mask %#x)\n",
-+			    slot, (unsigned long long)jc_va, g_faults, g_exp_step, g_exp_mask);
++			printf("BEGONIA MALI: first slot %u job done in %u ms (jc %#llx, %u faults so far, step %u mask %#x)\n",
++			    slot, ms, (unsigned long long)jc_va, g_faults, g_exp_step, g_exp_mask);
++		}
++		if (ms > g_slot_max_ms[slot] && ms >= 50u) {
++			g_slot_max_ms[slot] = ms;
++			printf("BEGONIA MALI: slot %u job took %u ms (new max, job %u on the slot)\n", slot, ms, g_slot_done[slot]);
 +		}
 +		if (slot == 0u && g_exp_adapt && g_exp_done_logged != g_exp_step) {
 +			g_exp_done_logged = g_exp_step;
