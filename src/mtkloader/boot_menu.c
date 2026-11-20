@@ -5,6 +5,7 @@
 #include "boot_menu.h"
 #include "begonia_hw.h"
 #include "console.h"
+#include "xnu_boot.h"
 
 #define COL_BG          0xff111318U
 #define COL_CARD        0xff1b2029U
@@ -374,6 +375,17 @@ enum boot_target boot_menu_select(int has_android, int has_xnu, struct touch_sta
     int prev_touch_down = 0;
 
     draw_menu(has_android, has_xnu, selected, touch);
+
+    /* One-shot iOS request from Android (console.c pstore_request_take): consumed on use, so the boot
+     * after iOS falls back to the countdown below (Android). */
+    if (has_xnu && pstore_request_take(BOOT_REQUEST_IOS, g_xnu_extra_args, BOOT_REQUEST_ARGS_MAX + 1U)) {
+        con_puts("one-shot iOS request from Android, extra boot-args: ");
+        con_puts(g_xnu_extra_args[0] ? g_xnu_extra_args : "(none)");
+        con_putc('\n');
+        draw_centered_text(540U, COUNTDOWN_Y, "iOS 18 (requested from Android)", 2U, COL_IOS_SILVER);
+        delay_ms(1500U);
+        return BOOT_TARGET_XNU;
+    }
 
     uint64_t freq = timer_freq();
     uint64_t t0 = timer_ticks();

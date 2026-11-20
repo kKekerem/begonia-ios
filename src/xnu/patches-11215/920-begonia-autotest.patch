@@ -1,12 +1,13 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -123,6 +123,8 @@ bsd/dev/sweet_a630_pas.c			standard
+@@ -123,6 +123,9 @@ bsd/dev/sweet_a630_pas.c			standard
  bsd/dev/begonia_touch.c			standard
  bsd/dev/begonia_mali.c			standard
  bsd/dev/begonia_mali_mmu.c		standard
 +bsd/dev/begonia_autotest.c		standard
 +bsd/dev/begonia_plog.c			standard
++bsd/dev/begonia_reboot.c		standard
  bsd/dev/beryllium_wlan.c		standard
  bsd/dev/beryllium_bt_hci.c		standard
  bsd/dev/mem.c				standard
@@ -244,24 +245,215 @@ new file mode 100644
 +	    PLOG_ZONE_PA, plog_early_len);
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/begonia_reboot.c b/bsd/dev/begonia_reboot.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/begonia_reboot.c
+@@ -0,0 +1,184 @@
++/*
++ * begonia_reboot.c (Loxy, 20 Nov 2026): restart, power off and panic restart on begonia (MT6785).
++ *
++ * Bergamota's reset path (bsd/dev/sweet_reboot.c) is Qualcomm only (PS_HOLD, then PSCI) and is only set
++ * up on beryllium. On begonia sweet_reboot_restart() flushed the UFS cache and returned -1, so a restart
++ * ended in "MACH Reboot", a power off in "CPU halted", and 30 s later both in panic("Halt/Restart Timed
++ * Out"); a panic spun forever (debug=0x14e has DB_NMI, so XNU never calls kdp_machine_reboot_type).
++ *
++ * begonia_reboot_init() maps TOPRGU in thread context and installs PE_halt_restart, which
++ * IOPlatformExpert::haltRestart() calls for every type after SweetPlatformExpert's own handling:
++ *  - kPERestartCPU, kPEPanicRestartCPU: the MediaTek software watchdog reset, step by step as the MIUI
++ *    4.14 kernel reboots (drivers/watchdog/mediatek/wdt/common/wdt_v2 wdt_arch_reset with
++ *    WD_SW_RESET_BYPASS_PWR_KEY; begonia's toprgu node has no "rstmode", MT6785 has no DBGTOP): kick,
++ *    NONRST_REG2 bypass-power-key bit, WDT_MODE without IRQ / DUAL / EXTRA_CNT / DDR_RESERVE plus
++ *    EXTEN, the status backup in NONRST_REG, then WDT_SWRST = 0x1209. A warm reset like every Android
++ *    reboot: DRAM keeps the ramoops logs, and the dual-boot picker starts Android after its countdown.
++ *    PSCI SYSTEM_RESET if the SoC is still running 2 s later.
++ *  - kPEHaltCPU (power off): UFS cache flush, PSCI SYSTEM_OFF (MediaTek ATF powers the PMIC off); if
++ *    that returns, the reset above.
++ *  - kPEPanicDiagnosticsDone: the panic text is out (also in the ramoops mirror, begonia_plog.c). Unless
++ *    the debug boot-arg has DB_REBOOT_ALWAYS (0x100000, then kPEPanicRestartCPU follows), reset after
++ *    begoniapanicreset seconds (default 5; 0 = keep the panic screen, the old behaviour).
++ * Every log line starts with "BEGONIA REBOOT:".
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <mach/vm_types.h>
++#include <pexpert/pexpert.h>
++#include <IOKit/IOPlatformExpert.h>
++#include "sweet_board.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void delay(int usec);
++extern int sweet_ufs_flush_final(void);         /* bsd/dev/sweet_ufs.c (Bergamota 0222) */
++
++#define RGU_PA                  0x10007000u     /* live DT toprgu@10007000, "mediatek,toprgu" */
++#define RGU_MODE                0x00u
++#define RGU_RESTART             0x08u
++#define RGU_STATUS              0x0cu
++#define RGU_SWRST               0x14u
++#define RGU_NONRST              0x20u
++#define RGU_NONRST2             0x24u
++#define RGU_MODE_KEY            0x22000000u
++#define RGU_MODE_DDR_RESERVE    0x0080u
++#define RGU_MODE_DUAL           0x0040u
++#define RGU_MODE_EXTRA_CNT      0x0010u
++#define RGU_MODE_IRQ            0x0008u
++#define RGU_MODE_EXTEN          0x0004u
++#define RGU_RESTART_KEY         0x1971u
++#define RGU_SWRST_KEY           0x1209u
++#define RGU_NONRST2_BYPASS_PWRKEY (1u << 13)
++
++#define PSCI_SYSTEM_OFF         0x84000008ULL
++#define PSCI_SYSTEM_RESET       0x84000009ULL
++#define DB_REBOOT_ALWAYS_BIT    0x100000u       /* osfmk/kern/debug.h */
++
++static volatile uint32_t *br_rgu;
++static uint32_t br_panic_reset_s = 5;
++static uint32_t br_debug;
++static volatile uint32_t br_busy;
++
++void begonia_reboot_init(void);
++
++static inline void
++br_w(uint32_t off, uint32_t v)
++{
++	br_rgu[off / 4] = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline uint32_t
++br_r(uint32_t off)
++{
++	return br_rgu[off / 4];
++}
++
++/* SMCCC 1.0 fast call from EL1 (HCR_EL2.TSC is clear, the loader drops XNU to EL1): MediaTek ATF PSCI. */
++static uint64_t
++br_psci(uint64_t fn)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7",
++	    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	return x0;
++}
++
++/* The MIUI 4.14 kernel's normal reboot (wdt_arch_reset, bypass power key), without the PMIC dump. */
++static void
++br_rgu_reset(void)
++{
++	uint32_t mode, nonrst2;
++
++	br_w(RGU_RESTART, RGU_RESTART_KEY);
++	nonrst2 = br_r(RGU_NONRST2) | RGU_NONRST2_BYPASS_PWRKEY;
++	mode = br_r(RGU_MODE) & 0x00ffffffu;
++	mode &= ~(RGU_MODE_IRQ | RGU_MODE_DUAL);
++	mode |= RGU_MODE_KEY | RGU_MODE_EXTEN;
++	br_w(RGU_NONRST2, nonrst2);
++	br_w(RGU_NONRST, br_r(RGU_STATUS) | br_r(RGU_NONRST));
++	mode &= ~RGU_MODE_EXTRA_CNT;
++	br_w(RGU_MODE, mode);
++	br_w(RGU_NONRST, br_r(RGU_STATUS));
++	mode = (br_r(RGU_MODE) & 0x00ffffffu & ~RGU_MODE_DDR_RESERVE) | RGU_MODE_KEY;
++	br_w(RGU_MODE, mode);
++	delay(200);
++	br_w(RGU_SWRST, RGU_SWRST_KEY);
++	for (int i = 0; i < 400; i++) {         /* Linux mainline repeats it every 5 ms */
++		delay(5000);
++		br_w(RGU_SWRST, RGU_SWRST_KEY);
++	}
++}
++
++static int
++br_reset(const char *why)
++{
++	if (br_busy++ == 0) {
++		printf("BEGONIA REBOOT: %s: TOPRGU software reset (WDT_MODE 0x%08x, NONRST2 0x%08x, STATUS 0x%08x)\n",
++		    why, br_rgu ? br_r(RGU_MODE) : 0, br_rgu ? br_r(RGU_NONRST2) : 0, br_rgu ? br_r(RGU_STATUS) : 0);
++		delay(100 * 1000);              /* let the console / ramoops mirror take the line */
++	}
++	if (br_rgu != NULL) {
++		br_rgu_reset();
++	}
++	printf("BEGONIA REBOOT: still running after the watchdog reset, PSCI SYSTEM_RESET\n");
++	(void)br_psci(PSCI_SYSTEM_RESET);
++	delay(2000 * 1000);
++	printf("BEGONIA REBOOT: no reset happened\n");
++	return -1;
++}
++
++static int
++begonia_halt_restart(unsigned int type)
++{
++	switch (type) {
++	case kPERestartCPU:
++		return br_reset("restart");
++	case kPEPanicRestartCPU:
++		return br_reset("panic restart");
++	case kPEHaltCPU: {
++		int flush = sweet_ufs_flush_final();
++		printf("BEGONIA REBOOT: power off (UFS cache flush -> %d), PSCI SYSTEM_OFF\n", flush);
++		delay(100 * 1000);
++		uint64_t rc = br_psci(PSCI_SYSTEM_OFF);
++		delay(1000 * 1000);
++		printf("BEGONIA REBOOT: PSCI SYSTEM_OFF returned 0x%llx\n", rc);
++		return br_reset("power off fallback");
++	}
++	case kPEPanicDiagnosticsDone:
++		if ((br_debug & DB_REBOOT_ALWAYS_BIT) || br_panic_reset_s == 0) {
++			return -1;
++		}
++		printf("BEGONIA REBOOT: panic, reset in %u s (begoniapanicreset=0 keeps the panic screen)\n",
++		    br_panic_reset_s);
++		delay((int)(br_panic_reset_s * 1000 * 1000));
++		return br_reset("panic");
++	default:
++		return -1;
++	}
++}
++
++/* Thread context (begonia_platform_hw_init, before the GPU / touch drivers). Idempotent. */
++void
++begonia_reboot_init(void)
++{
++	if (br_rgu != NULL || !sweet_board_begonia()) {
++		return;
++	}
++	(void)PE_parse_boot_argn("begoniapanicreset", &br_panic_reset_s, sizeof(br_panic_reset_s));
++	if (br_panic_reset_s > 600) {
++		br_panic_reset_s = 600;
++	}
++	(void)PE_parse_boot_argn("debug", &br_debug, sizeof(br_debug));
++	br_rgu = (volatile uint32_t *)ml_io_map(RGU_PA, 0x1000);
++	if (br_rgu == NULL) {
++		printf("BEGONIA REBOOT: TOPRGU map failed, PSCI only\n");
++	}
++	PE_halt_restart = begonia_halt_restart;
++	printf("BEGONIA REBOOT: restart/power off/panic -> TOPRGU (WDT_MODE 0x%08x, STATUS 0x%08x, NONRST2 0x%08x), "
++	    "panic reset after %u s\n", br_rgu ? br_r(RGU_MODE) : 0, br_rgu ? br_r(RGU_STATUS) : 0,
++	    br_rgu ? br_r(RGU_NONRST2) : 0, br_panic_reset_s);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/begonia_keys.c b/bsd/dev/begonia_keys.c
 --- a/bsd/dev/begonia_keys.c
 +++ b/bsd/dev/begonia_keys.c
-@@ -196,6 +196,9 @@
+@@ -196,6 +196,10 @@
  	}
  }
- 
+
 +void begonia_plog_start(void);
++void begonia_reboot_init(void);
 +void begonia_autotest_init(void);
 +
  void
  begonia_platform_hw_init(void)
  {
-@@ -205,8 +208,10 @@
+@@ -205,8 +209,11 @@
  		return;
  	}
  	hw_started = true;
 +	begonia_plog_start();
++	begonia_reboot_init();
  	begonia_keys_init();
  	begonia_touch_init();
  	begonia_mali_init();

@@ -494,6 +494,68 @@ int plog_contains(const char *needle)
     return 0;
 }
 
+static int boot_arg_char(uint8_t c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+           c == '=' || c == '_' || c == '-' || c == '.' || c == ',' || c == ' ';
+}
+
+/*
+ * One-shot boot request from Android (20 Nov 2026). Android cannot reach this loader, but its kernel
+ * console lands in the ramoops console zone (cprz), which survives the watchdog reset of a reboot and
+ * is not touched by preloader/LK. `echo 'LOXY_BOOT_IOS_ONCE{begoniareboot=420}' > /dev/kmsg; reboot`
+ * therefore asks for one iOS boot, optionally with extra XNU boot-args (boot-arg characters only,
+ * {...} optional). Only what that Android boot wrote is searched (header start/size, Linux zaps the zone
+ * when it boots), and every match is consumed here (its first byte overwritten), so the boot after iOS,
+ * and any Android crash/reboot after it, gets the normal menu again (Android after 10 s): a request can
+ * never turn into a boot loop. Returns 1 if the zone held the request; args gets the last {...}.
+ */
+int pstore_request_take(const char *needle, char *args, uint32_t args_cap)
+{
+    volatile uint32_t *h = (volatile uint32_t *)(uintptr_t)PSTORE_CONSOLE_PA;
+    volatile uint8_t *d = (volatile uint8_t *)(uintptr_t)(PSTORE_CONSOLE_PA + 12U);
+    const uint32_t cap = (uint32_t)(PSTORE_CONSOLE_SIZE - 12U);
+    uint32_t n = 0U;
+    int found = 0;
+
+    if (args_cap) {
+        args[0] = '\0';
+    }
+    while (needle[n]) {
+        n++;
+    }
+    if (n == 0U || h[0] != PLOG_SIG || h[1] >= cap || h[2] > cap || h[2] < n) {
+        return 0;
+    }
+    uint32_t size = h[2];
+    uint32_t start = (h[1] + cap - size) % cap;
+    for (uint32_t i = 0U; i + n <= size; i++) {
+        uint32_t k = 0U;
+        while (k < n && d[(start + i + k) % cap] == (uint8_t)needle[k]) {
+            k++;
+        }
+        if (k != n) {
+            continue;
+        }
+        found = 1;
+        uint32_t j = i + n;
+        if (args_cap && j < size && d[(start + j) % cap] == '{') {
+            uint32_t m = 0U;
+            j++;
+            while (j < size && m + 1U < args_cap && boot_arg_char(d[(start + j) % cap])) {
+                args[m++] = (char)d[(start + j) % cap];
+                j++;
+            }
+            if (j >= size || d[(start + j) % cap] != '}') {
+                m = 0U;     /* unterminated or a character that is not allowed: no extra args */
+            }
+            args[m] = '\0';
+        }
+        d[(start + i) % cap] = (uint8_t)'#';
+    }
+    return found;
+}
+
 void plog_putc(char c)
 {
     if (!g_plog_on) {

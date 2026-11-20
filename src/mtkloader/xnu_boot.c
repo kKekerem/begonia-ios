@@ -10,6 +10,8 @@ extern char _start[];
 extern char __loader_end[];
 extern void __attribute__((noreturn)) jump_to_kernel(uint64_t entry_pa, uint64_t boot_args_pa);
 
+char g_xnu_extra_args[BOOT_REQUEST_ARGS_MAX + 1U];
+
 static void copy64(uintptr_t dst, uintptr_t src, uint64_t n)
 {
     volatile uint64_t *d = (volatile uint64_t *)dst;
@@ -293,6 +295,24 @@ const char *xnu_payload_boot(uintptr_t start, uintptr_t end)
     ba->deviceTreeLength = (uint32_t)p->adt_size;
     for (int i = 0; i < BOOT_LINE_LENGTH; i++) {
         ba->CommandLine[i] = p->cmdline[i];
+    }
+    ba->CommandLine[BOOT_LINE_LENGTH - 1] = '\0';
+    if (g_xnu_extra_args[0]) {
+        /* one-shot request from Android: append its boot-args (XNU takes the first of a repeated arg) */
+        int len = 0;
+        while (len < BOOT_LINE_LENGTH - 1 && ba->CommandLine[len]) {
+            len++;
+        }
+        if (len > 0 && len < BOOT_LINE_LENGTH - 2) {
+            ba->CommandLine[len++] = ' ';
+        }
+        for (int i = 0; g_xnu_extra_args[i] && len < BOOT_LINE_LENGTH - 1; i++) {
+            ba->CommandLine[len++] = g_xnu_extra_args[i];
+        }
+        ba->CommandLine[len] = '\0';
+        con_puts("boot-args + request: ");
+        con_puts(g_xnu_extra_args);
+        con_putc('\n');
     }
     ba->memSizeActual = p->mem_size;
 

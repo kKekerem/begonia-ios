@@ -81,4 +81,7 @@ const char *xnu_payload_check(uintptr_t start, uintptr_t end);
 /* Load segments, ADT, and boot_args, then jump to XNU (never returns on success). */
 const char *xnu_payload_boot(uintptr_t start, uintptr_t end);
 
+/* Extra boot-args of a one-shot request from Android (boot_menu.c), appended to the payload's. */
+extern char g_xnu_extra_args[];
+
 #endif /* XNU_BOOT_H */
