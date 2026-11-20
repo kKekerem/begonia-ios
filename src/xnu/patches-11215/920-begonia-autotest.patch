@@ -568,3 +568,19 @@ diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
  	if (sweet_fb_panic_hook != NULL && panic_active()) {
  		void (*hook)(void) = sweet_fb_panic_hook;
  		sweet_fb_panic_hook = NULL;
+@@ -555,6 +557,7 @@
+ 		 * the graphics console takes over printf would vanish from both logs.
+ 		 */
+ 		sweet_log_append(str, size);
++		begonia_plog_append(str, size);
+ #endif
+ 		return;
+ 	}
+@@ -643,6 +646,7 @@
+ 	if (disableConsoleOutput) {
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 		sweet_log_append(&c, 1);
++		begonia_plog_append(&c, 1);
+ #endif
+ 		return;
+ 	}
