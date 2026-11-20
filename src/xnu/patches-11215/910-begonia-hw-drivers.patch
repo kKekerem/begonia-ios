@@ -2336,10 +2336,9 @@ index 1a16f3f..d9e4a98 100644
  			return true;
 diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
 new file mode 100644
-index 0000000..5eb4dee
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMali.cpp
-@@ -0,0 +1,496 @@
+@@ -0,0 +1,546 @@
 +/*
 + * SweetMali: IOKit service and user client for begonia Mali-G76 MC4 (MT6785).
 + */
@@ -2377,6 +2376,50 @@ index 0000000..5eb4dee
 +};
 +
 +static IOLock *gMaliClientLock;
++
++/*
++ * 20 Nov 2026: what the GPU wrote into an IOSurface, read back through the kernel's write-combine alias (DRAM)
++ * right after the fragment job: 16 texels on a 4x4 grid. The first GPU-composited boot showed a black screen while
++ * every job completed; this separates "the GPU drew black" from "the framebuffer did not show what was drawn".
++ * First 12 fragment jobs that write a surface, then every 400th.
++ */
++static uint32_t gMaliSampleCount;
++
++static void
++mali_sample_surface(const struct mali_gem_slot *b, uint64_t seq)
++{
++	SweetSurface *s = b->surface;
++	if (s == NULL || b->kva == NULL || s->width == 0 || s->height == 0 || s->bytesPerRow == 0) {
++		return;
++	}
++	uint32_t n = gMaliSampleCount++;
++	if (n >= 12u && (n % 400u) != 0u) {
++		return;
++	}
++	uint32_t w = s->width, h = s->height, bpr = s->bytesPerRow;
++	uint64_t sum = 0;
++	uint32_t nonzero = 0, first = 0;
++	for (uint32_t gy = 0; gy < 4u; gy++) {
++		for (uint32_t gx = 0; gx < 4u; gx++) {
++			uint64_t off = (uint64_t)s->offset + (uint64_t)((2u * gy + 1u) * h / 8u) * bpr +
++			    (uint64_t)((2u * gx + 1u) * w / 8u) * 4u;
++			if (off + 4u > b->size) {
++				continue;
++			}
++			uint32_t px = *(volatile uint32_t *)(b->kva + off);
++			if (gy == 0u && gx == 0u) {
++				first = px;
++			}
++			sum += (px & 0xffu) + ((px >> 8) & 0xffu) + ((px >> 16) & 0xffu);
++			if ((px & 0x00ffffffu) != 0u) {
++				nonzero++;
++			}
++		}
++	}
++	IOLog("BEGONIA MALI: fragment seq %llu wrote surface %u (%ux%u fmt %#x bpr %u): mean %llu, %u/16 not black, "
++	    "texel(1/8,1/8) %#010x [sample %u]\n", (unsigned long long)seq, (unsigned)s->id, w, h,
++	    (unsigned)s->pixelFormat, bpr, (unsigned long long)(sum / 48u), nonzero, first, n);
++}
 +
 +class SweetMali : public IOService {
 +	OSDeclareDefaultStructors(SweetMali);
@@ -2681,7 +2724,8 @@ index 0000000..5eb4dee
 +		r->jc = begonia_mali_last_seq();
 +		return kIOReturnSuccess;
 +	}
-+	uint64_t seq = begonia_mali_submit(r->jc, (r->requirements & SWEET_MALI_JD_REQ_FS) != 0u);
++	bool fragment = (r->requirements & SWEET_MALI_JD_REQ_FS) != 0u;
++	uint64_t seq = begonia_mali_submit(r->jc, fragment);
 +	if (seq == 0u) {
 +		return kIOReturnError;
 +	}
@@ -2699,6 +2743,11 @@ index 0000000..5eb4dee
 +			struct mali_gem_slot *b = boSlot(handles[k]);
 +			if (b != NULL) {
 +				b->last_seq = seq;
++				/* display-sized surfaces only: the compositor's framebuffers (828x1792 here) */
++				if (fragment && b->surface != NULL && !b->readonly && b->surface->width >= 600u &&
++				    b->surface->height >= 1200u) {
++					mali_sample_surface(b, seq);
++				}
 +			}
 +		}
 +	}
