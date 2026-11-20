@@ -297,7 +297,7 @@ diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_mali.c
-@@ -0,0 +1,1056 @@
+@@ -0,0 +1,1069 @@
 +/*
 + * ARM Mali-G76 MC4 (r0p0, 0x7211 @ 0x13040000) driver for Redmi Note 8 Pro (begonia / MT6785).
 + */
@@ -821,19 +821,32 @@ new file mode 100644
 +		    g_vtx_dumps, (unsigned long long)job, type, h[0], h[1], (unsigned long long)tiler);
 +		mali_dump_mem("vjob", job, 32u);
 +		if (type == 10u || type == 7u) {
-+			uint64_t pos_draw = job + ((type == 10u) ? 256u : 128u);
 +			uint32_t d[32];
 +			mali_dump_mem("vdraw", job + 128u, 32u);
 +			if (type == 10u) {
-+				mali_dump_mem("vdraw2", pos_draw, 32u);
++				mali_dump_mem("vdraw2", job + 256u, 32u);
 +			}
-+			if (mali_peek(pos_draw, d, 8u)) {
++			/* IDVS: the position buffer is the FRAGMENT draw's Position (gpu11: the vertex draw's was 0) */
++			if (mali_peek(job + 128u, d, 32u)) {
 +				uint64_t pos = (uint64_t)d[4] | ((uint64_t)d[5] << 32);
-+				printf("BEGONIA MALI VTX: positions at %#llx\n", (unsigned long long)pos);
++				uint64_t rsd = (uint64_t)d[14] | ((uint64_t)d[15] << 32);
++				uint64_t vbufs = (uint64_t)d[20] | ((uint64_t)d[21] << 32);
++				uint64_t vars = (uint64_t)d[22] | ((uint64_t)d[23] << 32);
++				printf("BEGONIA MALI VTX: positions %#llx state %#llx varying buffers %#llx varyings %#llx\n",
++				    (unsigned long long)pos, (unsigned long long)rsd, (unsigned long long)vbufs,
++				    (unsigned long long)vars);
 +				mali_dump_mem("pos", pos, 32u);
++				mali_dump_mem("rsd", rsd, 32u);
++				mali_dump_mem("vbufs", vbufs, 16u);
++				mali_dump_mem("vars", vars, 16u);
 +			}
 +			if (tiler != 0u) {
++				uint32_t t[32];
 +				mali_dump_mem("vtiler", tiler, 16u);
++				if (mali_peek(tiler, t, 8u)) {
++					uint64_t heap = (uint64_t)t[6] | ((uint64_t)t[7] << 32);
++					mali_dump_mem("heap", heap, 8u);
++				}
 +			}
 +		}
 +		job = (uint64_t)h[6] | ((uint64_t)h[7] << 32);
