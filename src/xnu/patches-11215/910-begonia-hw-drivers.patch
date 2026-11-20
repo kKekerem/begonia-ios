@@ -297,7 +297,7 @@ diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_mali.c
-@@ -0,0 +1,960 @@
+@@ -0,0 +1,997 @@
 +/*
 + * ARM Mali-G76 MC4 (r0p0, 0x7211 @ 0x13040000) driver for Redmi Note 8 Pro (begonia / MT6785).
 + */
@@ -748,6 +748,39 @@ new file mode 100644
 +		printf("BEGONIA MALI DUMP: %s %#llx+%02x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
 +		    tag, (unsigned long long)gpu_va, i * 4u, w[i], w[i + 1u], w[i + 2u], w[i + 3u],
 +		    w[i + 4u], w[i + 5u], w[i + 6u], w[i + 7u]);
++	}
++}
++
++/*
++ * 20 Nov 2026: the descriptors of a fragment job that COMPLETED (first 6): in the first GPU-composited boots
++ * every fragment job finished in 0 ms and left the IOSurface untouched (all texels 0, alpha too). Job header +
++ * payload, then the framebuffer descriptor (v7: parameters 64 B, padding 64 B, ZS/CRC extension, render targets
++ * 64 B each: word 1 bit 0 = write enable, words 8-9 = base, 10 = row stride) and the tiler context it points to.
++ */
++static uint32_t g_frag_dumps;
++
++static void
++mali_dump_frag(uint64_t jc_va)
++{
++	uint32_t w[32];
++	printf("BEGONIA MALI FRAG: fragment job %u done, jc %#llx\n", g_frag_dumps, (unsigned long long)jc_va);
++	mali_dump_mem("fjob", jc_va, 16u);
++	if (!mali_peek(jc_va, w, 12u)) {
++		return;
++	}
++	uint64_t fbp = (uint64_t)w[10] | ((uint64_t)w[11] << 32);
++	uint64_t fbd = fbp & ~0x3full;
++	printf("BEGONIA MALI FRAG: fbd pointer %#llx (zs/crc ext %u, %u render targets) bounds %u,%u..%u,%u\n",
++	    (unsigned long long)fbp, (unsigned)((fbp >> 1) & 1u), (unsigned)(((fbp >> 2) & 0xfu) + 1u),
++	    w[8] & 0xfffu, (w[8] >> 16) & 0xfffu, w[9] & 0xfffu, (w[9] >> 16) & 0xfffu);
++	mali_dump_mem("fbd", fbd, 32u);
++	mali_dump_mem("fbd+80", fbd + 0x80u, 32u);
++	mali_dump_mem("fbd+100", fbd + 0x100u, 32u);
++	if (mali_peek(fbd, w, 16u)) {
++		uint64_t tiler = (uint64_t)w[14] | ((uint64_t)w[15] << 32);
++		if (tiler != 0u) {
++			mali_dump_mem("tiler", tiler, 16u);
++		}
 +	}
 +}
 +
@@ -1213,6 +1246,10 @@ new file mode 100644
 +	if (irq != done) {
 +		mali_job_fault(slot, jc_va, irq);
 +	} else {
++		if (slot == 0u && g_frag_dumps < 6u) {
++			g_frag_dumps++;
++			mali_dump_frag(jc_va);
++		}
 +		if (g_slot_done[slot]++ == 0u) {
 +			printf("BEGONIA MALI: first slot %u job done in %u ms (jc %#llx, %u faults so far, step %u mask %#x)\n",
 +			    slot, ms, (unsigned long long)jc_va, g_faults, g_exp_step, g_exp_mask);
@@ -2338,7 +2375,7 @@ diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
 new file mode 100644
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMali.cpp
-@@ -0,0 +1,546 @@
+@@ -0,0 +1,557 @@
 +/*
 + * SweetMali: IOKit service and user client for begonia Mali-G76 MC4 (MT6785).
 + */
@@ -2416,9 +2453,10 @@ new file mode 100644
 +			}
 +		}
 +	}
-+	IOLog("BEGONIA MALI: fragment seq %llu wrote surface %u (%ux%u fmt %#x bpr %u): mean %llu, %u/16 not black, "
-+	    "texel(1/8,1/8) %#010x [sample %u]\n", (unsigned long long)seq, (unsigned)s->id, w, h,
-+	    (unsigned)s->pixelFormat, bpr, (unsigned long long)(sum / 48u), nonzero, first, n);
++	IOLog("BEGONIA MALI: fragment seq %llu wrote surface %u (%ux%u fmt %#x bpr %u, gpu va %#llx): mean %llu, "
++	    "%u/16 not black, texel(1/8,1/8) %#010x [sample %u]\n", (unsigned long long)seq, (unsigned)s->id, w, h,
++	    (unsigned)s->pixelFormat, bpr, (unsigned long long)b->gpu_va, (unsigned long long)(sum / 48u), nonzero,
++	    first, n);
 +}
 +
 +class SweetMali : public IOService {
@@ -2715,6 +2753,16 @@ new file mode 100644
 +	if (in_sync && fBos[r->handle - 1u].kva != NULL)
 +		sweet_dma_sync_va(fBos[r->handle - 1u].kva, (size_t)fBos[r->handle - 1u].size);
 +	r->gpu_va = fBos[r->handle - 1u].gpu_va;
++	{
++		static uint32_t logged;
++		if (logged < 24u) {
++			logged++;
++			IOLog("BEGONIA MALI: surface %u %ux%u fmt %#x bpr %u offset %u -> gpu va %#llx size %#llx handle %u%s\n",
++			    (unsigned)s->id, (unsigned)s->width, (unsigned)s->height, (unsigned)s->pixelFormat,
++			    (unsigned)s->bytesPerRow, (unsigned)r->offset, (unsigned long long)r->gpu_va,
++			    (unsigned long long)size, r->handle, s->wrapped ? " (wrapped, read-only)" : "");
++		}
++	}
 +	return kIOReturnSuccess;
 +}
 +
