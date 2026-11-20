@@ -297,7 +297,7 @@ diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_mali.c
-@@ -0,0 +1,996 @@
+@@ -0,0 +1,1056 @@
 +/*
 + * ARM Mali-G76 MC4 (r0p0, 0x7211 @ 0x13040000) driver for Redmi Note 8 Pro (begonia / MT6785).
 + */
@@ -319,6 +319,7 @@ new file mode 100644
 +
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern uint64_t phystokv(uint64_t pa);      /* osfmk/arm pmap: the physical aperture */
 +
 +#define TOPCKGEN_PA             0x10000000u
 +#define INFRACFG_PA             0x10001000u
@@ -718,14 +719,19 @@ new file mode 100644
 +	if (off + nwords * 4u > 4096u) {
 +		nwords = (4096u - off) / 4u;
 +	}
-+	vm_offset_t va = ml_io_map((vm_offset_t)(pa & ~0xfffull), 4096u);
-+	if (va == 0u) {
-+		return false;
++	/*
++	 * Through the kernel's physical aperture: no new mapping. An ml_io_map window over a managed page made
++	 * pmap_assert_free panic when the page was freed (gpu10, at shutdown); ml_io_unmap panicked too (gpu9).
++	 * The lines are cleaned+invalidated first, so the read comes from DRAM (what the GPU wrote).
++	 */
++	uint64_t va = phystokv(pa);
++	for (uint64_t a = va & ~63ull; a < va + (uint64_t)nwords * 4u; a += 64u) {
++		__asm__ volatile ("dc civac, %0" :: "r"(a) : "memory");
 +	}
++	__asm__ volatile ("dsb sy" ::: "memory");
 +	for (uint32_t i = 0; i < nwords; i++) {
-+		out[i] = *(volatile uint32_t *)(va + off + i * 4u);
++		out[i] = *(volatile uint32_t *)(va + i * 4u);
 +	}
-+	/* no ml_io_unmap: it panicked right after the first dump (gpu9); a few leaked 4 KiB windows are harmless */
 +	for (uint32_t i = nwords; i < 32u; i++) {
 +		out[i] = 0xdeadbeefu;
 +	}
@@ -780,6 +786,57 @@ new file mode 100644
 +		if (tiler != 0u) {
 +			mali_dump_mem("tiler", tiler, 16u);
 +		}
++	}
++}
++
++/*
++ * 20 Nov 2026: the vertex side of the first frames (gpu10: every fragment job had no primitive in any tile, so
++ * nothing was written back). Each slot-1 job chain is walked (Next): header (type, exception status); for an
++ * IDVS (10) or tiler (7) job its tiler pointer, draw descriptors and the first 8 positions the position shader
++ * wrote (draw word 4-5 = Position), as floats in hex. First 8 chains that hold such a job.
++ */
++static uint32_t g_vtx_dumps;
++
++static void
++mali_dump_vertex_chain(uint64_t jc_va)
++{
++	uint64_t job = jc_va;
++	bool counted = false;
++	for (uint32_t n = 0; n < 6u && job != 0u; n++) {
++		uint32_t h[32];
++		if (!mali_peek(job, h, 32u)) {
++			return;
++		}
++		uint32_t type = (h[4] >> 1) & 0x7fu;
++		if (type != 10u && type != 7u && type != 5u) {
++			job = (uint64_t)h[6] | ((uint64_t)h[7] << 32);
++			continue;
++		}
++		if (!counted) {
++			counted = true;
++			g_vtx_dumps++;
++		}
++		uint64_t tiler = (uint64_t)h[18] | ((uint64_t)h[19] << 32);
++		printf("BEGONIA MALI VTX: chain %u job %#llx type %u status %#x first_incomplete %#x tiler %#llx\n",
++		    g_vtx_dumps, (unsigned long long)job, type, h[0], h[1], (unsigned long long)tiler);
++		mali_dump_mem("vjob", job, 32u);
++		if (type == 10u || type == 7u) {
++			uint64_t pos_draw = job + ((type == 10u) ? 256u : 128u);
++			uint32_t d[32];
++			mali_dump_mem("vdraw", job + 128u, 32u);
++			if (type == 10u) {
++				mali_dump_mem("vdraw2", pos_draw, 32u);
++			}
++			if (mali_peek(pos_draw, d, 8u)) {
++				uint64_t pos = (uint64_t)d[4] | ((uint64_t)d[5] << 32);
++				printf("BEGONIA MALI VTX: positions at %#llx\n", (unsigned long long)pos);
++				mali_dump_mem("pos", pos, 32u);
++			}
++			if (tiler != 0u) {
++				mali_dump_mem("vtiler", tiler, 16u);
++			}
++		}
++		job = (uint64_t)h[6] | ((uint64_t)h[7] << 32);
 +	}
 +}
 +
@@ -1248,6 +1305,9 @@ new file mode 100644
 +		if (slot == 0u && g_frag_dumps < 6u) {
 +			g_frag_dumps++;
 +			mali_dump_frag(jc_va);
++		}
++		if (slot == 1u && g_vtx_dumps < 8u) {
++			mali_dump_vertex_chain(jc_va);
 +		}
 +		if (g_slot_done[slot]++ == 0u) {
 +			printf("BEGONIA MALI: first slot %u job done in %u ms (jc %#llx, %u faults so far, step %u mask %#x)\n",
