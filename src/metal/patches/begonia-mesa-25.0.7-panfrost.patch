@@ -897,3 +897,65 @@ index 8b809d4..f4be0f0 100644
     if (host_addr == MAP_FAILED) {
        mesa_loge("mmap(..., size=%zu, prot=%d, flags=0x%x) failed: %s",
                  size, prot, flags, strerror(errno));
+diff --git a/src/compiler/nir/nir_lower_viewport_transform.c b/src/compiler/nir/nir_lower_viewport_transform.c
+--- a/src/compiler/nir/nir_lower_viewport_transform.c
++++ b/src/compiler/nir/nir_lower_viewport_transform.c
+@@ -50,18 +50,39 @@
+ lower_viewport_transform_instr(nir_builder *b, nir_intrinsic_instr *intr,
+                                void *data)
+ {
+-   if (intr->intrinsic != nir_intrinsic_store_deref)
++   unsigned src_idx;
++
++   if (intr->intrinsic == nir_intrinsic_store_deref) {
++      nir_variable *var = nir_intrinsic_get_var(intr, 0);
++      if (var->data.mode != nir_var_shader_out ||
++          var->data.location != VARYING_SLOT_POS)
++         return false;
++      src_idx = 1;
++   } else if (intr->intrinsic == nir_intrinsic_store_output) {
++      /* begonia (Loxy): a frontend that lowers I/O before the driver sees the shader (Chlorophyll's AIR path,
++       * air_metal.c finalize_for_gallium) hands gl_Position over as store_output, which this pass did not know.
++       * Bifrost and Valhall do the viewport transform in the vertex shader (Adreno does it in hardware), so on
++       * Mali every such draw was rasterised in clip units around pixel (0,0) and the screen stayed black.
++       * Only a whole-vec4 store can be transformed; a variable-based shader has no store_output yet when the
++       * driver runs this pass (nir_lower_io comes after), so nothing is transformed twice.
++       */
++      if (nir_intrinsic_io_semantics(intr).location != VARYING_SLOT_POS ||
++          nir_intrinsic_component(intr) != 0 ||
++          (nir_intrinsic_write_mask(intr) & 0xf) != 0xf ||
++          intr->src[0].ssa->num_components != 4)
++         return false;
++      src_idx = 0;
++   } else {
+       return false;
+-
+-   nir_variable *var = nir_intrinsic_get_var(intr, 0);
+-   if (var->data.mode != nir_var_shader_out ||
+-       var->data.location != VARYING_SLOT_POS)
+-      return false;
++   }
+ 
+    b->cursor = nir_before_instr(&intr->instr);
+ 
+    /* Grab the source and viewport */
+-   nir_def *input_point = intr->src[1].ssa;
++   nir_def *input_point = intr->src[src_idx].ssa;
++   const unsigned in_bits = input_point->bit_size;
++   if (in_bits != 32)
++      input_point = nir_f2f32(b, input_point);
+    nir_def *scale = nir_load_viewport_scale(b);
+    nir_def *offset = nir_load_viewport_offset(b);
+ 
+@@ -93,7 +114,10 @@
+                                     nir_channel(b, screen, 2),
+                                     w_recip);
+ 
+-   nir_src_rewrite(&intr->src[1], screen_space);
++   if (in_bits != 32)
++      screen_space = nir_f2fN(b, screen_space, in_bits);
++
++   nir_src_rewrite(&intr->src[src_idx], screen_space);
+    return true;
+ }
+ 

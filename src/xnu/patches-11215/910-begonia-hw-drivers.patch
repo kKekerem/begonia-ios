@@ -2447,7 +2447,7 @@ diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
 new file mode 100644
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMali.cpp
-@@ -0,0 +1,557 @@
+@@ -0,0 +1,601 @@
 +/*
 + * SweetMali: IOKit service and user client for begonia Mali-G76 MC4 (MT6785).
 + */
@@ -2552,6 +2552,7 @@ new file mode 100644
 +	IOReturn createBO(struct sweet_mali_create_bo *r);
 +	IOReturn surfaceBO(struct sweet_mali_surface_bo *r);
 +	IOReturn submitJobs(struct sweet_mali_submit *r);
++	void syncSubmitSurfaces(struct sweet_mali_submit *r, uint32_t cnt, bool after, uint64_t seq, bool fragment);
 +	IOReturn copyIn(uint64_t addr, void *dst, size_t len);
 +
 +public:
@@ -2838,21 +2839,34 @@ new file mode 100644
 +	return kIOReturnSuccess;
 +}
 +
-+IOReturn SweetMaliUserClient::submitJobs(struct sweet_mali_submit *r)
++/*
++ * 22 Nov 2026: CPU caches around a GPU job. Bergamota's driver was written for the Adreno 630, which is IO-coherent
++ * with the CPU; the Mali-G76 of the MT6785 is not. IOSurface memory is CPU-cacheable (CoreAnimation and CoreText draw
++ * layer contents into it with the CPU, SweetFB copies the composited frame out of it with the CPU), so:
++ *  - before a job: clean every surface the job may read to memory (dc cvac), or the GPU samples stale DRAM;
++ *  - after a job: clean+invalidate the surfaces it may have written (dc civac), or CPU readers keep stale lines.
++ * Buffers from createBO are write-combined and need no maintenance beyond the barrier.
++ */
++static void
++mali_cache_range(const uint8_t *va, uint64_t len, bool invalidate)
 +{
-+	if (r->jc == 0u) {
-+		r->jc = begonia_mali_last_seq();
-+		return kIOReturnSuccess;
++	uintptr_t a = (uintptr_t)va & ~(uintptr_t)63u;
++	uintptr_t end = (uintptr_t)va + (uintptr_t)len;
++	if (invalidate) {
++		for (; a < end; a += 64u) {
++			__asm__ volatile ("dc civac, %0" :: "r"(a) : "memory");
++		}
++	} else {
++		for (; a < end; a += 64u) {
++			__asm__ volatile ("dc cvac, %0" :: "r"(a) : "memory");
++		}
 +	}
-+	bool fragment = (r->requirements & SWEET_MALI_JD_REQ_FS) != 0u;
-+	uint64_t seq = begonia_mali_submit(r->jc, fragment);
-+	if (seq == 0u) {
-+		return kIOReturnError;
-+	}
-+	uint32_t cnt = r->bo_handle_count;
-+	if (cnt > MALI_SUBMIT_HANDLES) {
-+		cnt = MALI_SUBMIT_HANDLES;
-+	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++void SweetMaliUserClient::syncSubmitSurfaces(struct sweet_mali_submit *r, uint32_t cnt, bool after, uint64_t seq,
++    bool fragment)
++{
 +	for (uint32_t off = 0; off < cnt; off += 64u) {
 +		uint32_t handles[64];
 +		uint32_t n = (cnt - off) < 64u ? (cnt - off) : 64u;
@@ -2861,16 +2875,46 @@ new file mode 100644
 +		}
 +		for (uint32_t k = 0; k < n; k++) {
 +			struct mali_gem_slot *b = boSlot(handles[k]);
-+			if (b != NULL) {
-+				b->last_seq = seq;
-+				/* display-sized surfaces only: the compositor's framebuffers (828x1792 here) */
-+				if (fragment && b->surface != NULL && !b->readonly && b->surface->width >= 600u &&
-+				    b->surface->height >= 1200u) {
-+					mali_sample_surface(b, seq);
++			if (b == NULL) {
++				continue;
++			}
++			if (!after) {
++				if (b->surface != NULL && b->kva != NULL && b->size != 0u) {
++					mali_cache_range(b->kva, b->size, false);
 +				}
++				continue;
++			}
++			b->last_seq = seq;
++			if (b->surface != NULL && b->kva != NULL && b->size != 0u && !b->readonly) {
++				mali_cache_range(b->kva, b->size, true);
++			}
++			/* display-sized surfaces only: the compositor's framebuffers (828x1792 here) */
++			if (fragment && b->surface != NULL && !b->readonly && b->surface->width >= 600u &&
++			    b->surface->height >= 1200u) {
++				mali_sample_surface(b, seq);
 +			}
 +		}
 +	}
++}
++
++IOReturn SweetMaliUserClient::submitJobs(struct sweet_mali_submit *r)
++{
++	if (r->jc == 0u) {
++		r->jc = begonia_mali_last_seq();
++		return kIOReturnSuccess;
++	}
++	bool fragment = (r->requirements & SWEET_MALI_JD_REQ_FS) != 0u;
++	uint32_t cnt = r->bo_handle_count;
++	if (cnt > MALI_SUBMIT_HANDLES) {
++		cnt = MALI_SUBMIT_HANDLES;
++	}
++	syncSubmitSurfaces(r, cnt, false, 0u, fragment);
++	__asm__ volatile ("dsb sy" ::: "memory");     /* write-combined descriptor/vertex writes drained before the job */
++	uint64_t seq = begonia_mali_submit(r->jc, fragment);
++	if (seq == 0u) {
++		return kIOReturnError;
++	}
++	syncSubmitSurfaces(r, cnt, true, seq, fragment);
 +	r->jc = seq;
 +	return kIOReturnSuccess;
 +}
