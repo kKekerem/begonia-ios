@@ -1834,10 +1834,9 @@ new file mode 100644
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/begonia_touch.c b/bsd/dev/begonia_touch.c
 new file mode 100644
-index 0000000..f02abae
 --- /dev/null
 +++ b/bsd/dev/begonia_touch.c
-@@ -0,0 +1,393 @@
+@@ -0,0 +1,415 @@
 +/*
 + * Polled MT6785 SPI5 + Novatek NT36672A touchscreen driver for Redmi Note 8 Pro (begonia).
 + * Ports proven mtkloader SPI5 (0x11019000) + NVT (0x21C00) protocol to XNU HID events.
@@ -2086,6 +2085,28 @@ index 0000000..f02abae
 +	return 0;
 +}
 +
++/*
++ * 22 Nov 2026: the 65-byte point buffer in 16-byte reads at their own offsets in the event page. One 67-byte
++ * transfer runs through the SPI5 pause/resume path (32-byte FIFO); on begonia the long transfers fail or come back
++ * as garbage (the mtkloader saw the same: 8..18-byte transfers fine, longer ones not), so iOS got no touches while
++ * the 18-byte FW-info read said the controller was ready.
++ */
++static int
++nvt_read_event_buf(uint8_t *out, uint32_t len)
++{
++	for (uint32_t off = 0; off < len; off += 16u) {
++		uint32_t n = (len - off) < 16u ? (len - off) : 16u;
++		int ok = -1;
++		for (uint32_t tries = 0; tries < 3u && ok != 0; tries++) {
++			ok = nvt_read_reg((uint8_t)off, out + off, n);
++		}
++		if (ok != 0) {
++			return -1;
++		}
++	}
++	return 0;
++}
++
 +static bool
 +nvt_probe_fw(uint8_t *fw_ver, uint16_t *pid)
 +{
@@ -2149,7 +2170,7 @@ index 0000000..f02abae
 +
 +	for (;;) {
 +		uint8_t pts[65];
-+		if (nvt_set_page(NVT_EVENT_BUF_ADDR) == 0 && nvt_read_reg(0x00u, pts, sizeof(pts)) == 0) {
++		if (nvt_set_page(NVT_EVENT_BUF_ADDR) == 0 && nvt_read_event_buf(pts, sizeof(pts)) == 0) {
 +			bool seen[NVT_MAX_SLOTS];
 +			bzero(seen, sizeof(seen));
 +
