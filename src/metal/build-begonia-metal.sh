@@ -163,7 +163,7 @@ cat > "$B/Info.plist" <<'EOP'
   <key>NSPrincipalClass</key><string>CHLDevice</string>
 </dict></plist>
 EOP
-printf "SpringBoard\nbackboardd\n" > "$B/chlorophyll.deny"
+printf "backboardd\n" > "$B/chlorophyll.deny"   # 22 Nov: SpringBoard gets a Metal device too; without one UIKit drew every material opaque
 
 # 5. Build OpenGLES / EAGL / libOSMesa.8.dylib / bgl-launch payload (Panfrost + Softpipe)
 cp -f "$OUT/bgmtl/libdrm.2.dylib" "$DRM_LINK/libdrm.2.dylib"

@@ -404,6 +404,16 @@ void mtkloader_main(uint64_t fdt_pa)
     touch_init(android_img_pa, android_len, &touch);
     con_puts("touch ready=");
     con_dec((uint64_t)touch.ready);
+    /* 22 Nov: why not (touch_nvt.c dbg: 2 no chip id, 3 no firmware in the Android Image, 6 download failed,
+     * 7 uploaded, bit 0 already running); the iOS touch driver needs the firmware this loads */
+    con_puts(" dbg=");
+    con_hex((uint64_t)touch.dbg);
+    con_puts(" fw_uploaded=");
+    con_dec((uint64_t)touch.fw_uploaded);
+    con_puts(" pid=");
+    con_hex((uint64_t)touch.pid);
+    con_puts(" fw_ver=");
+    con_hex((uint64_t)touch.fw_ver);
     con_putc('\n');
 
     int has_xnu = find_payload_window(fdt, &pl_start, &pl_end);
