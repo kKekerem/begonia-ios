@@ -39,6 +39,20 @@ static uint32_t read_le32(const uint8_t *p)
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+/* 22 Nov: SPI5 transfers to the NT36672A fail now and then (plog dbg 0xef0013: a 16-byte FW-info read and an SRAM
+ * write); retry each one instead of giving up, which used to end in a bootloader reset that wiped the firmware
+ * Android had loaded. */
+static int nvt_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
+{
+    for (uint32_t tries = 0; tries < 6u; tries++) {
+        if (spi5_xfer(tx, rx, len) == 0) {
+            return 0;
+        }
+        delay_ms(1u);
+    }
+    return -1;
+}
+
 static int nvt_spi_write(const uint8_t *buf, uint32_t len)
 {
     uint8_t tx[140];
@@ -49,7 +63,7 @@ static int nvt_spi_write(const uint8_t *buf, uint32_t len)
         tx[i] = buf[i];
     }
     tx[0] |= 0x80u;
-    return spi5_xfer(tx, 0, len);
+    return nvt_xfer(tx, 0, len);
 }
 
 static int nvt_spi_read(uint8_t reg_addr, uint8_t *out, uint32_t data_len)
@@ -64,7 +78,7 @@ static int nvt_spi_read(uint8_t reg_addr, uint8_t *out, uint32_t data_len)
         tx[i] = 0u;
     }
     tx[0] = reg_addr & 0x7fu;
-    if (spi5_xfer(tx, rx, total) != 0) {
+    if (nvt_xfer(tx, rx, total) != 0) {
         return -1;
     }
     for (uint32_t i = 0; i < data_len; i++) {
@@ -334,9 +348,13 @@ void touch_init(uintptr_t android_img_pa, uint64_t android_img_len, struct touch
     }
     spi5_hw_init();
 
-    if (nvt_read_fw_info(out)) {
-        out->ready = 1;
-        return;
+    /* firmware already running (Android loaded it before a warm reboot): never reset it on one failed read */
+    for (uint32_t tries = 0; tries < 5u; tries++) {
+        if (nvt_read_fw_info(out)) {
+            out->ready = 1;
+            return;
+        }
+        delay_ms(20u);
     }
 
     int id_ok = nvt_probe_chip_id(out->chip_id);
