@@ -206,8 +206,8 @@ static int nvt_write_sram(const uint8_t *fw, uint32_t sram_addr, uint32_t size, 
         if (n > page_rem) {
             n = page_rem;
         }
-        if (n > 28u) {
-            n = 28u; /* fit 1 addr byte + data inside a single 32-byte SPI5 FIFO transfer */
+        if (n > 16u) {
+            n = 16u; /* 22 Nov: 29-byte writes failed (dbg 0x13) while 8..18-byte transfers work; 17-byte packets */
         }
         if (nvt_set_page(sram_addr + pos) != 0) {
             return -1;
