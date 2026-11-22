@@ -2447,7 +2447,7 @@ diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
 new file mode 100644
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMali.cpp
-@@ -0,0 +1,601 @@
+@@ -0,0 +1,605 @@
 +/*
 + * SweetMali: IOKit service and user client for begonia Mali-G76 MC4 (MT6785).
 + */
@@ -2878,14 +2878,18 @@ new file mode 100644
 +			if (b == NULL) {
 +				continue;
 +			}
++			/* only CPU-cacheable surfaces: wrapped client memory and pool surfaces are mapped write-back; every other
++			 * IOSurface is write-combined (SweetSurface mapCache), where a DC loop over megabytes per job only cost time */
++			bool cached = b->surface != NULL && b->kva != NULL && b->size != 0u &&
++			    (b->surface->wrapped || b->surface->pooled);
 +			if (!after) {
-+				if (b->surface != NULL && b->kva != NULL && b->size != 0u) {
++				if (cached) {
 +					mali_cache_range(b->kva, b->size, false);
 +				}
 +				continue;
 +			}
 +			b->last_seq = seq;
-+			if (b->surface != NULL && b->kva != NULL && b->size != 0u && !b->readonly) {
++			if (cached && !b->readonly) {
 +				mali_cache_range(b->kva, b->size, true);
 +			}
 +			/* display-sized surfaces only: the compositor's framebuffers (828x1792 here) */
