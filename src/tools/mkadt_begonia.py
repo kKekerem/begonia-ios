@@ -270,6 +270,8 @@ def main() -> int:
     ap.add_argument("--cpus", type=int, default=1)
     ap.add_argument("--identity", default="n841ap", choices=sorted(IDENTITIES))
     ap.add_argument("--display-scale", type=int, default=2)
+    ap.add_argument("--points", default=None,
+                    help="UI size in points, WxH (default 414x896); canvas = points x display-scale")
     ap.add_argument("--product-adt", default=None)
     args = ap.parse_args()
 
@@ -281,6 +283,7 @@ def main() -> int:
         cpus_count=args.cpus,
         identity=args.identity,
         display_scale=args.display_scale,
+        points=tuple(int(v) for v in args.points.split("x")) if args.points else (414, 896),
         product_adt_path=args.product_adt,
     )
     blob = adt.serialize(tree)
