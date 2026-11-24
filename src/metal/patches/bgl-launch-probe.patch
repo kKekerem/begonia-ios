@@ -34,7 +34,7 @@ diff --git a/gpu/eagl/launch/bgl-launch.c b/gpu/eagl/launch/bgl-launch.c
 +			dup2(fd, 2);
 +			close(fd);
 +		}
-+		execl("/usr/local/bin/bgmtl_render_probe", "bgmtl_render_probe", (char *)NULL);
++		execl("/usr/local/bin/bgmtl_render_probe", "bgmtl_render_probe", "/usr/local/share/begonia-metal/bg_kernels.metallib", "/usr/local/share/begonia-metal/bg_render.metallib", (char *)NULL);
 +		_exit(127);
 +	}
 +	if (pid < 0)
