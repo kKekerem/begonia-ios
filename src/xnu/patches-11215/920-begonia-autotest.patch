@@ -15,7 +15,7 @@ diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_autotest.c
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,140 @@
 +/*
 + * begonia_autotest.c (Loxy, 19 Nov 2026): unattended iOS test boots on begonia.
 + *
@@ -62,6 +62,7 @@ new file mode 100644
 +	BGMTL_DIR "bgmtl-bb.sync",      /* bit 2: backboardd commits synchronously */
 +	BGMTL_DIR "bgmtl-bb.full",      /* bit 3: backboardd redraws in full (no dirty regions) */
 +	BGMTL_DIR "bgmtl.dumpatt",      /* bit 4: with the trace, attachments dumped to /private/var/tmp/att */
++	BGMTL_DIR "bgmtl.probe",        /* bit 5 (24 Nov): bgl-launch runs bgmtl_render_probe once -> bgmtl-probe.txt */
 +};
 +
 +static void

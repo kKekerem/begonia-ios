@@ -177,7 +177,13 @@ cp -f "$OUT/bgmtl/libdrm.2.dylib" "$DRM_LINK/libdrm.2.dylib"
   cp -f "$WORK/eagl-inj/OpenGLES.framework/OpenGLES" "$OUT/bergamota-gl/OpenGLES.framework/OpenGLES"
   cp -f "$WORK/eagl-inj/libOSMesa.8.dylib" "$OUT/bergamota-gl/libOSMesa.8.dylib"
   cp -f "$OUT/bgmtl/libdrm.2.dylib" "$OUT/bergamota-gl/libdrm.2.dylib"
-  $CC -O2 -Wall -Wextra "$BERGAMOTA_DIR/gpu/eagl/launch/bgl-launch.c" -o "$OUT/bergamota-gl/bgl-launch"
+  # 24 Nov: bgl-launch with the one-shot GPU self-test (patches/bgl-launch-probe.patch)
+  BGL_SRC="$WORK/bgl-launch-src"
+  rm -rf "$BGL_SRC"
+  mkdir -p "$BGL_SRC/gpu/eagl/launch"
+  cp "$BERGAMOTA_DIR/gpu/eagl/launch/bgl-launch.c" "$BGL_SRC/gpu/eagl/launch/"
+  (cd "$BGL_SRC" && git init -q . && git apply "$HERE/patches/bgl-launch-probe.patch")
+  $CC -O2 -Wall -Wextra "$BGL_SRC/gpu/eagl/launch/bgl-launch.c" -o "$OUT/bergamota-gl/bgl-launch"
 )
 install_name_tool -id "@rpath/libOSMesa.8.dylib" "$OUT/bergamota-gl/libOSMesa.8.dylib"
 for rp in $(otool -l "$OUT/bergamota-gl/libOSMesa.8.dylib" | awk '/LC_RPATH/{f=1} f&&/path /{print $2; f=0}'); do
