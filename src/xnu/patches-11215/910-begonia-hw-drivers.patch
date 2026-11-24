@@ -17,7 +17,7 @@ diff --git a/bsd/dev/begonia_drivers.h b/bsd/dev/begonia_drivers.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_drivers.h
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,58 @@
 +/*
 + * Internal driver interfaces for Redmi Note 8 Pro (begonia / MT6785).
 + */
@@ -54,6 +54,7 @@ new file mode 100644
 +void begonia_mali_mmu_flush(void);
 +uint64_t begonia_mali_submit(uint64_t jc_va, bool fragment);
 +bool begonia_mali_wait(uint64_t seq, uint64_t timeout_ns);
++void begonia_mali_note_cache_ns(uint64_t ns);     /* 25 Nov: SweetMali cache sync time, for the GPU stats */
 +void begonia_mali_note_client(int delta);
 +void begonia_mali_note_buffer(uint64_t addr, uint64_t size);
 +
@@ -297,7 +298,7 @@ diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_mali.c
-@@ -0,0 +1,1069 @@
+@@ -0,0 +1,1114 @@
 +/*
 + * ARM Mali-G76 MC4 (r0p0, 0x7211 @ 0x13040000) driver for Redmi Note 8 Pro (begonia / MT6785).
 + */
@@ -505,6 +506,50 @@ new file mode 100644
 +static uint32_t g_slot_done[2], g_slot_max_ms[2];
 +static uint32_t g_job_timeout_ms = MALI_JOB_TIMEOUT_MS, g_req_mhz;
 +static bool g_chain_flag[2];
++/*
++ * 25 Nov 2026: where the frame time goes. The submit below waits for each job, so GPU time is inside Chlorophyll's
++ * "encode" (bgmtl.log perf lines); these are the GPU-side numbers per 10 s window (first 40 windows).
++ */
++static uint64_t g_stat_t0, g_stat_busy_ns[2], g_stat_max_ns[2], g_stat_cache_ns;
++static uint32_t g_stat_jobs[2], g_stat_lines;
++
++void
++begonia_mali_note_cache_ns(uint64_t ns)
++{
++	(void)__atomic_add_fetch(&g_stat_cache_ns, ns, __ATOMIC_RELAXED);
++}
++
++static void
++mali_stat_job(uint32_t slot, uint64_t ns)
++{
++	uint64_t now = mach_absolute_time(), el = 0;
++	g_stat_busy_ns[slot] += ns;
++	g_stat_jobs[slot]++;
++	if (ns > g_stat_max_ns[slot]) {
++		g_stat_max_ns[slot] = ns;
++	}
++	if (g_stat_t0 == 0u) {
++		g_stat_t0 = now;
++		return;
++	}
++	absolutetime_to_nanoseconds(now - g_stat_t0, &el);
++	if (el < 10ull * NSEC_PER_SEC) {
++		return;
++	}
++	if (g_stat_lines < 40u) {
++		uint64_t cache = __atomic_exchange_n(&g_stat_cache_ns, 0u, __ATOMIC_RELAXED);
++		g_stat_lines++;
++		printf("BEGONIA MALI: %llu ms: fragment %u jobs %llu ms busy (max %llu us), vertex/tiler %u jobs %llu ms busy "
++		    "(max %llu us), cache sync %llu ms
++",
++		    el / 1000000ull, g_stat_jobs[0], g_stat_busy_ns[0] / 1000000ull, g_stat_max_ns[0] / 1000ull,
++		    g_stat_jobs[1], g_stat_busy_ns[1] / 1000000ull, g_stat_max_ns[1] / 1000ull, cache / 1000000ull);
++	}
++	g_stat_t0 = now;
++	g_stat_busy_ns[0] = g_stat_busy_ns[1] = 0u;
++	g_stat_max_ns[0] = g_stat_max_ns[1] = 0u;
++	g_stat_jobs[0] = g_stat_jobs[1] = 0u;
++}
 +
 +
 +SYSCTL_UINT(_kern_begonia, OID_AUTO, mali, CTLFLAG_RD | CTLFLAG_LOCKED, &g_stage, 0, "Mali-G76 bringup stage (0..6)");
@@ -1312,6 +1357,7 @@ new file mode 100644
 +	uint64_t ns = 0;
 +	absolutetime_to_nanoseconds(mach_absolute_time() - t_start, &ns);
 +	uint32_t ms = (uint32_t)(ns / 1000000ull);
++	mali_stat_job(slot, ns);
 +	if (irq != done) {
 +		mali_job_fault(slot, jc_va, irq);
 +	} else {
@@ -2551,7 +2597,7 @@ diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
 new file mode 100644
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMali.cpp
-@@ -0,0 +1,605 @@
+@@ -0,0 +1,611 @@
 +/*
 + * SweetMali: IOKit service and user client for begonia Mali-G76 MC4 (MT6785).
 + */
@@ -2568,6 +2614,7 @@ new file mode 100644
 +#include <IOKit/IOSubMemoryDescriptor.h>
 +#include <pexpert/pexpert.h>
 +#include <sys/systm.h>
++#include <kern/clock.h>
 +
 +#include "SweetMaliABI.h"
 +#include "SweetSurface.h"
@@ -3016,13 +3063,18 @@ new file mode 100644
 +	if (cnt > MALI_SUBMIT_HANDLES) {
 +		cnt = MALI_SUBMIT_HANDLES;
 +	}
++	uint64_t t0 = mach_absolute_time(), ns = 0;
 +	syncSubmitSurfaces(r, cnt, false, 0u, fragment);
 +	__asm__ volatile ("dsb sy" ::: "memory");     /* write-combined descriptor/vertex writes drained before the job */
++	uint64_t t1 = mach_absolute_time();
 +	uint64_t seq = begonia_mali_submit(r->jc, fragment);
 +	if (seq == 0u) {
 +		return kIOReturnError;
 +	}
++	uint64_t t2 = mach_absolute_time();
 +	syncSubmitSurfaces(r, cnt, true, seq, fragment);
++	absolutetime_to_nanoseconds((t1 - t0) + (mach_absolute_time() - t2), &ns);
++	begonia_mali_note_cache_ns(ns);
 +	r->jc = seq;
 +	return kIOReturnSuccess;
 +}
