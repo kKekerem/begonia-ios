@@ -196,23 +196,32 @@ static const uint8_t *find_builtin_nvt_fw(uintptr_t img_pa, uint64_t img_len)
     return best;
 }
 
+/*
+ * 25 Nov 2026: 32-byte frames (address byte + 31 data bytes, the whole SPI5 FIFO, no pause/resume) and the page
+ * register written only when a write moves to another 128-byte page (Linux writes 63 KiB after one set_page).
+ */
 static int nvt_write_sram(const uint8_t *fw, uint32_t sram_addr, uint32_t size, uint32_t bin_addr)
 {
-    uint8_t pkt[129];
+    uint8_t pkt[32];
     uint32_t pos = 0;
+    uint32_t page = 0xffffffffu;
     while (pos < size) {
-        uint32_t page_rem = 128u - ((sram_addr + pos) & 0x7fu);
+        uint32_t addr = sram_addr + pos;
+        uint32_t page_rem = 128u - (addr & 0x7fu);
         uint32_t n = size - pos;
         if (n > page_rem) {
             n = page_rem;
         }
-        if (n > 16u) {
-            n = 16u; /* 22 Nov: 29-byte writes failed (dbg 0x13) while 8..18-byte transfers work; 17-byte packets */
+        if (n > 31u) {
+            n = 31u;
         }
-        if (nvt_set_page(sram_addr + pos) != 0) {
-            return -1;
+        if ((addr >> 7) != page) {
+            if (nvt_set_page(addr) != 0) {
+                return -1;
+            }
+            page = addr >> 7;
         }
-        pkt[0] = (uint8_t)((sram_addr + pos) & 0x7fu);
+        pkt[0] = (uint8_t)(addr & 0x7fu);
         for (uint32_t i = 0; i < n; i++) {
             pkt[1u + i] = fw[bin_addr + pos + i];
         }
@@ -393,6 +402,61 @@ void touch_init(uintptr_t android_img_pa, uint64_t android_img_len, struct touch
     } else if ((out->dbg & 0xffU) == 0U) {
         out->dbg |= 0x06U;
     }
+}
+
+/*
+ * 25 Nov 2026: start the touch firmware for iOS, every time. LK resets the TDDI (display RESX) on every boot,
+ * which stops the NT36672A MCU while its SRAM keeps the old firmware and FW-info bytes: the FW-info check said
+ * "running" on warm boots from Android, but no touch reports ever came (iOS polled for minutes, 0 frames). Linux
+ * downloads the firmware after every display reset (nvt_ts_resume -> nvt_update_firmware) and so does this, up
+ * to three times like nvt_download_firmware_hw_crc, then waits for the ReK state like nvt_ts_resume.
+ */
+void touch_boot_fw(uintptr_t android_img_pa, uint64_t android_img_len, struct touch_state *st)
+{
+    const uint8_t *fw;
+    uint32_t tries;
+
+    st->boot_tries = 0;
+    st->boot_state = 0;
+    if (st->fw_uploaded) {
+        st->boot_ok = 1;    /* touch_init loaded it in this boot already */
+        return;
+    }
+    fw = find_builtin_nvt_fw(android_img_pa, android_img_len);
+    if (!fw) {
+        st->dbg = (st->dbg & ~0xffU) | 0x03U;
+        return;
+    }
+    for (tries = 1; tries <= 3u; tries++) {
+        st->boot_tries = tries;
+        st->dbg &= ~0xffffU;
+        if (nvt_download_fw(fw, st) == 0) {
+            break;
+        }
+    }
+    if (tries > 3u) {
+        st->ready = 0;
+        return;
+    }
+    /* wait for RESET_STATE_REK (0xA1) and later, up to 600 ms (nvt_check_fw_reset_state: 50 x 10 ms) */
+    for (uint32_t i = 0; i < 60u; i++) {
+        uint8_t rst_state = 0;
+        if (nvt_set_page(NVT_EVENT_BUF_ADDR) == 0 &&
+            nvt_spi_read(EVENT_MAP_RESET_COMPLETE, &rst_state, 1u) == 0) {
+            st->boot_state = rst_state;
+            if (rst_state >= 0xA1u && rst_state <= 0xAFu) {
+                break;
+            }
+        }
+        delay_ms(10u);
+    }
+    if (nvt_read_fw_info(st)) {
+        st->ready = 1;
+        st->fw_uploaded = 1;
+        st->boot_ok = 1;
+        st->dbg = (st->dbg & ~0xffU) | 0x07U;
+    }
+    (void)nvt_set_page(NVT_EVENT_BUF_ADDR);
 }
 
 void touch_poll(struct touch_state *out)

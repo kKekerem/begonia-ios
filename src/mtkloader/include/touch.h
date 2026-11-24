@@ -16,6 +16,10 @@ struct touch_state {
     uint8_t fw_ver;
     uint8_t chip_id[6];
     uint32_t dbg;
+    /* 25 Nov 2026: touch_boot_fw() (iOS path) */
+    int boot_ok;
+    uint32_t boot_tries;
+    uint8_t boot_state;
 };
 
 /*
@@ -25,6 +29,12 @@ struct touch_state {
  * Never fails hard: sets out->ready = 0 if touch hardware is unavailable.
  */
 void touch_init(uintptr_t android_img_pa, uint64_t android_img_len, struct touch_state *out);
+
+/*
+ * Download and start the NT36672A firmware (from the chained Android Image) right before XNU boots, unless
+ * touch_init already did in this boot. LK's display reset stops the touch MCU on every boot.
+ */
+void touch_boot_fw(uintptr_t android_img_pa, uint64_t android_img_len, struct touch_state *st);
 
 /* Poll current primary finger contact; updates out->down, out->x, out->y. */
 void touch_poll(struct touch_state *out);

@@ -3,6 +3,7 @@
  */
 #include "spi5.h"
 #include "begonia_hw.h"
+#include "console.h"
 
 #define SPI_CMD_ACT                 (1u << 0)
 #define SPI_CMD_RESUME              (1u << 1)
@@ -12,7 +13,11 @@
 #define SPI_CMD_RXMSBF              (1u << 13)
 #define SPI_CMD_FINISH_IE           (1u << 16)
 #define SPI_CMD_PAUSE_IE            (1u << 17)
+#define SPI_STATUS1_REG             0x0020u
 #define SPI_FIFO_BYTES              32u
+
+uint32_t spi5_fail_count;
+uint32_t spi5_last_fail;
 
 void spi5_gpio_set_mode(uint32_t pin, uint32_t mode)
 {
@@ -37,6 +42,33 @@ void spi5_gpio_set_dout(uint32_t pin, int val)
     uint32_t bit = 1u << (pin % 32u);
     uint32_t v = mmio_read32(reg);
     mmio_write32(reg, val ? (v | bit) : (v & ~bit));
+}
+
+static void spi5_delay_us(uint32_t us)
+{
+    uint64_t end = timer_ticks() + (timer_freq() * us + 999999ULL) / 1000000ULL;
+    while (timer_ticks() < end) {
+    }
+}
+
+/*
+ * 25 Nov 2026: SPI5 transfers stalled now and then (about a third of the iOS touch polls; every firmware
+ * download in here died on one of its ~7000 writes even with 6 retries each). SPI_CMD_RST was set and cleared
+ * back to back and the TX FIFO filled right after it, but the reset runs in the 26 MHz SPI clock domain: a pulse
+ * a few bus cycles long is caught late or not at all, TX words written while it is still active are dropped and
+ * the controller (must_tx) then waits for data that never comes, so FINISH is never set. Linux resets only when
+ * CS is deasserted at the end of a message and fills the FIFO much later. The reset is now held and released for
+ * 2 us each (52 SPI clocks), with read-backs so each write has reached SPI5 before the wait starts.
+ */
+static void spi5_reset(void)
+{
+    mmio_write32(MT6785_SPI5_BASE + SPI_CMD_REG, SPI_CMD_RST);
+    (void)mmio_read32(MT6785_SPI5_BASE + SPI_CMD_REG);
+    spi5_delay_us(2u);
+    mmio_write32(MT6785_SPI5_BASE + SPI_CMD_REG, 0u);
+    (void)mmio_read32(MT6785_SPI5_BASE + SPI_CMD_REG);
+    spi5_delay_us(2u);
+    (void)mmio_read32(MT6785_SPI5_BASE + SPI_STATUS0_REG); /* read-clear a stale FINISH/PAUSE */
 }
 
 void spi5_hw_init(void)
@@ -65,23 +97,28 @@ void spi5_hw_init(void)
     spi5_gpio_set_dir(38u, 1);
 
     /* mt6765_compat enhance_timing: 26 MHz / 6 = ~4.33 MHz, pad-select = 0 */
-    mmio_write32(MT6785_SPI5_BASE + SPI_CMD_REG, SPI_CMD_RST);
-    mmio_write32(MT6785_SPI5_BASE + SPI_CMD_REG, 0u);
+    spi5_delay_us(10u);   /* the clock mux and gate writes above settle */
+    spi5_reset();
     mmio_write32(MT6785_SPI5_BASE + SPI_PAD_SEL_REG, 0u);
     mmio_write32(MT6785_SPI5_BASE + SPI_CFG2_REG, ((3u - 1u) << 0) | ((3u - 1u) << 16));
     mmio_write32(MT6785_SPI5_BASE + SPI_CFG0_REG, ((6u - 1u) << 0) | ((6u - 1u) << 16));
     mmio_write32(MT6785_SPI5_BASE + SPI_CFG1_REG, 5u);
+    (void)mmio_read32(MT6785_SPI5_BASE + SPI_CFG1_REG);
 }
 
+/* FINISH (bit 0) or PAUSE (bit 1); 2 ms is ~30x the longest 32-byte transfer at 4.33 MHz */
 static int spi5_wait_status(void)
 {
-    for (uint32_t spin = 0; spin < 250000u; spin++) {
+    uint64_t end = timer_ticks() + timer_freq() / 500ULL;
+    for (;;) {
         uint32_t st = mmio_read32(MT6785_SPI5_BASE + SPI_STATUS0_REG);
         if (st & 3u) {
             return 0;
         }
+        if (timer_ticks() > end) {
+            return -1;
+        }
     }
-    return -1;
 }
 
 int spi5_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
@@ -90,12 +127,13 @@ int spi5_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
         return 0;
     }
 
-    mmio_write32(MT6785_SPI5_BASE + SPI_CMD_REG, SPI_CMD_RST);
-    mmio_write32(MT6785_SPI5_BASE + SPI_CMD_REG, 0u);
-    (void)mmio_read32(MT6785_SPI5_BASE + SPI_STATUS0_REG);
-
     uint32_t base_cmd = SPI_CMD_TXMSBF | SPI_CMD_RXMSBF | SPI_CMD_FINISH_IE | SPI_CMD_PAUSE_IE;
     uint32_t off = 0;
+
+    spi5_reset();
+    /* mode bits first, like Linux (prepare_message), the start bit later in its own write */
+    mmio_write32(MT6785_SPI5_BASE + SPI_CMD_REG, base_cmd);
+    (void)mmio_read32(MT6785_SPI5_BASE + SPI_CMD_REG);
 
     while (off < len) {
         uint32_t chunk = len - off;
@@ -129,8 +167,11 @@ int spi5_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
         mmio_write32(MT6785_SPI5_BASE + SPI_CMD_REG, cmd);
 
         if (spi5_wait_status() != 0) {
-            mmio_write32(MT6785_SPI5_BASE + SPI_CMD_REG, SPI_CMD_RST);
-            mmio_write32(MT6785_SPI5_BASE + SPI_CMD_REG, 0u);
+            spi5_fail_count++;
+            /* [31:24] STATUS1 (bit 0 busy), [23:16] CMD low byte, [15:0] transfer length */
+            spi5_last_fail = ((mmio_read32(MT6785_SPI5_BASE + SPI_STATUS1_REG) & 0xffu) << 24) |
+                             ((cmd & 0xffu) << 16) | (len & 0xffffu);
+            spi5_reset();
             return -1;
         }
 

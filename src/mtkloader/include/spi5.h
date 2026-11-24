@@ -16,4 +16,8 @@ void spi5_hw_init(void);
 /* Execute a single continuous CS-low SPI transfer (multi-chunk PAUSE_EN when len > 32). */
 int spi5_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len);
 
+/* 25 Nov 2026: transfers that timed out, and the last one ([31:24] STATUS1, [23:16] CMD, [15:0] length) */
+extern uint32_t spi5_fail_count;
+extern uint32_t spi5_last_fail;
+
 #endif /* SPI5_H */

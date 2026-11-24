@@ -10,6 +10,7 @@
 #include "inflate.h"
 #include "mmu.h"
 #include "touch.h"
+#include "spi5.h"
 #include "xnu_boot.h"
 
 extern char _start[];
@@ -414,6 +415,10 @@ void mtkloader_main(uint64_t fdt_pa)
     con_hex((uint64_t)touch.pid);
     con_puts(" fw_ver=");
     con_hex((uint64_t)touch.fw_ver);
+    con_puts(" spi_fail=");
+    con_dec((uint64_t)spi5_fail_count);
+    con_puts(" last=");
+    con_hex((uint64_t)spi5_last_fail);
     con_putc('\n');
 
     int has_xnu = find_payload_window(fdt, &pl_start, &pl_end);
@@ -435,6 +440,23 @@ void mtkloader_main(uint64_t fdt_pa)
         }
 
         if (target == BOOT_TARGET_XNU && has_xnu) {
+            /* 25 Nov 2026: LK's display reset stopped the touch MCU; start its firmware for iOS (touch_nvt.c) */
+            touch_boot_fw(android_img_pa, android_len, &touch);
+            con_puts("xnu touch: ok=");
+            con_dec((uint64_t)touch.boot_ok);
+            con_puts(" tries=");
+            con_dec((uint64_t)touch.boot_tries);
+            con_puts(" state=");
+            con_hex((uint64_t)touch.boot_state);
+            con_puts(" dbg=");
+            con_hex((uint64_t)touch.dbg);
+            con_puts(" fw_ver=");
+            con_hex((uint64_t)touch.fw_ver);
+            con_puts(" spi_fail=");
+            con_dec((uint64_t)spi5_fail_count);
+            con_puts(" last=");
+            con_hex((uint64_t)spi5_last_fail);
+            con_putc('\n');
             show_diagnostics(fdt, &touch);
             console_set_fg(0xff3fb950U);
             con_puts("Booting SWEETXNU payload at ");
