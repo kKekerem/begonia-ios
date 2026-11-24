@@ -1836,7 +1836,7 @@ diff --git a/bsd/dev/begonia_touch.c b/bsd/dev/begonia_touch.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_touch.c
-@@ -0,0 +1,415 @@
+@@ -0,0 +1,434 @@
 +/*
 + * Polled MT6785 SPI5 + Novatek NT36672A touchscreen driver for Redmi Note 8 Pro (begonia).
 + * Ports proven mtkloader SPI5 (0x11019000) + NVT (0x21C00) protocol to XNU HID events.
@@ -2155,22 +2155,41 @@ new file mode 100644
 +	bzero(miss, sizeof(miss));
 +
 +	spi5_hw_init();
-+	for (uint32_t t = 0; t < 10u && !ready; t++) {
++	/* 24 Nov: keep probing for 10 minutes (was 1 s, then never again) */
++	for (uint32_t t = 0; t < 6000u && !ready; t++) {
 +		ready = nvt_probe_fw(&fw_ver, &pid);
 +		if (!ready) {
++			if (t == 10u) {
++				printf("BEGONIA TOUCH: NT36672A FW not active in SRAM yet (mtkloader dualboot loads it); still probing\n");
++			}
 +			touch_sleep_ms(100u);
 +		}
 +	}
 +	if (!ready) {
-+		printf("BEGONIA TOUCH: NT36672A FW not active in SRAM (boot via mtkloader dualboot to load FW); waiting paused\n");
++		printf("BEGONIA TOUCH: NT36672A FW never became active in 10 min; touch off\n");
 +		return;
 +	}
 +	printf("BEGONIA TOUCH: NT36672A ready on SPI5 (pid=%#x fw=v%u poll=%ums)\n",
 +	    pid, fw_ver, touch_poll_ms);
 +
++	/* 24 Nov: poll statistics every ~10 s for the first ~6 minutes (touch bring-up) */
++	uint32_t polls = 0, fails = 0, frames = 0, stat_lines = 0;
++	uint8_t last[8] = { 0 };
 +	for (;;) {
 +		uint8_t pts[65];
-+		if (nvt_set_page(NVT_EVENT_BUF_ADDR) == 0 && nvt_read_event_buf(pts, sizeof(pts)) == 0) {
++		if (++polls % 1250u == 0u && stat_lines < 36u) {
++			stat_lines++;
++			printf("BEGONIA TOUCH: polls=%u read_fail=%u frames_with_points=%u last=%02x %02x %02x %02x %02x %02x\n",
++			    polls, fails, frames, last[0], last[1], last[2], last[3], last[4], last[5]);
++		}
++		bool rd = nvt_set_page(NVT_EVENT_BUF_ADDR) == 0 && nvt_read_event_buf(pts, sizeof(pts)) == 0;
++		if (!rd) {
++			fails++;
++		} else if ((pts[0] >> 3) >= 1u && (pts[0] >> 3) <= NVT_MAX_SLOTS) {
++			frames++;
++			memcpy(last, pts, sizeof(last));
++		}
++		if (rd) {
 +			bool seen[NVT_MAX_SLOTS];
 +			bzero(seen, sizeof(seen));
 +
