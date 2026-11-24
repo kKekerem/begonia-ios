@@ -14,7 +14,23 @@ index 67912be..cce7667 100644
  /* for rwa_texture_from_surface: a resource over memory somebody else allocated is a
   * winsys_handle, and the one modifier an IOSurface of this port's kernel can carry is
   * linear (MINISURF has no tiling and no compression at all). */
-@@ -523,30 +528,42 @@
+@@ -496,6 +501,15 @@
+     */
+    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
+             type_size_vec4, nir_lower_io_use_interpolated_input_intrinsics);
++   /*
++    * begonia (Loxy, 24 Nov 2026): gather the shader info here. ir3 works most of it out from the IR, but Panfrost
++    * reads nir->info as a gallium frontend leaves it after nir_shader_gather_info: outputs_written (render targets,
++    * blend), fs.uses_discard (forward pixel kill, early-Z, side effects), fs.needs_quad_helper_invocations
++    * (derivatives at primitive edges), writes_memory and the system values. Nothing on this path gathered it, so
++    * Mali made those decisions on zeros. Done after nir_lower_io, so it sees the store_output/load_input form the
++    * driver gets; the fields the frontend sets by hand (origin, depth layout, binding counts) are not touched.
++    */
++   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+ }
+ 
+ struct rwa_device *
+@@ -523,30 +537,42 @@
     bool software = debug_get_bool_option("RWA_SOFTWARE", false);
     device->software = software;
  
@@ -74,7 +90,7 @@ index 67912be..cce7667 100644
        static const driOptionDescription freedreno_options[] = {
  #include "freedreno/driinfo_freedreno.h"
        };
-@@ -7235,7 +7252,9 @@
+@@ -7235,7 +7261,9 @@
  
  /* Chlorophyll: freedreno's debug flags, present only in a build that links the freedreno driver (the host build runs
   * softpipe). FD_DBG_SYSMEM (bit 9) makes every batch render in sysmem instead of tiling through GMEM. */
@@ -84,7 +100,7 @@ index 67912be..cce7667 100644
  
  int
  rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
-@@ -7577,8 +7596,10 @@
+@@ -7577,8 +7605,10 @@
      * patched from the resource (patch_fb_read_sysmem) is exact. Sticky for the process: such a batch can be flushed
      * by a later call, and a client that fetches at all (CoreAnimation) does so every frame.
      */
@@ -95,7 +111,7 @@ index 67912be..cce7667 100644
  
     fb_bind(device, &fb, draw->color, draw->color_count, draw->depth);
  
-@@ -7587,7 +7608,14 @@
+@@ -7587,7 +7617,14 @@
      * colour cache had not written back yet (the pass's clear colour): Control Center's blur passes came out with one
      * triangle of each quad white (CoreAnimation's Tc3sA2Xhf_Idst after the downsample draw), and which half depended on
      * timing. FRAMEBUFFER: wait for idle, flush CCU colour/depth, flush and invalidate the texture cache. */
