@@ -11,6 +11,27 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/dev/beryllium_wlan.c		standard
  bsd/dev/beryllium_bt_hci.c		standard
  bsd/dev/mem.c				standard
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -1230,6 +1230,17 @@
+ void
+ vcputc_options(char c, __unused bool poll)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * begonia 940: once the GUI presents (sweetfb_noconsole=1) nothing but a panic draws here. Without a serial
++	 * port kprintf falls back to console_write_unbuffered -> _cnputc, which skips the mute in _cnputs: its
++	 * characters and the text cursor reached the framebuffer (the white mark at the bottom centre).
++	 */
++	extern int sweet_console_muted;
++	if (sweet_console_muted && !panic_active()) {
++		return;
++	}
++#endif
+ 	if (gc_initialized && gc_enabled) {
+ 		VCPUTC_LOCK_LOCK();
+ 		if (gc_enabled) {
 diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
 --- a/bsd/dev/begonia_autotest.c
 +++ b/bsd/dev/begonia_autotest.c
@@ -296,6 +317,15 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  	} else if (strcmp(line, "fb") == 0) {
  		usb_fb_start(2u);
  	} else if (strncmp(line, "fb ", 3) == 0) {
+@@ -1079,7 +1308,7 @@ usb_cmd(char *line)
+ 		usb.reboot_at = mach_absolute_time() + delta;
+ 		printf("BEGONIA USB: reboot in 2 s\n");
+ 	} else if (strncmp(line, "peek ", 5) == 0 && parse_hex(line + 5, &pa) && (pa & 3u) == 0 &&
+-	    pa >= 0x10000000u && pa < 0x14000000u) {
++	    pa >= 0x10000000u && pa < 0x14040000u) {     /* 940: and the display engine (0x1400xxxx..0x1403xxxx) */
+ 		uint32_t page = pa & ~0xfffu;
+ 		if (usb.peek_va == 0 || usb.peek_page != page) {
+ 			usb.peek_va = ml_io_map(page, 0x1000);
 @@ -1153,6 +1382,8 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  				usb_tx_poll();
  			}
