@@ -33,7 +33,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_usb.c
-@@ -0,0 +1,1068 @@
+@@ -0,0 +1,1173 @@
 +/*
 + * begonia_usb.c (Loxy, 25 Nov 2026): USB device port for iOS on begonia (Redmi Note 8 Pro, MT6785).
 + *
@@ -905,30 +905,130 @@ new file mode 100644
 +	}
 +}
 +
-+/* ---- data: console out, commands in ---- */
++/* ---- data: console out (and framebuffer dumps), commands in ---- */
 +
++/*
++ * "fb [1|2|4]": one picture of the panel framebuffer (the boot framebuffer SweetFB copies every frame into, at
++ * 0x7e384000 outside XNU's DRAM window, so an ml_io_map window is fine) goes out in place of the console:
++ * 8-byte magic 00 ff 'B' 'G' 'F' 'B' ff 00, u32 width, u32 height, u32 bytes, u32 scale (little endian), then
++ * width x height BGRA pixels, every scale-th pixel of every scale-th row. usbcon.py turns it into a PNG.
++ */
++static struct {
++	vm_offset_t     va;
++	uint64_t        pa;
++	uint32_t        stride, scale, ow, oh, x, y;
++	bool            active, header;
++} fb;
++
++static void
++put_le32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++	p[2] = (uint8_t)(v >> 16);
++	p[3] = (uint8_t)(v >> 24);
++}
++
++static void
++usb_fb_start(uint32_t scale)
++{
++	PE_Video video;
++
++	if (fb.active) {
++		return;
++	}
++	bzero(&video, sizeof(video));
++	if (PE_current_console(&video) != 0 || video.v_baseAddr == 0 || video.v_width == 0 || video.v_height == 0 ||
++	    video.v_rowBytes < video.v_width * 4u) {
++		printf("BEGONIA USB: no framebuffer\n");
++		return;
++	}
++	if (fb.va == 0) {
++		fb.pa = (uint64_t)video.v_baseAddr;
++		fb.va = ml_io_map((vm_offset_t)video.v_baseAddr,
++		    (vm_size_t)(((uint64_t)video.v_rowBytes * video.v_height + 0x3fffu) & ~(uint64_t)0x3fffu));
++		if (fb.va == 0) {
++			printf("BEGONIA USB: framebuffer map failed\n");
++			return;
++		}
++	}
++	fb.stride = (uint32_t)video.v_rowBytes;
++	fb.scale = (scale == 1u || scale == 4u) ? scale : 2u;
++	fb.ow = (uint32_t)video.v_width / fb.scale;
++	fb.oh = (uint32_t)video.v_height / fb.scale;
++	fb.x = 0;
++	fb.y = 0;
++	fb.header = false;
++	printf("BEGONIA USB: framebuffer %lux%lu stride %u at %#llx -> %ux%u (1/%u), %u bytes\n",
++	    (unsigned long)video.v_width, (unsigned long)video.v_height, fb.stride, fb.pa, fb.ow, fb.oh, fb.scale,
++	    fb.ow * fb.oh * 4u);
++	fb.active = true;
++}
++
++static uint32_t
++usb_fb_fill(uint8_t *pkt)
++{
++	static const uint8_t magic[8] = { 0x00, 0xff, 'B', 'G', 'F', 'B', 0xff, 0x00 };
++	uint32_t n = 0;
++
++	if (!fb.header) {
++		memcpy(pkt, magic, sizeof(magic));
++		put_le32(pkt + 8, fb.ow);
++		put_le32(pkt + 12, fb.oh);
++		put_le32(pkt + 16, fb.ow * fb.oh * 4u);
++		put_le32(pkt + 20, fb.scale);
++		n = 24;
++		fb.header = true;
++	}
++	while (n + 4u <= BULK_MAXP && fb.y < fb.oh) {
++		uint32_t px = *(volatile uint32_t *)(fb.va + (vm_offset_t)fb.y * fb.scale * fb.stride +
++		    (vm_offset_t)fb.x * fb.scale * 4u);
++		put_le32(pkt + n, px);
++		n += 4u;
++		if (++fb.x == fb.ow) {
++			fb.x = 0;
++			fb.y++;
++		}
++	}
++	if (fb.y >= fb.oh) {
++		fb.active = false;
++	}
++	return n;
++}
++
++/* up to 32 packets per poll: the next one goes as soon as the host has taken the last (<= 25 us wait) */
 +static void
 +usb_tx_poll(void)
 +{
 +	static uint8_t pkt[BULK_MAXP];
-+	uint32_t csr = usb_rd(U3D_TXCSR0(1));
 +
-+	if (csr & TX_TXPKTRDY) {
-+		return;                                 /* the last packet has not gone out yet */
-+	}
-+	uint32_t n = sweet_log_copy(&usb.log_pos, (char *)pkt, BULK_MAXP);
-+	if (n == 0) {
-+		if (usb.tx_last_full) {                 /* zero-length packet: the host completes its read now */
-+			usb.tx_last_full = false;
-+			usb_wr(U3D_TXCSR0(1), (csr & ~TX_W1C) | TX_TXPKTRDY);
++	for (unsigned burst = 0; burst < 32u; burst++) {
++		uint32_t csr = usb_rd(U3D_TXCSR0(1));
++		if (csr & TX_TXPKTRDY) {
++			unsigned spin = 0;
++			while (spin < 25u && (usb_rd(U3D_TXCSR0(1)) & TX_TXPKTRDY)) {
++				delay(1);
++				spin++;
++			}
++			if (spin == 25u) {
++				return;                         /* the host is not reading right now */
++			}
++			csr = usb_rd(U3D_TXCSR0(1));
 +		}
-+		return;
++		uint32_t n = fb.active ? usb_fb_fill(pkt) : sweet_log_copy(&usb.log_pos, (char *)pkt, BULK_MAXP);
++		if (n == 0) {
++			if (usb.tx_last_full) {         /* zero-length packet: the host completes its read now */
++				usb.tx_last_full = false;
++				usb_wr(U3D_TXCSR0(1), (csr & ~TX_W1C) | TX_TXPKTRDY);
++			}
++			return;
++		}
++		fifo_write(1, pkt, n);
++		usb_wr(U3D_TXCSR0(1), (csr & ~TX_W1C) | TX_TXPKTRDY);
++		usb.tx_last_full = n == BULK_MAXP;
++		usb.tx_pkts++;
++		usb.tx_bytes += n;
 +	}
-+	fifo_write(1, pkt, n);
-+	usb_wr(U3D_TXCSR0(1), (csr & ~TX_W1C) | TX_TXPKTRDY);
-+	usb.tx_last_full = n == BULK_MAXP;
-+	usb.tx_pkts++;
-+	usb.tx_bytes += n;
 +}
 +
 +static void
@@ -979,7 +1079,12 @@ new file mode 100644
 +	printf("BEGONIA USB: command \"%s\"\n", line);
 +	if (strcmp(line, "help") == 0) {
 +		printf("BEGONIA USB: commands: help | stat | log (send the whole console ring again) | "
-+		    "reboot (restart; the picker then starts Android) | peek <physical address, hex, MMIO 0x10000000-0x13ffffff>\n");
++		    "reboot (restart; the picker then starts Android) | peek <physical address, hex, MMIO 0x10000000-0x13ffffff> | "
++		    "fb [1|2|4] (framebuffer picture, every n-th pixel)\n");
++	} else if (strcmp(line, "fb") == 0) {
++		usb_fb_start(2u);
++	} else if (strncmp(line, "fb ", 3) == 0) {
++		usb_fb_start((uint32_t)(line[3] - '0'));
 +	} else if (strcmp(line, "stat") == 0) {
 +		usb_stat();
 +	} else if (strcmp(line, "log") == 0) {
