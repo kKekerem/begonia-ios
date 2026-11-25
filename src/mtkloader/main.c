@@ -342,6 +342,76 @@ static void chain_android(uintptr_t fdt, uint64_t android_len)
        android_len, BEGONIA_KERNEL_PA, tail_zero);
 }
 
+/*
+ * 25 Nov 2026: the loader's "xnu touch:" plog line is overwritten by the next (Android) boot before anyone can
+ * read it, so the result also goes into the XNU boot-args (launchd prints them into the iOS log):
+ * begoniatouchfw=<ok>.<tries>.<state hex>.<dbg hex>.<fw_ver hex>.<spi_fail>
+ */
+static void xnu_args_append(const char *s)
+{
+    unsigned len = 0;
+    while (len < BOOT_REQUEST_ARGS_MAX && g_xnu_extra_args[len]) {
+        len++;
+    }
+    if (len > 0 && len < BOOT_REQUEST_ARGS_MAX) {
+        g_xnu_extra_args[len++] = ' ';
+    }
+    for (; *s && len < BOOT_REQUEST_ARGS_MAX; s++) {
+        g_xnu_extra_args[len++] = *s;
+    }
+    g_xnu_extra_args[len] = '\0';
+}
+
+static char *fmt_hex(char *p, uint64_t v)
+{
+    static const char digits[] = "0123456789abcdef";
+    int shift = 60;
+    while (shift > 0 && ((v >> shift) & 0xfU) == 0U) {
+        shift -= 4;
+    }
+    for (; shift >= 0; shift -= 4) {
+        *p++ = digits[(v >> shift) & 0xfU];
+    }
+    return p;
+}
+
+static char *fmt_dec(char *p, uint64_t v)
+{
+    char tmp[24];
+    int n = 0;
+    do {
+        tmp[n++] = (char)('0' + (v % 10U));
+        v /= 10U;
+    } while (v != 0U && n < (int)sizeof(tmp));
+    while (n > 0) {
+        *p++ = tmp[--n];
+    }
+    return p;
+}
+
+static void touch_result_to_xnu_args(const struct touch_state *t)
+{
+    char buf[96];
+    char *p = buf;
+    const char *key = "begoniatouchfw=";
+    while (*key) {
+        *p++ = *key++;
+    }
+    p = fmt_dec(p, (uint64_t)t->boot_ok);
+    *p++ = '.';
+    p = fmt_dec(p, (uint64_t)t->boot_tries);
+    *p++ = '.';
+    p = fmt_hex(p, (uint64_t)t->boot_state);
+    *p++ = '.';
+    p = fmt_hex(p, (uint64_t)t->dbg);
+    *p++ = '.';
+    p = fmt_hex(p, (uint64_t)t->fw_ver);
+    *p++ = '.';
+    p = fmt_dec(p, (uint64_t)spi5_fail_count);
+    *p = '\0';
+    xnu_args_append(buf);
+}
+
 static void show_diagnostics(uintptr_t fdt, const struct touch_state *touch)
 {
     console_clear(0xff0d1117U);
@@ -457,6 +527,7 @@ void mtkloader_main(uint64_t fdt_pa)
             con_puts(" last=");
             con_hex((uint64_t)spi5_last_fail);
             con_putc('\n');
+            touch_result_to_xnu_args(&touch);
             show_diagnostics(fdt, &touch);
             console_set_fg(0xff3fb950U);
             con_puts("Booting SWEETXNU payload at ");

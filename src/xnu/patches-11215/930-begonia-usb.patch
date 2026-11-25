@@ -1,0 +1,1102 @@
+# begonia: USB device (MT6785 SSUSB, CDC-ACM console). Applied as sweet-z-930 after 920.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -126,6 +126,7 @@
+ bsd/dev/begonia_autotest.c		standard
+ bsd/dev/begonia_plog.c			standard
+ bsd/dev/begonia_reboot.c		standard
++bsd/dev/begonia_usb.c		standard
+ bsd/dev/beryllium_wlan.c		standard
+ bsd/dev/beryllium_bt_hci.c		standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/begonia_keys.c b/bsd/dev/begonia_keys.c
+--- a/bsd/dev/begonia_keys.c
++++ b/bsd/dev/begonia_keys.c
+@@ -199,6 +199,7 @@
+ void begonia_plog_start(void);
+ void begonia_reboot_init(void);
+ void begonia_autotest_init(void);
++void begonia_usb_init(void);
+ 
+ void
+ begonia_platform_hw_init(void)
+@@ -215,5 +216,6 @@
+ 	begonia_touch_init();
+ 	begonia_mali_init();
+ 	begonia_autotest_init();
++	begonia_usb_init();
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/begonia_usb.c
+@@ -0,0 +1,1066 @@
++/*
++ * begonia_usb.c (Loxy, 25 Nov 2026): USB device port for iOS on begonia (Redmi Note 8 Pro, MT6785).
++ *
++ * The USB-C port is wired to the MT6785 SSUSB IP (MediaTek "mtu3": device MAC at 0x11201000, IPPC at
++ * 0x11203e00, T-PHY at 0x11e40000; the board is USB 2.0 only). This driver runs it in device mode at
++ * high speed as one CDC-ACM serial port (IAD composite), which Windows 10/11 (usbser.sys), Linux
++ * (cdc_acm) and macOS bind without extra drivers:
++ *  - phone -> PC: the live kernel console (the sweet log ring, from its oldest byte) once the PC opens
++ *    the port (DTR set);
++ *  - PC -> phone: one-line commands, see usb_cmd() ("help" lists them).
++ * Polled from a kernel thread (1 ms while configured), PIO only: no QMU / DMA, so there is no memory
++ * the controller writes and nothing to keep cache coherent. The controller's level-1 interrupt output
++ * stays masked; the second-level status registers are polled.
++ *
++ * Sources: MediaTek's begonia 4.14 kernel (MiCode Xiaomi_Kernel_OpenSource begonia-r-oss)
++ * drivers/misc/mediatek/mu3d/hal (ssusb_*_c_header.h register map; mu3d_hal_usb_drv.c ssusb_en,
++ * rst_dev, dft_reg, ep_enable, write_fifo / read_fifo) and mu3d/drv/musb_gadget_ep0.c (SET_ADDRESS is
++ * written before SETUPPKTRDY | DATAEND), mu3phy/mt6785/mtk-phy-asic.c (phy_init_soc, usb_phy_recover);
++ * the EP0 state machine follows mainline drivers/usb/mtu3/mtu3_gadget_ep0.c. Clocks: infracfg_ao CG2
++ * bit 1 (INFRACFG_AO_USB_CG) and bit 31 (INFRACFG_AO_SSUSB_XHCI_CG), as the DT's mtu3_0 / usb3_phy
++ * nodes list them. The PHY's 3.3 V supply is MT6359 VUSB (LDO_VUSB_CON0 0x1d08, MON 0x1d0a).
++ *
++ * Boot-arg begoniausb=1 starts it (off by default until it has been seen working on the phone).
++ * Every log line starts with "BEGONIA USB:".
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/reboot.h>
++#include <libkern/libkern.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_board.h"
++#include "begonia_drivers.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void delay(int usec);
++extern void IOSleep(unsigned int milliseconds);
++extern int reboot_kernel(int howto, char *message);
++extern void begonia_wdt_stop_kicking(void);                                     /* begonia_reboot.c */
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);       /* sweet_ufs.c */
++extern uint64_t sweet_log_position(void);
++
++void begonia_usb_init(void);
++
++/* ---- registers ---- */
++
++#define INFRA_PA                0x10001000u
++#define INFRA_CG2_CLR           0x00a8u
++#define INFRA_CG2_STA           0x00acu
++#define INFRA_CG2_USB           (1u << 1)       /* INFRACFG_AO_USB_CG */
++#define INFRA_CG2_SSUSB_XHCI    (1u << 31)      /* INFRACFG_AO_SSUSB_XHCI_CG */
++
++#define SSUSB_PA                0x11200000u     /* + 0x1000 device MAC, + 0x1800 EPCTL, + 0x2400 USB3 MAC, */
++#define SSUSB_SIZE              0x4000u         /* + 0x3400 USB2 CSR, + 0x3e00 IPPC */
++#define PHY_PA                  0x11e40000u
++#define PHY_SIZE                0x1000u
++
++#define MT6359_LDO_VUSB_CON0    0x1d08u         /* bit 0 RG_LDO_VUSB_EN_0 */
++#define MT6359_LDO_VUSB_MON     0x1d0au         /* bit 0 DA_VUSB_B_EN */
++
++#define U3D_LV1IECR             0x100cu
++#define U3D_EPISR               0x1080u
++#define U3D_EPIECR              0x108cu
++#define U3D_DMAIECR             0x109cu
++#define U3D_EP0CSR              0x1100u
++#define U3D_RXCOUNT0            0x1108u
++#define U3D_TXCSR0(n)           (0x1110u + ((n) - 1u) * 0x10u)
++#define U3D_TXCSR1(n)           (0x1114u + ((n) - 1u) * 0x10u)
++#define U3D_TXCSR2(n)           (0x1118u + ((n) - 1u) * 0x10u)
++#define U3D_RXCSR0(n)           (0x1210u + ((n) - 1u) * 0x10u)
++#define U3D_RXCSR1(n)           (0x1214u + ((n) - 1u) * 0x10u)
++#define U3D_RXCSR2(n)           (0x1218u + ((n) - 1u) * 0x10u)
++#define U3D_RXCSR3(n)           (0x121cu + ((n) - 1u) * 0x10u)
++#define U3D_FIFO(n)             (0x1300u + (n) * 0x10u)
++#define U3D_QIECR0              0x170cu
++#define U3D_QIECR1              0x171cu
++#define U3D_QEMIECR             0x174cu
++#define U3D_TQERRIECR0          0x178cu
++#define U3D_RQERRIECR0          0x17ccu
++#define U3D_RQERRIECR1          0x17dcu
++#define U3D_CAP_EP0FFSZ         0x1c04u
++#define U3D_CAP_EPNTXFFSZ       0x1c08u
++#define U3D_CAP_EPNRXFFSZ       0x1c0cu
++#define U3D_CAP_EPINFO          0x1c10u
++#define U3D_MISC_CTRL           0x1c84u
++#define U3D_DEVICE_CONF         0x1800u
++#define U3D_EP_RST              0x1804u
++#define U3D_DEV_LINK_INTR_ENABLE 0x1850u
++#define U3D_DEV_LINK_INTR       0x1854u
++#define U3D_USB3_CONFIG         0x241cu
++#define U3D_POWER_MANAGEMENT    0x3404u
++#define U3D_COMMON_USB_INTR_ENABLE 0x3418u
++#define U3D_COMMON_USB_INTR     0x341cu
++#define U3D_LINK_RESET_INFO     0x3424u
++#define U3D_USB20_TIMING_PARAMETER 0x3440u
++#define IPPC_PW_CTRL0           0x3e00u
++#define IPPC_PW_CTRL2           0x3e08u
++#define IPPC_PW_STS1            0x3e10u
++#define IPPC_PW_STS2            0x3e14u
++#define IPPC_DEV_CAP            0x3e28u
++#define IPPC_U3_CTRL_0P         0x3e30u
++#define IPPC_U2_CTRL_0P         0x3e50u
++#define IPPC_U2_PHY_PLL         0x3e7cu
++#define IPPC_REF_CK_CTRL        0x3e8cu
++#define IPPC_DEV_RST_CTRL       0x3e98u
++#define IPPC_HW_ID              0x3ea0u
++#define IPPC_HW_SUB_ID          0x3ea4u
++
++/* EP0CSR */
++#define EP0_SENDSTALL           (1u << 25)
++#define EP0_FIFOFULL            (1u << 23)
++#define EP0_SENTSTALL           (1u << 22)
++#define EP0_DPHTX               (1u << 20)
++#define EP0_DATAEND             (1u << 19)
++#define EP0_TXPKTRDY            (1u << 18)
++#define EP0_SETUPPKTRDY         (1u << 17)
++#define EP0_RXPKTRDY            (1u << 16)
++#define EP0_MAXPKTSZ            0x3ffu
++#define EP0_W1C                 (EP0_RXPKTRDY | EP0_SETUPPKTRDY | EP0_SENTSTALL)
++/* TXnCSR0 / RXnCSR0 */
++#define TX_AUTOSET              (1u << 30)
++#define TX_DMAREQEN             (1u << 29)
++#define TX_SENTSTALL            (1u << 22)
++#define TX_SENDSTALL            (1u << 21)
++#define TX_TXPKTRDY             (1u << 16)
++#define RX_AUTOCLEAR            (1u << 30)
++#define RX_DMAREQEN             (1u << 29)
++#define RX_SENTSTALL            (1u << 22)
++#define RX_SENDSTALL            (1u << 21)
++#define RX_RXPKTRDY             (1u << 16)
++#define MAXPKTSZ_MASK           0x7ffu
++#define TX_W1C                  (TX_SENTSTALL)
++#define RX_W1C                  (RX_SENTSTALL | RX_RXPKTRDY)
++#define EP_TYPE_BULK            0x00u           /* TXnCSR1 / RXnCSR1 type field (5:4) */
++#define EP_TYPE_INT             0x10u
++#define FIFOSZ_16               4u              /* 2^n bytes */
++#define FIFOSZ_512              9u
++/* DEVICE_CONF */
++#define DEV_ADDR_SHIFT          24
++#define DEV_ADDR_MASK           (0x7fu << 24)
++#define DEV_SPEED_MASK          0x7u            /* 0 inactive, 1 full, 3 high, 4 super */
++/* EP_RST: IN endpoints bit 16 + n, OUT endpoints bit n */
++#define EP_RST_TX(n)            (1u << (16u + (n)))
++#define EP_RST_RX(n)            (1u << (n))
++/* MISC_CTRL */
++#define VBUS_ON                 (1u << 1)
++#define VBUS_FRC_EN             (1u << 0)
++/* DEV_LINK_INTR */
++#define SPEED_CHG_INTR          (1u << 0)
++/* POWER_MANAGEMENT */
++#define PM_LPM_BESL_STALL       (1u << 14)
++#define PM_LPM_BESLD_STALL      (1u << 13)
++#define PM_LPM_HRWE             (1u << 10)
++#define PM_ISO_UPDATE           (1u << 7)
++#define PM_SOFT_CONN            (1u << 6)
++#define PM_HS_ENABLE            (1u << 5)
++#define PM_SUSPENDM_ENABLE      (1u << 0)
++/* COMMON_USB_INTR(_ENABLE) */
++#define CI_DISCONN              (1u << 5)
++#define CI_CONN                 (1u << 4)
++#define CI_RESET                (1u << 2)
++#define CI_RESUME               (1u << 1)
++#define CI_SUSPEND              (1u << 0)
++/* LINK_RESET_INFO */
++#define LRI_WTCHRP_MASK         (0xfu << 16)
++/* IPPC */
++#define IP_SW_RST               (1u << 0)
++#define IP_U2_SLEEP_CNT_MASK    (0xffu << 8)
++#define IP_DEV_PDN              (1u << 0)
++#define STS1_SYS125_RST_B       (1u << 10)
++#define STS1_DEV_RST_B          (1u << 3)
++#define STS1_DEV_BMU_RST_B      (1u << 2)
++#define STS1_DEV_QMU_RST_B      (1u << 1)
++#define STS1_SYSPLL_STABLE      (1u << 0)
++#define STS2_U2_MAC_SYS_RST_B   (1u << 0)
++#define U2P_DIS                 (1u << 0)
++#define U2P_PDN                 (1u << 1)
++#define U2P_HOST_SEL            (1u << 2)
++#define U2P_OTG_SEL             (1u << 7)
++#define U2P_OTG_MAC_AUTO_SEL    (1u << 8)
++#define REF_CK_GATE_ENABLES     0x0fu           /* MAC, PHY, REF, MAC3 (mu3d_hal_ssusb_en) */
++#define DEV_SW_RST              (1u << 0)
++#define U2_PHY_PLL_1US_MASK     0xffu
++#define MAC_SYS_CK_MHZ          63u             /* mu3d_hal_hw.h U3D_MAC_SYS_CK */
++#define MAC_REF_CK_MHZ          26u             /* U3D_MAC_REF_CK */
++
++/* T-PHY: USB 2.0 port registers at + 0x300, USB30 PHYA at + 0xb00 */
++#define PHY_USBPHYACR6          0x318u
++#define PHY_U2PHYACR4           0x320u
++#define PHY_U2PHYDTM0           0x368u
++#define PHY_U2PHYDTM1           0x36cu
++#define PHY_U2PHYDMON1          0x374u
++#define PHY_USB30_PHYA_REG1     0xb04u
++#define PHYA1_VUSB09_ON         (1u << 29)
++#define ACR6_PHY_REV6_MASK      (3u << 30)
++#define ACR6_PHY_REV6_1         (1u << 30)      /* mt_usb_dts_probe: usb20_phy_rev6 = 1 */
++#define ACR6_BC11_SW_EN         (1u << 23)
++#define ACR6_OTG_VBUSCMP_EN     (1u << 20)
++#define ACR6_DISCTH_MASK        (0xfu << 4)
++#define ACR4_DP_100K_MODE       (1u << 18)
++#define ACR4_DM_100K_EN         (1u << 17)
++#define ACR4_DP_100K_EN         (1u << 16)
++#define ACR4_GPIO_CTL           (1u << 9)
++#define ACR4_GPIO_MODE          (1u << 8)
++#define DTM0_FORCE_UART_EN      (1u << 26)
++#define DTM0_FORCE_DATAIN       (1u << 23)
++#define DTM0_FORCE_DM_PULLDOWN  (1u << 21)
++#define DTM0_FORCE_DP_PULLDOWN  (1u << 20)
++#define DTM0_FORCE_XCVRSEL      (1u << 19)
++#define DTM0_FORCE_SUSPENDM     (1u << 18)
++#define DTM0_FORCE_TERMSEL      (1u << 17)
++#define DTM0_RG_DATAIN_MASK     (0xfu << 10)
++#define DTM0_RG_DMPULLDOWN      (1u << 7)
++#define DTM0_RG_DPPULLDOWN      (1u << 6)
++#define DTM0_RG_XCVRSEL_MASK    (3u << 4)
++#define DTM0_RG_TERMSEL         (1u << 2)
++#define DTM1_RG_UART_EN         (1u << 16)
++#define DTM1_FORCE_VBUSVALID    (1u << 13)
++#define DTM1_FORCE_SESSEND      (1u << 12)
++#define DTM1_FORCE_BVALID       (1u << 11)
++#define DTM1_FORCE_AVALID       (1u << 10)
++#define DTM1_FORCE_IDDIG        (1u << 9)
++#define DTM1_RG_VBUSVALID       (1u << 5)
++#define DTM1_RG_SESSEND         (1u << 4)
++#define DTM1_RG_BVALID          (1u << 3)
++#define DTM1_RG_AVALID          (1u << 2)
++#define DTM1_RG_IDDIG           (1u << 1)
++
++/* ---- descriptors: CDC-ACM in an IAD composite; VID 0x1209 / PID 0x0001 = pid.codes test ID ---- */
++
++#define EP0_MAXP                64u
++#define BULK_MAXP               512u
++#define NOTIFY_MAXP             16u
++#define CFG_LEN                 75u
++
++static const uint8_t usb_dev_desc[18] = {
++	18, 1, 0x00, 0x02, 0xef, 0x02, 0x01, EP0_MAXP,
++	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
++};
++static const uint8_t usb_qual_desc[10] = { 10, 6, 0x00, 0x02, 0xef, 0x02, 0x01, EP0_MAXP, 1, 0 };
++static const uint8_t usb_cfg_desc[CFG_LEN] = {
++	9, 2, CFG_LEN, 0, 2, 1, 0, 0x80, 250,           /* 2 interfaces, 500 mA */
++	8, 0x0b, 0, 2, 0x02, 0x02, 0x00, 0,             /* IAD: interfaces 0-1, CDC ACM */
++	9, 4, 0, 0, 1, 0x02, 0x02, 0x00, 0,             /* interface 0: ACM control, 1 endpoint */
++	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
++	5, 0x24, 0x01, 0x00, 1,                         /* call management: data interface 1 */
++	4, 0x24, 0x02, 0x02,                            /* ACM: line coding + control line state */
++	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
++	7, 5, 0x82, 0x03, NOTIFY_MAXP, 0, 9,            /* ep 0x82 interrupt IN (never sent) */
++	9, 4, 1, 0, 2, 0x0a, 0x00, 0x00, 0,             /* interface 1: CDC data, 2 endpoints */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
++};
++static const char *const usb_strings[] = { NULL, "Loxy", "begonia iOS console", "BEGONIA0001" };
++
++/* ---- state ---- */
++
++enum ep0_state { EP0_IDLE, EP0_TX, EP0_TX_END, EP0_RX };
++
++static struct {
++	vm_offset_t     mac, phy, infra;
++	int             chan;
++	enum ep0_state  ep0;
++	uint8_t         setup[8];
++	uint8_t         ep0_buf[256];
++	uint32_t        ep0_len, ep0_off;
++	bool            ep0_zlp;        /* the IN data stage ends with a zero-length packet */
++	uint8_t         ep0_req;        /* class request whose OUT data stage is being received */
++	bool            configured;
++	bool            dtr;
++	bool            log_started;
++	bool            tx_last_full;   /* the last bulk IN packet was 512 bytes: a short one must follow */
++	uint8_t         line_coding[7];
++	uint32_t        speed;
++	uint32_t        tx1_fifo, tx2_fifo, rx1_fifo;
++	uint64_t        log_pos;
++	uint64_t        tx_bytes, rx_bytes, tx_pkts, rx_pkts;
++	uint32_t        resets, setups, stalls, suspends, logged;
++	uint64_t        reboot_at;      /* mach_absolute_time deadline of a requested reboot, 0 = none */
++	char            cmd[128];
++	uint32_t        cmd_len;
++	vm_offset_t     peek_va;
++	uint32_t        peek_page;
++} usb = {
++	.line_coding = { 0x00, 0xc2, 0x01, 0x00, 0, 0, 8 },     /* 115200 8N1 */
++};
++
++static inline uint32_t
++usb_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(usb.mac + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++usb_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(usb.mac + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline void
++usb_set(uint32_t off, uint32_t bits)
++{
++	usb_wr(off, usb_rd(off) | bits);
++}
++
++static inline void
++usb_clr(uint32_t off, uint32_t bits)
++{
++	usb_wr(off, usb_rd(off) & ~bits);
++}
++
++static inline uint32_t
++phy_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(usb.phy + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++phy_rmw(uint32_t off, uint32_t clr, uint32_t set)
++{
++	*(volatile uint32_t *)(usb.phy + off) = (phy_rd(off) & ~clr) | set;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++usb_wait(uint32_t off, uint32_t mask, uint32_t want, unsigned us)
++{
++	for (unsigned i = 0; i < us; i += 10) {
++		if ((usb_rd(off) & mask) == want) {
++			return true;
++		}
++		delay(10);
++	}
++	return (usb_rd(off) & mask) == want;
++}
++
++static void
++usb_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&usb.chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* PIO, as mu3d_hal_write_fifo / read_fifo: 32-bit words, then a 16- and an 8-bit write for the tail */
++static void
++fifo_write(unsigned ep, const uint8_t *p, uint32_t n)
++{
++	vm_offset_t f = usb.mac + U3D_FIFO(ep);
++
++	while (n >= 4) {
++		*(volatile uint32_t *)f = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
++		    ((uint32_t)p[3] << 24);
++		p += 4;
++		n -= 4;
++	}
++	if (n >= 2) {
++		*(volatile uint16_t *)f = (uint16_t)(p[0] | (p[1] << 8));
++		p += 2;
++		n -= 2;
++	}
++	if (n) {
++		*(volatile uint8_t *)f = p[0];
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++fifo_read(unsigned ep, uint8_t *p, uint32_t n)
++{
++	vm_offset_t f = usb.mac + U3D_FIFO(ep);
++
++	while (n > 0) {
++		uint32_t v = *(volatile uint32_t *)f;
++		for (unsigned i = 0; i < 4 && n > 0; i++, n--) {
++			*p++ = (uint8_t)(v >> (8 * i));
++		}
++	}
++}
++
++/* ---- PHY, clocks, controller ---- */
++
++static void
++usb_vusb_on(void)
++{
++	uint32_t con0 = 0, mon = 0;
++	bool ok = begonia_pmic_read(MT6359_LDO_VUSB_CON0, &con0) && begonia_pmic_read(MT6359_LDO_VUSB_MON, &mon);
++
++	printf("BEGONIA USB: VUSB (3.3 V PHY supply) CON0 %#x MON %#x (read %s)\n", con0, mon, ok ? "ok" : "FAILED");
++	if (ok && !(mon & 1u)) {
++		(void)begonia_pmic_write(MT6359_LDO_VUSB_CON0, con0 | 1u);
++		delay(250);
++		(void)begonia_pmic_read(MT6359_LDO_VUSB_MON, &mon);
++		printf("BEGONIA USB: VUSB enabled, MON %#x\n", mon);
++	}
++}
++
++/* phy_init_soc + usb_phy_recover (mtk-phy-asic.c), then device role with VBUS / session forced valid */
++static void
++usb_phy_init(void)
++{
++	printf("BEGONIA USB: PHY before: DTM0 %#x DTM1 %#x ACR4 %#x ACR6 %#x PHYA_REG1 %#x DMON1 %#x\n",
++	    phy_rd(PHY_U2PHYDTM0), phy_rd(PHY_U2PHYDTM1), phy_rd(PHY_U2PHYACR4), phy_rd(PHY_USBPHYACR6),
++	    phy_rd(PHY_USB30_PHYA_REG1), phy_rd(PHY_U2PHYDMON1));
++	phy_rmw(PHY_USB30_PHYA_REG1, 0, PHYA1_VUSB09_ON);
++	/* USB function, not UART / GPIO; BC1.1 path off; DP/DM 100k off; OTG VBUS comparator on */
++	phy_rmw(PHY_U2PHYDTM0, DTM0_FORCE_UART_EN, 0);
++	phy_rmw(PHY_U2PHYDTM1, DTM1_RG_UART_EN, 0);
++	phy_rmw(PHY_U2PHYACR4, ACR4_GPIO_CTL | ACR4_GPIO_MODE | ACR4_DP_100K_EN | ACR4_DM_100K_EN, ACR4_DP_100K_MODE);
++	phy_rmw(PHY_USBPHYACR6, ACR6_BC11_SW_EN, ACR6_OTG_VBUSCMP_EN);
++	/* release forced suspendm: the 480 MHz PLL runs */
++	phy_rmw(PHY_U2PHYDTM0, DTM0_FORCE_SUSPENDM, 0);
++	delay(800);
++	/* release the line states a power-save or the charger detection forced */
++	phy_rmw(PHY_U2PHYDTM0, DTM0_RG_DPPULLDOWN | DTM0_RG_DMPULLDOWN | DTM0_RG_XCVRSEL_MASK | DTM0_RG_TERMSEL |
++	    DTM0_RG_DATAIN_MASK | DTM0_FORCE_DP_PULLDOWN | DTM0_FORCE_DM_PULLDOWN | DTM0_FORCE_XCVRSEL |
++	    DTM0_FORCE_TERMSEL | DTM0_FORCE_DATAIN, 0);
++	delay(800);
++	/* B-device (ID high), VBUS valid, A/B session valid, no session end: all forced */
++	phy_rmw(PHY_U2PHYDTM1, DTM1_RG_SESSEND,
++	    DTM1_FORCE_VBUSVALID | DTM1_FORCE_SESSEND | DTM1_FORCE_AVALID | DTM1_FORCE_BVALID | DTM1_FORCE_IDDIG |
++	    DTM1_RG_VBUSVALID | DTM1_RG_AVALID | DTM1_RG_BVALID | DTM1_RG_IDDIG);
++	phy_rmw(PHY_USBPHYACR6, ACR6_DISCTH_MASK | ACR6_PHY_REV6_MASK, (0xfu << 4) | ACR6_PHY_REV6_1);
++	printf("BEGONIA USB: PHY after: DTM0 %#x DTM1 %#x ACR4 %#x ACR6 %#x PHYA_REG1 %#x DMON1 %#x\n",
++	    phy_rd(PHY_U2PHYDTM0), phy_rd(PHY_U2PHYDTM1), phy_rd(PHY_U2PHYACR4), phy_rd(PHY_USBPHYACR6),
++	    phy_rd(PHY_USB30_PHYA_REG1), phy_rd(PHY_U2PHYDMON1));
++}
++
++static bool
++usb_hw_start(void)
++{
++	volatile uint32_t *cg_clr = (volatile uint32_t *)(usb.infra + INFRA_CG2_CLR);
++	volatile uint32_t *cg_sta = (volatile uint32_t *)(usb.infra + INFRA_CG2_STA);
++	uint32_t sta0 = *cg_sta;
++
++	*cg_clr = INFRA_CG2_USB | INFRA_CG2_SSUSB_XHCI;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(250);
++	uint32_t sta = *cg_sta;
++	printf("BEGONIA USB: infra CG2 %#x -> %#x (USB bit1 / SSUSB_XHCI bit31: 0 = clock on)\n", sta0, sta);
++	if (sta & (INFRA_CG2_USB | INFRA_CG2_SSUSB_XHCI)) {
++		printf("BEGONIA USB: clock gates did not open, controller left alone\n");
++		return false;
++	}
++	usb_vusb_on();
++	usb_phy_init();
++
++	printf("BEGONIA USB: IPPC HW_ID %#x SUB %#x DEV_CAP %#x PW_CTRL0 %#x CTRL2 %#x STS1 %#x STS2 %#x U2 %#x U3 %#x\n",
++	    usb_rd(IPPC_HW_ID), usb_rd(IPPC_HW_SUB_ID), usb_rd(IPPC_DEV_CAP), usb_rd(IPPC_PW_CTRL0),
++	    usb_rd(IPPC_PW_CTRL2), usb_rd(IPPC_PW_STS1), usb_rd(IPPC_PW_STS2), usb_rd(IPPC_U2_CTRL_0P),
++	    usb_rd(IPPC_U3_CTRL_0P));
++
++	/* whole IP (xHCI + device) reset, device powered, U2 port on in device role (mu3d_hal_ssusb_en) */
++	usb_set(IPPC_PW_CTRL0, IP_SW_RST);
++	delay(1);
++	usb_clr(IPPC_PW_CTRL0, IP_SW_RST);
++	usb_clr(IPPC_PW_CTRL2, IP_DEV_PDN);
++	usb_clr(IPPC_U2_CTRL_0P, U2P_DIS | U2P_PDN | U2P_HOST_SEL | U2P_OTG_SEL | U2P_OTG_MAC_AUTO_SEL);
++	usb_set(IPPC_REF_CK_CTRL, REF_CK_GATE_ENABLES);
++	bool clk125 = usb_wait(IPPC_PW_STS1, STS1_SYS125_RST_B, STS1_SYS125_RST_B, 10000);
++	bool clku2 = usb_wait(IPPC_PW_STS2, STS2_U2_MAC_SYS_RST_B, STS2_U2_MAC_SYS_RST_B, 10000);
++
++	/* device MAC reset (mu3d_hal_rst_dev) */
++	usb_wr(IPPC_DEV_RST_CTRL, DEV_SW_RST);
++	usb_wr(IPPC_DEV_RST_CTRL, 0);
++	bool devrst = usb_wait(IPPC_PW_STS1, STS1_DEV_RST_B | STS1_DEV_BMU_RST_B | STS1_DEV_QMU_RST_B,
++	    STS1_DEV_RST_B | STS1_DEV_BMU_RST_B | STS1_DEV_QMU_RST_B, 10000);
++	printf("BEGONIA USB: IP up: sys125 %s, u2 mac %s, device reset %s; STS1 %#x STS2 %#x U2 %#x U3 %#x\n",
++	    clk125 ? "ok" : "NOT ready", clku2 ? "ok" : "NOT ready", devrst ? "done" : "NOT done",
++	    usb_rd(IPPC_PW_STS1), usb_rd(IPPC_PW_STS2), usb_rd(IPPC_U2_CTRL_0P), usb_rd(IPPC_U3_CTRL_0P));
++	if (!clku2 || !devrst) {
++		return false;
++	}
++
++	/* default registers (mu3d_hal_dft_reg): 1 us in sys_ck / ref_ck cycles, U2 sleep count > 600 ns */
++	usb_wr(U3D_USB20_TIMING_PARAMETER, (usb_rd(U3D_USB20_TIMING_PARAMETER) & ~0xffu) | MAC_SYS_CK_MHZ);
++	usb_wr(IPPC_U2_PHY_PLL, (usb_rd(IPPC_U2_PHY_PLL) & ~U2_PHY_PLL_1US_MASK) | MAC_REF_CK_MHZ);
++	usb_wr(IPPC_PW_CTRL0, (usb_rd(IPPC_PW_CTRL0) & ~IP_U2_SLEEP_CNT_MASK) |
++	    (((600u * MAC_REF_CK_MHZ + 999u) / 1000u + 1u) << 8));
++	usb_set(U3D_POWER_MANAGEMENT, PM_LPM_BESL_STALL | PM_LPM_BESLD_STALL | PM_LPM_HRWE);
++	usb_clr(U3D_POWER_MANAGEMENT, PM_ISO_UPDATE);
++	usb_clr(U3D_LINK_RESET_INFO, LRI_WTCHRP_MASK);  /* chirp-K about 0.1 us after the reset (mtu3_csr_init) */
++
++	/* no interrupt to the GIC (polled); the status registers below latch with their enables set */
++	usb_wr(U3D_LV1IECR, ~0u);
++	usb_wr(U3D_EPIECR, ~0u);
++	usb_wr(U3D_DMAIECR, ~0u);
++	usb_wr(U3D_QIECR0, ~0u);
++	usb_wr(U3D_QIECR1, ~0u);
++	usb_wr(U3D_QEMIECR, ~0u);
++	usb_wr(U3D_TQERRIECR0, ~0u);
++	usb_wr(U3D_RQERRIECR0, ~0u);
++	usb_wr(U3D_RQERRIECR1, ~0u);
++	usb_wr(U3D_COMMON_USB_INTR, usb_rd(U3D_COMMON_USB_INTR));
++	usb_wr(U3D_COMMON_USB_INTR_ENABLE, CI_SUSPEND | CI_RESUME | CI_RESET | CI_CONN | CI_DISCONN);
++	usb_wr(U3D_DEV_LINK_INTR, SPEED_CHG_INTR);
++	usb_wr(U3D_DEV_LINK_INTR_ENABLE, SPEED_CHG_INTR);
++
++	/* high speed only, VBUS forced on in the MAC too (mtu3 "force-vbus"), address 0 */
++	usb_wr(U3D_USB3_CONFIG, 0);
++	usb_wr(U3D_MISC_CTRL, VBUS_FRC_EN | VBUS_ON);
++	usb_wr(U3D_DEVICE_CONF, 0);
++	usb_set(U3D_POWER_MANAGEMENT, PM_HS_ENABLE);
++	usb_wr(U3D_EP0CSR, (usb_rd(U3D_EP0CSR) & ~(EP0_W1C | EP0_MAXPKTSZ)) | EP0_MAXP);
++
++	/* endpoint FIFOs: separate TX / RX SRAM on the USB3-capable IP (legacy start addresses 0 / 0) */
++	uint32_t cap = usb_rd(IPPC_DEV_CAP);
++	bool separate = (cap & 0xffu) != 0;
++	usb.tx1_fifo = separate ? 0u : 64u;
++	usb.tx2_fifo = usb.tx1_fifo + BULK_MAXP;
++	usb.rx1_fifo = separate ? 0u : usb.tx2_fifo + 64u;
++	printf("BEGONIA USB: FIFO EP0 %#x TX %#x RX %#x EPINFO %#x, %s FIFOs: tx1 %#x tx2 %#x rx1 %#x\n",
++	    usb_rd(U3D_CAP_EP0FFSZ), usb_rd(U3D_CAP_EPNTXFFSZ), usb_rd(U3D_CAP_EPNRXFFSZ), usb_rd(U3D_CAP_EPINFO),
++	    separate ? "separate" : "shared", usb.tx1_fifo, usb.tx2_fifo, usb.rx1_fifo);
++
++	usb.ep0 = EP0_IDLE;
++	usb_set(U3D_POWER_MANAGEMENT, PM_SOFT_CONN | PM_SUSPENDM_ENABLE);
++	printf("BEGONIA USB: soft connect: POWER_MANAGEMENT %#x MISC_CTRL %#x DEVICE_CONF %#x EP0CSR %#x DTM1 %#x DMON1 %#x\n",
++	    usb_rd(U3D_POWER_MANAGEMENT), usb_rd(U3D_MISC_CTRL), usb_rd(U3D_DEVICE_CONF), usb_rd(U3D_EP0CSR),
++	    phy_rd(PHY_U2PHYDTM1), phy_rd(PHY_U2PHYDMON1));
++	return true;
++}
++
++/* ---- endpoints 1 IN (bulk), 2 IN (interrupt), 1 OUT (bulk) ---- */
++
++static void
++usb_eps_configure(void)
++{
++	uint32_t rst = EP_RST_TX(1) | EP_RST_TX(2) | EP_RST_RX(1);
++
++	usb_set(U3D_EP_RST, rst);
++	usb_clr(U3D_EP_RST, rst);
++	usb_wr(U3D_TXCSR0(1), (usb_rd(U3D_TXCSR0(1)) & ~(TX_W1C | TX_AUTOSET | TX_DMAREQEN | MAXPKTSZ_MASK)) | BULK_MAXP);
++	usb_wr(U3D_TXCSR1(1), EP_TYPE_BULK);
++	usb_wr(U3D_TXCSR2(1), ((usb.tx1_fifo >> 4) & 0x1fffu) | (FIFOSZ_512 << 16));
++	usb_wr(U3D_TXCSR0(2), (usb_rd(U3D_TXCSR0(2)) & ~(TX_W1C | TX_AUTOSET | TX_DMAREQEN | MAXPKTSZ_MASK)) | NOTIFY_MAXP);
++	usb_wr(U3D_TXCSR1(2), EP_TYPE_INT);
++	usb_wr(U3D_TXCSR2(2), ((usb.tx2_fifo >> 4) & 0x1fffu) | (FIFOSZ_16 << 16) | (9u << 24));
++	usb_wr(U3D_RXCSR0(1), (usb_rd(U3D_RXCSR0(1)) & ~(RX_W1C | RX_AUTOCLEAR | RX_DMAREQEN | MAXPKTSZ_MASK)) | BULK_MAXP);
++	usb_wr(U3D_RXCSR1(1), EP_TYPE_BULK);
++	usb_wr(U3D_RXCSR2(1), ((usb.rx1_fifo >> 4) & 0x1fffu) | (FIFOSZ_512 << 16));
++	usb.configured = true;
++	usb.tx_last_full = false;
++	printf("BEGONIA USB: configured: TX1 %#x/%#x/%#x TX2 %#x/%#x/%#x RX1 %#x/%#x/%#x\n",
++	    usb_rd(U3D_TXCSR0(1)), usb_rd(U3D_TXCSR1(1)), usb_rd(U3D_TXCSR2(1)),
++	    usb_rd(U3D_TXCSR0(2)), usb_rd(U3D_TXCSR1(2)), usb_rd(U3D_TXCSR2(2)),
++	    usb_rd(U3D_RXCSR0(1)), usb_rd(U3D_RXCSR1(1)), usb_rd(U3D_RXCSR2(1)));
++}
++
++static void
++usb_eps_unconfigure(void)
++{
++	usb_wr(U3D_TXCSR0(1), usb_rd(U3D_TXCSR0(1)) & ~(TX_W1C | MAXPKTSZ_MASK));
++	usb_wr(U3D_TXCSR0(2), usb_rd(U3D_TXCSR0(2)) & ~(TX_W1C | MAXPKTSZ_MASK));
++	usb_wr(U3D_RXCSR0(1), usb_rd(U3D_RXCSR0(1)) & ~(RX_W1C | MAXPKTSZ_MASK));
++	usb.configured = false;
++	usb.dtr = false;
++}
++
++/* ---- control endpoint ---- */
++
++static void
++ep0_csr(uint32_t set)
++{
++	usb_wr(U3D_EP0CSR, (usb_rd(U3D_EP0CSR) & ~EP0_W1C) | set);
++}
++
++static uint32_t
++usb_string(unsigned idx, uint8_t *out)
++{
++	if (idx == 0) {
++		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;   /* en-US */
++		return 4;
++	}
++	if (idx >= sizeof(usb_strings) / sizeof(usb_strings[0])) {
++		return 0;
++	}
++	uint32_t n = 2;
++	for (const char *s = usb_strings[idx]; *s && n < 126; s++) {
++		out[n++] = (uint8_t)*s;
++		out[n++] = 0;
++	}
++	out[0] = (uint8_t)n;
++	out[1] = 3;
++	return n;
++}
++
++/* one packet of the IN data stage (64 bytes max), then TXPKTRDY */
++static void
++ep0_tx(void)
++{
++	uint32_t left = usb.ep0_len - usb.ep0_off;
++	uint32_t n = left > EP0_MAXP ? EP0_MAXP : left;
++
++	if (n) {
++		fifo_write(0, usb.ep0_buf + usb.ep0_off, n);
++	}
++	usb.ep0_off += n;
++	if (n < EP0_MAXP || (usb.ep0_off == usb.ep0_len && !usb.ep0_zlp)) {
++		usb.ep0 = EP0_TX_END;   /* a short packet (or the exact length asked for) ends the stage */
++	}
++	ep0_csr(EP0_TXPKTRDY);
++}
++
++static void
++ep0_rx(void)
++{
++	uint32_t cnt = usb_rd(U3D_RXCOUNT0) & EP0_MAXPKTSZ;
++	uint8_t junk[EP0_MAXP];
++
++	if (cnt > EP0_MAXP) {
++		cnt = EP0_MAXP;
++	}
++	if (usb.ep0_off + cnt <= sizeof(usb.ep0_buf)) {
++		fifo_read(0, usb.ep0_buf + usb.ep0_off, cnt);
++		usb.ep0_off += cnt;
++	} else {
++		fifo_read(0, junk, cnt);
++	}
++	bool last = cnt < EP0_MAXP || usb.ep0_off >= usb.ep0_len;
++	ep0_csr(EP0_RXPKTRDY | (last ? EP0_DATAEND : 0));
++	if (last) {
++		usb.ep0 = EP0_IDLE;
++		if (usb.ep0_req == 0x20 && usb.ep0_off >= sizeof(usb.line_coding)) {
++			memcpy(usb.line_coding, usb.ep0_buf, sizeof(usb.line_coding));
++		}
++	}
++}
++
++static void
++ep0_setup(void)
++{
++	const uint8_t *s = usb.setup;
++	uint8_t type = s[0], req = s[1];
++	uint16_t value = (uint16_t)(s[2] | (s[3] << 8));
++	uint16_t index = (uint16_t)(s[4] | (s[5] << 8));
++	uint16_t length = (uint16_t)(s[6] | (s[7] << 8));
++	uint8_t *d = usb.ep0_buf;
++	uint32_t n = 0;
++	bool ok = true;
++	bool in = (type & 0x80) != 0;
++
++	usb.setups++;
++	if (usb.logged < 120) {
++		usb.logged++;
++		printf("BEGONIA USB: setup %02x %02x %04x %04x %u\n", type, req, value, index, length);
++	}
++	usb.ep0_req = 0;
++	if ((type & 0x60) == 0x20) {                    /* CDC ACM class requests (interface 0) */
++		switch (req) {
++		case 0x20:                              /* SET_LINE_CODING: 7 bytes OUT */
++			usb.ep0_req = req;
++			break;
++		case 0x21:                              /* GET_LINE_CODING */
++			memcpy(d, usb.line_coding, sizeof(usb.line_coding));
++			n = (uint32_t)sizeof(usb.line_coding);
++			break;
++		case 0x22: {                            /* SET_CONTROL_LINE_STATE: bit 0 DTR */
++			bool dtr = (value & 1u) != 0;
++			if (dtr && !usb.dtr) {
++				if (!usb.log_started) {
++					usb.log_started = true;
++					usb.log_pos = 0;        /* first open: the whole ring, from its oldest byte */
++				}
++				printf("BEGONIA USB: port opened (log at %llu of %llu)\n", usb.log_pos, sweet_log_position());
++			} else if (!dtr && usb.dtr) {
++				printf("BEGONIA USB: port closed\n");
++			}
++			usb.dtr = dtr;
++			break;
++		}
++		case 0x23:                              /* SEND_BREAK */
++			break;
++		default:
++			ok = false;
++			break;
++		}
++	} else if ((type & 0x60) != 0) {
++		ok = false;
++	} else {
++		switch (req) {
++		case 0:                                 /* GET_STATUS */
++			d[0] = 0; d[1] = 0; n = 2;
++			break;
++		case 1:                                 /* CLEAR_FEATURE */
++			if ((type & 0x1f) == 2 && value == 0) { /* ENDPOINT_HALT: reset the endpoint (data toggle) */
++				uint32_t epn = index & 0x0fu;
++				if (epn == 1 || epn == 2) {
++					uint32_t bit = (index & 0x80u) ? EP_RST_TX(epn) : EP_RST_RX(epn);
++					usb_set(U3D_EP_RST, bit);
++					usb_clr(U3D_EP_RST, bit);
++				}
++			}
++			break;
++		case 3:                                 /* SET_FEATURE (remote wakeup, halt): accepted */
++			break;
++		case 5:                                 /* SET_ADDRESS: latched by the controller after the status stage */
++			usb_wr(U3D_DEVICE_CONF, (usb_rd(U3D_DEVICE_CONF) & ~DEV_ADDR_MASK) |
++			    ((uint32_t)(value & 0x7fu) << DEV_ADDR_SHIFT));
++			break;
++		case 6:                                 /* GET_DESCRIPTOR */
++			switch (value >> 8) {
++			case 1: memcpy(d, usb_dev_desc, sizeof(usb_dev_desc)); n = (uint32_t)sizeof(usb_dev_desc); break;
++			case 2: memcpy(d, usb_cfg_desc, sizeof(usb_cfg_desc)); n = (uint32_t)sizeof(usb_cfg_desc); break;
++			case 3: n = usb_string(value & 0xffu, d); ok = n != 0; break;
++			case 6: memcpy(d, usb_qual_desc, sizeof(usb_qual_desc)); n = (uint32_t)sizeof(usb_qual_desc); break;
++			default: ok = false; break;
++			}
++			break;
++		case 8:                                 /* GET_CONFIGURATION */
++			d[0] = usb.configured ? 1 : 0; n = 1;
++			break;
++		case 9:                                 /* SET_CONFIGURATION */
++			if (value == 1) {
++				usb_eps_configure();
++			} else if (value == 0) {
++				usb_eps_unconfigure();
++			} else {
++				ok = false;
++			}
++			break;
++		case 10:                                /* GET_INTERFACE */
++			d[0] = 0; n = 1;
++			break;
++		case 11:                                /* SET_INTERFACE: only alternate setting 0 exists */
++			ok = value == 0;
++			break;
++		default:
++			ok = false;
++			break;
++		}
++	}
++
++	if (!ok) {
++		usb.stalls++;
++		if (length) {
++			ep0_csr(EP0_SETUPPKTRDY | (in ? EP0_DPHTX : 0));
++			ep0_csr(EP0_SENDSTALL);
++		} else {
++			ep0_csr(EP0_SETUPPKTRDY | EP0_SENDSTALL);
++		}
++		usb.ep0 = EP0_IDLE;
++		return;
++	}
++	if (length == 0) {
++		ep0_csr(EP0_SETUPPKTRDY | EP0_DATAEND);
++		usb.ep0 = EP0_IDLE;
++	} else if (in) {
++		usb.ep0_len = n < length ? n : length;
++		usb.ep0_off = 0;
++		usb.ep0_zlp = usb.ep0_len < length && (usb.ep0_len % EP0_MAXP) == 0;
++		usb.ep0 = EP0_TX;
++		ep0_csr(EP0_SETUPPKTRDY | EP0_DPHTX);
++		ep0_tx();
++	} else {
++		usb.ep0_len = length < sizeof(usb.ep0_buf) ? length : (uint32_t)sizeof(usb.ep0_buf);
++		usb.ep0_off = 0;
++		usb.ep0 = EP0_RX;
++		usb_wr(U3D_EP0CSR, (usb_rd(U3D_EP0CSR) & ~(EP0_W1C | EP0_DPHTX)) | EP0_SETUPPKTRDY);
++	}
++}
++
++static void
++ep0_poll(void)
++{
++	uint32_t csr = usb_rd(U3D_EP0CSR);
++
++	if (csr & EP0_SENTSTALL) {
++		usb_wr(U3D_EP0CSR, (csr & ~(EP0_W1C | EP0_SENDSTALL)) | EP0_SENTSTALL);
++		usb.ep0 = EP0_IDLE;
++		csr = usb_rd(U3D_EP0CSR);
++	}
++	if (csr & EP0_SETUPPKTRDY) {                    /* a new SETUP also ends a transfer still in progress */
++		uint32_t cnt = usb_rd(U3D_RXCOUNT0) & EP0_MAXPKTSZ;
++		if (usb_rd(U3D_EPISR) & EPISR_SETUPEND) {
++			usb_wr(U3D_EPISR, EPISR_SETUPEND);
++		}
++		if (cnt != 8) {
++			uint8_t junk[EP0_MAXP];
++			fifo_read(0, junk, cnt > EP0_MAXP ? EP0_MAXP : cnt);
++			printf("BEGONIA USB: SETUP with %u bytes, stalled\n", cnt);
++			ep0_csr(EP0_SETUPPKTRDY | EP0_SENDSTALL);
++			usb.ep0 = EP0_IDLE;
++			return;
++		}
++		fifo_read(0, usb.setup, 8);
++		ep0_setup();
++		return;
++	}
++	switch (usb.ep0) {
++	case EP0_TX:
++		if (!(csr & EP0_TXPKTRDY)) {
++			ep0_tx();
++		}
++		break;
++	case EP0_TX_END:
++		if (!(csr & EP0_TXPKTRDY)) {
++			ep0_csr(EP0_DATAEND);   /* the controller runs the status stage */
++			usb.ep0 = EP0_IDLE;
++		}
++		break;
++	case EP0_RX:
++		if (csr & EP0_RXPKTRDY) {
++			ep0_rx();
++		}
++		break;
++	default:
++		break;
++	}
++}
++
++/* ---- bus events ---- */
++
++static void
++usb_bus_reset(const char *why)
++{
++	usb.resets++;
++	usb_wr(U3D_DEVICE_CONF, usb_rd(U3D_DEVICE_CONF) & ~DEV_ADDR_MASK);
++	if (usb.configured) {
++		usb_eps_unconfigure();
++	}
++	usb.dtr = false;
++	usb.ep0 = EP0_IDLE;
++	if (usb.resets <= 30) {
++		printf("BEGONIA USB: %s #%u\n", why, usb.resets);
++	}
++}
++
++static void
++usb_bus_poll(void)
++{
++	uint32_t ci = usb_rd(U3D_COMMON_USB_INTR);
++	if (ci) {
++		usb_wr(U3D_COMMON_USB_INTR, ci);        /* W1C */
++		if (ci & CI_RESET) {
++			usb_bus_reset("bus reset");
++		}
++		if (ci & CI_DISCONN) {
++			usb_bus_reset("disconnect");
++		}
++		if (ci & CI_CONN) {
++			printf("BEGONIA USB: connect\n");
++		}
++		if (ci & CI_SUSPEND) {
++			if (usb.suspends++ < 10) {
++				printf("BEGONIA USB: suspend\n");
++			}
++		}
++	}
++	if (usb_rd(U3D_DEV_LINK_INTR) & SPEED_CHG_INTR) {
++		usb_wr(U3D_DEV_LINK_INTR, SPEED_CHG_INTR);
++		usb.speed = usb_rd(U3D_DEVICE_CONF) & DEV_SPEED_MASK;
++		usb.ep0 = EP0_IDLE;
++		usb_wr(U3D_EP0CSR, (usb_rd(U3D_EP0CSR) & ~(EP0_W1C | EP0_MAXPKTSZ)) | EP0_MAXP);
++		printf("BEGONIA USB: link speed %u (%s)\n", usb.speed,
++		    usb.speed == 3 ? "high" : usb.speed == 1 ? "full" : usb.speed == 0 ? "inactive" : "other");
++	}
++}
++
++/* ---- data: console out, commands in ---- */
++
++static void
++usb_tx_poll(void)
++{
++	static uint8_t pkt[BULK_MAXP];
++	uint32_t csr = usb_rd(U3D_TXCSR0(1));
++
++	if (csr & TX_TXPKTRDY) {
++		return;                                 /* the last packet has not gone out yet */
++	}
++	uint32_t n = sweet_log_copy(&usb.log_pos, (char *)pkt, BULK_MAXP);
++	if (n == 0) {
++		if (usb.tx_last_full) {                 /* zero-length packet: the host completes its read now */
++			usb.tx_last_full = false;
++			usb_wr(U3D_TXCSR0(1), (csr & ~TX_W1C) | TX_TXPKTRDY);
++		}
++		return;
++	}
++	fifo_write(1, pkt, n);
++	usb_wr(U3D_TXCSR0(1), (csr & ~TX_W1C) | TX_TXPKTRDY);
++	usb.tx_last_full = n == BULK_MAXP;
++	usb.tx_pkts++;
++	usb.tx_bytes += n;
++}
++
++static void
++usb_stat(void)
++{
++	printf("BEGONIA USB: stat speed %u cfg %d dtr %d; tx %llu B in %llu pkts, rx %llu B in %llu pkts; resets %u "
++	    "setups %u stalls %u suspends %u; log %llu / %llu; PM %#x CONF %#x EP0CSR %#x TX1 %#x RX1 %#x\n",
++	    usb.speed, usb.configured, usb.dtr, usb.tx_bytes, usb.tx_pkts, usb.rx_bytes, usb.rx_pkts, usb.resets,
++	    usb.setups, usb.stalls, usb.suspends, usb.log_pos, sweet_log_position(), usb_rd(U3D_POWER_MANAGEMENT),
++	    usb_rd(U3D_DEVICE_CONF), usb_rd(U3D_EP0CSR), usb_rd(U3D_TXCSR0(1)), usb_rd(U3D_RXCSR0(1)));
++}
++
++static bool
++parse_hex(const char *s, uint32_t *out)
++{
++	uint32_t v = 0;
++	int digits = 0;
++
++	if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
++		s += 2;
++	}
++	for (; *s; s++, digits++) {
++		char c = *s;
++		uint32_t d;
++		if (c >= '0' && c <= '9') {
++			d = (uint32_t)(c - '0');
++		} else if (c >= 'a' && c <= 'f') {
++			d = (uint32_t)(c - 'a' + 10);
++		} else if (c >= 'A' && c <= 'F') {
++			d = (uint32_t)(c - 'A' + 10);
++		} else {
++			return false;
++		}
++		if (digits >= 8) {
++			return false;
++		}
++		v = (v << 4) | d;
++	}
++	*out = v;
++	return digits > 0;
++}
++
++static void
++usb_cmd(char *line)
++{
++	uint32_t pa = 0;
++
++	printf("BEGONIA USB: command \"%s\"\n", line);
++	if (strcmp(line, "help") == 0) {
++		printf("BEGONIA USB: commands: help | stat | log (send the whole console ring again) | "
++		    "reboot (restart; the picker then starts Android) | peek <physical address, hex, MMIO 0x10000000-0x13ffffff>\n");
++	} else if (strcmp(line, "stat") == 0) {
++		usb_stat();
++	} else if (strcmp(line, "log") == 0) {
++		usb.log_pos = 0;
++	} else if (strcmp(line, "reboot") == 0) {
++		uint64_t delta;
++		nanoseconds_to_absolutetime(2000ULL * NSEC_PER_MSEC, &delta);
++		usb.reboot_at = mach_absolute_time() + delta;
++		printf("BEGONIA USB: reboot in 2 s\n");
++	} else if (strncmp(line, "peek ", 5) == 0 && parse_hex(line + 5, &pa) && (pa & 3u) == 0 &&
++	    pa >= 0x10000000u && pa < 0x14000000u) {
++		uint32_t page = pa & ~0xfffu;
++		if (usb.peek_va == 0 || usb.peek_page != page) {
++			usb.peek_va = ml_io_map(page, 0x1000);
++			usb.peek_page = page;
++		}
++		if (usb.peek_va != 0) {
++			printf("BEGONIA USB: [%#x] = %#x\n", pa, *(volatile uint32_t *)(usb.peek_va + (pa & 0xfffu)));
++		}
++	} else {
++		printf("BEGONIA USB: unknown command (try help)\n");
++	}
++}
++
++static void
++usb_rx_poll(void)
++{
++	static uint8_t buf[BULK_MAXP];
++	uint32_t csr = usb_rd(U3D_RXCSR0(1));
++
++	if (!(csr & RX_RXPKTRDY)) {
++		return;
++	}
++	uint32_t cnt = (usb_rd(U3D_RXCSR3(1)) >> 16) & MAXPKTSZ_MASK;
++	if (cnt > BULK_MAXP) {
++		cnt = BULK_MAXP;
++	}
++	fifo_read(1, buf, cnt);
++	usb_wr(U3D_RXCSR0(1), (csr & ~RX_W1C) | RX_RXPKTRDY);   /* W1C: the packet is consumed */
++	usb.rx_pkts++;
++	usb.rx_bytes += cnt;
++	for (uint32_t i = 0; i < cnt; i++) {
++		char c = (char)buf[i];
++		if (c == '\r' || c == '\n') {
++			if (usb.cmd_len) {
++				usb.cmd[usb.cmd_len] = '\0';
++				usb_cmd(usb.cmd);
++				usb.cmd_len = 0;
++			}
++		} else if (usb.cmd_len < sizeof(usb.cmd) - 1) {
++			usb.cmd[usb.cmd_len++] = c;
++		}
++	}
++}
++
++static void
++begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint64_t next_stat = 0, stat_gap;
++	uint32_t stats = 0;
++
++	usb.mac = ml_io_map(SSUSB_PA, SSUSB_SIZE);
++	usb.phy = ml_io_map(PHY_PA, PHY_SIZE);
++	usb.infra = ml_io_map(INFRA_PA, 0x1000);
++	if (usb.mac == 0 || usb.phy == 0 || usb.infra == 0) {
++		printf("BEGONIA USB: ml_io_map failed\n");
++		return;
++	}
++	if (!usb_hw_start()) {
++		printf("BEGONIA USB: not started\n");
++		return;
++	}
++	nanoseconds_to_absolutetime(30ULL * NSEC_PER_SEC, &stat_gap);
++	next_stat = mach_absolute_time() + stat_gap;
++	for (;;) {
++		usb_bus_poll();
++		ep0_poll();
++		if (usb.configured) {
++			usb_rx_poll();
++			if (usb.dtr) {
++				usb_tx_poll();
++			}
++		}
++		if (usb.reboot_at != 0 && mach_absolute_time() >= usb.reboot_at) {
++			usb.reboot_at = 0;
++			printf("BEGONIA USB: rebooting\n");
++			begonia_wdt_stop_kicking();     /* begoniawdt guard: a shutdown that hangs ends in a reset */
++			reboot_kernel(RB_AUTOBOOT, (char *)"begoniausb");
++		}
++		if (mach_absolute_time() >= next_stat) {
++			next_stat = mach_absolute_time() + stat_gap;
++			if (stats++ < 20) {
++				usb_stat();
++			}
++		}
++		usb_sleep_ms(usb.configured ? 1u : 4u);
++	}
++}
++
++void
++begonia_usb_init(void)
++{
++	static bool started;
++	uint32_t enabled = 0;
++	thread_t thread;
++
++	if (started || !sweet_board_begonia()) {
++		return;
++	}
++	started = true;
++	(void)PE_parse_boot_argn("begoniausb", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("BEGONIA USB: off (boot-arg begoniausb=1 starts the USB serial console)\n");
++		return;
++	}
++	if (kernel_thread_start(begonia_usb_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("BEGONIA USB: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
