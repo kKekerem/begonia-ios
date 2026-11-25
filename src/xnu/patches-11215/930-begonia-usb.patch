@@ -33,7 +33,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_usb.c
-@@ -0,0 +1,1190 @@
+@@ -0,0 +1,1194 @@
 +/*
 + * begonia_usb.c (Loxy, 25 Nov 2026): USB device port for iOS on begonia (Redmi Note 8 Pro, MT6785).
 + *
@@ -65,6 +65,7 @@ new file mode 100644
 +#include <sys/reboot.h>
 +#include <libkern/libkern.h>
 +#include <kern/clock.h>
++#include <kern/kalloc.h>
 +#include <kern/thread.h>
 +#include <kern/sched_prim.h>
 +#include <machine/machine_routines.h>
@@ -915,15 +916,19 @@ new file mode 100644
 +/* ---- data: console out (and framebuffer dumps), commands in ---- */
 +
 +/*
-+ * "fb [1|2|4]": one picture of the panel framebuffer (the boot framebuffer SweetFB copies every frame into, at
-+ * 0x7e384000 outside XNU's DRAM window, so an ml_io_map window is fine) goes out in place of the console:
-+ * 8-byte magic 00 ff 'B' 'G' 'F' 'B' ff 00, u32 width, u32 height, u32 bytes, u32 scale (little endian), then
-+ * width x height BGRA pixels, every scale-th pixel of every scale-th row. usbcon.py turns it into a PNG.
++ * "fb [1|2|4]": one picture of what the panel shows goes out in place of the console: 8-byte magic
++ * 00 ff 'B' 'G' 'F' 'B' ff 00, u32 width, u32 height, u32 bytes, u32 scale (little endian), then width x height
++ * BGRA pixels, every scale-th pixel of every scale-th row. usbcon.py turns it into a PNG.
++ * v26: an ml_io_map window over the whole 10 MB framebuffer panicked (kmem_alloc ... failed with 3: the I/O map
++ * has no room for it). The copy now comes from SweetFB's own mapping through Bergamota's sweet_fb_shot_copy()
++ * (iokit/Kernel/arm/SweetFramebuffer.cpp, patch 0224: front buffer or zero-copy surface) into kalloc'd memory.
 + */
++extern int sweet_fb_shot_copy(uint8_t *dst, size_t cap, uint32_t scale, uint32_t *ow, uint32_t *oh);
++
 +static struct {
-+	vm_offset_t     va;
-+	uint64_t        pa;
-+	uint32_t        stride, scale, ow, oh, x, y;
++	uint8_t         *buf;
++	size_t          cap;
++	uint32_t        scale, ow, oh, off, bytes;
 +	bool            active, header;
 +} fb;
 +
@@ -939,36 +944,38 @@ new file mode 100644
 +static void
 +usb_fb_start(uint32_t scale)
 +{
-+	PE_Video video;
++	uint32_t ow = 0, oh = 0;
 +
 +	if (fb.active) {
 +		return;
 +	}
-+	bzero(&video, sizeof(video));
-+	if (PE_current_console(&video) != 0 || video.v_baseAddr == 0 || video.v_width == 0 || video.v_height == 0 ||
-+	    video.v_rowBytes < video.v_width * 4u) {
-+		printf("BEGONIA USB: no framebuffer\n");
++	scale = (scale == 1u || scale == 4u) ? scale : 2u;
++	/* room for the panel (1080 x 2340) or the logical surface, at this scale */
++	size_t cap = (size_t)(1080u / scale + 1u) * (size_t)(2400u / scale + 1u) * 4u;
++	if (fb.buf != NULL && fb.cap != cap) {
++		kfree_data(fb.buf, fb.cap);
++		fb.buf = NULL;
++	}
++	if (fb.buf == NULL) {
++		fb.buf = (uint8_t *)kalloc_data(cap, Z_WAITOK);
++		fb.cap = cap;
++	}
++	if (fb.buf == NULL) {
++		printf("BEGONIA USB: no memory for a %lu-byte picture\n", (unsigned long)cap);
 +		return;
 +	}
-+	if (fb.va == 0) {
-+		fb.pa = (uint64_t)video.v_baseAddr;
-+		fb.va = ml_io_map((vm_offset_t)video.v_baseAddr,
-+		    (vm_size_t)(((uint64_t)video.v_rowBytes * video.v_height + 0x3fffu) & ~(uint64_t)0x3fffu));
-+		if (fb.va == 0) {
-+			printf("BEGONIA USB: framebuffer map failed\n");
-+			return;
-+		}
++	int err = sweet_fb_shot_copy(fb.buf, fb.cap, scale, &ow, &oh);
++	if (err != 0 || ow == 0 || oh == 0) {
++		printf("BEGONIA USB: framebuffer copy failed (%d)\n", err);
++		return;
 +	}
-+	fb.stride = (uint32_t)video.v_rowBytes;
-+	fb.scale = (scale == 1u || scale == 4u) ? scale : 2u;
-+	fb.ow = (uint32_t)video.v_width / fb.scale;
-+	fb.oh = (uint32_t)video.v_height / fb.scale;
-+	fb.x = 0;
-+	fb.y = 0;
++	fb.scale = scale;
++	fb.ow = ow;
++	fb.oh = oh;
++	fb.bytes = ow * oh * 4u;
++	fb.off = 0;
 +	fb.header = false;
-+	printf("BEGONIA USB: framebuffer %lux%lu stride %u at %#llx -> %ux%u (1/%u), %u bytes\n",
-+	    (unsigned long)video.v_width, (unsigned long)video.v_height, fb.stride, fb.pa, fb.ow, fb.oh, fb.scale,
-+	    fb.ow * fb.oh * 4u);
++	printf("BEGONIA USB: framebuffer %ux%u (1/%u), %u bytes\n", ow, oh, scale, fb.bytes);
 +	fb.active = true;
 +}
 +
@@ -987,17 +994,14 @@ new file mode 100644
 +		n = 24;
 +		fb.header = true;
 +	}
-+	while (n + 4u <= BULK_MAXP && fb.y < fb.oh) {
-+		uint32_t px = *(volatile uint32_t *)(fb.va + (vm_offset_t)fb.y * fb.scale * fb.stride +
-+		    (vm_offset_t)fb.x * fb.scale * 4u);
-+		put_le32(pkt + n, px);
-+		n += 4u;
-+		if (++fb.x == fb.ow) {
-+			fb.x = 0;
-+			fb.y++;
-+		}
++	uint32_t take = fb.bytes - fb.off;
++	if (take > BULK_MAXP - n) {
++		take = BULK_MAXP - n;
 +	}
-+	if (fb.y >= fb.oh) {
++	memcpy(pkt + n, fb.buf + fb.off, take);
++	n += take;
++	fb.off += take;
++	if (fb.off >= fb.bytes) {
 +		fb.active = false;
 +	}
 +	return n;
