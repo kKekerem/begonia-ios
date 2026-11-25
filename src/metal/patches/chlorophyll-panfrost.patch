@@ -193,13 +193,34 @@ index b3a614e..8d1776f 100644
     struct rwa_compute_info info = { 0 };
     bg_lock();
 diff --git a/test/bg_render.metal b/test/bg_render.metal
-index 4c7d2f6..264a235 100644
+index 4c7d2f6..a0aabf4 100644
 --- a/test/bg_render.metal
 +++ b/test/bg_render.metal
-@@ -45,3 +45,43 @@ fragment float4 bg_fs_tex3(V in [[stage_in]], texture2d<float> t [[texture(3)]],
+@@ -3,6 +3,10 @@
+ #include <metal_stdlib>
+ using namespace metal;
+ 
++#ifndef BG_PROBE_BASIC
++#define BG_PROBE_BASIC 0
++#endif
++
+ struct V { float4 pos [[position]]; float4 color; float2 uv; };
+ 
+ // positions and colours from buffer(0): float4 pos, float4 color per vertex (stride 32)
+@@ -15,6 +19,7 @@ vertex V bg_vs(uint vid [[vertex_id]], device const float4 *data [[buffer(0)]])
+    return v;
+ }
+ 
++#if BG_PROBE_BASIC
+ fragment float4 bg_fs_color(V in [[stage_in]]) { return in.color; }
+ 
+ fragment float4 bg_fs_tex(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]])
+@@ -45,3 +50,45 @@ fragment float4 bg_fs_tex3(V in [[stage_in]], texture2d<float> t [[texture(3)]],
  // a fragment stage with the varyings of CoreAnimation's std_vert0_*: color (float4) and texcoord0_0 (float2)
  struct CAV { float4 pos [[position]]; float4 color; float2 texcoord0_0; };
  fragment float4 bg_fs_ca_color(CAV in [[stage_in]]) { return in.color; }
++
++#endif
 +
 +// Loxy (26 Nov 2026): rounded corners came out square or chamfered. CoreAnimation draws a continuous (superellipse)
 +// corner as a quad whose vertices carry a corner coordinate t (-1..1, its texcoord0A) and computes the coverage per
@@ -241,13 +262,33 @@ index 4c7d2f6..264a235 100644
 +   return float4(cov, d, fw, len);
 +}
 diff --git a/test/bgmtl_render_probe.m b/test/bgmtl_render_probe.m
-index 48ce6a2..8c87fc3 100644
+index 48ce6a2..029383f 100644
 --- a/test/bgmtl_render_probe.m
 +++ b/test/bgmtl_render_probe.m
-@@ -459,6 +459,72 @@ main(int argc, char **argv)
+@@ -12,6 +12,10 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#ifndef BG_PROBE_BASIC
++#define BG_PROBE_BASIC 0
++#endif
++
+ extern id bgmtl_create_device(void);
+ 
+ static int g_pass, g_fail;
+@@ -70,6 +74,7 @@ main(int argc, char **argv)
+       id klib = load_lib(argv[1]), rlib = load_lib(argv[2]);
+       if (!g_dev || !g_queue || !klib || !rlib) return 3;
+ 
++#if BG_PROBE_BASIC   /* P1-P9 passed on 25 Nov (gpu21_probe.txt); left out of the corner build: the installed files have no room */
+       // ---- P1: texture read in a kernel (RGBA32Float 8x8) ----
+       printf("== P1 bg_tex_read\n");
+       {
+@@ -459,6 +464,73 @@ main(int argc, char **argv)
              printf("  %u red (near), %u green (far) of 1024\n", red, green);
           } else { g_fail++; printf("  setup failed (pso=%d dss=%d dt=%d)\n", pso != nil, dss != nil, dt != nil); }
        }
++#endif /* BG_PROBE_BASIC */
 +      // ---- P10/P11 (Loxy, 26 Nov 2026): CoreAnimation's continuous-corner coverage. A 64x64 quad whose corner
 +      // coordinate t runs -1..1 across it (t = clip position), drawn with bg_fs_deriv (t interpolated, fwidth/dfdx) and
 +      // with bg_fs_sup (CoreAnimation's coverage, intermediate values out), RGBA32Float, compared with the CPU ----
