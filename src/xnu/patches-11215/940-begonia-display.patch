@@ -1,0 +1,807 @@
+# begonia: display engine (bsd/dev/begonia_disp.c): the vsync tick on the panel's own frame starts, the backlight through DCS 0x51 with the display power, a per-second rate line; USB console tap/swipe/top/smp/bl; autotest flag bit 6 (Chlorophyll AIR dump). Applied as sweet-z-940 after 935.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -127,6 +127,7 @@
+ bsd/dev/begonia_plog.c			standard
+ bsd/dev/begonia_reboot.c		standard
+ bsd/dev/begonia_usb.c		standard
++bsd/dev/begonia_disp.c		standard
+ bsd/dev/beryllium_wlan.c		standard
+ bsd/dev/beryllium_bt_hci.c		standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
+--- a/bsd/dev/begonia_autotest.c
++++ b/bsd/dev/begonia_autotest.c
+@@ -45,6 +45,7 @@ static const char *const autotest_flag_files[] = {
+ 	BGMTL_DIR "bgmtl-bb.full",      /* bit 3: backboardd redraws in full (no dirty regions) */
+ 	BGMTL_DIR "bgmtl.dumpatt",      /* bit 4: with the trace, attachments dumped to /private/var/tmp/att */
+ 	BGMTL_DIR "bgmtl.probe",        /* bit 5 (24 Nov): bgl-launch runs bgmtl_render_probe once -> bgmtl-probe.txt */
++	BGMTL_DIR "bgmtl.airdump",      /* bit 6 (26 Nov, Loxy 940): every pipeline's AIR modules -> /private/var/tmp/air/<process> */
+ };
+ 
+ static void
+diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
+--- a/bsd/dev/begonia_usb.c
++++ b/bsd/dev/begonia_usb.c
+@@ -44,6 +44,16 @@ extern int reboot_kernel(int howto, char *message);
+ extern void begonia_wdt_stop_kicking(void);                                     /* begonia_reboot.c */
+ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);       /* sweet_ufs.c */
+ extern uint64_t sweet_log_position(void);
++/* 26 Nov 2026 (Loxy 940): console commands that drive and measure the UI without a finger on the glass */
++#include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <mach/task_info.h>
++extern void sweet_hid_touch(int finger, int down, int x, int y);              /* SweetHIDTouch (Bergamota 0058) */
++extern task_t proc_task(proc_t);
++extern kern_return_t task_info(task_t, task_flavor_t, task_info_t, mach_msg_type_number_t *);
++extern void sweet_sample_task(const char *name, int pid, task_t task);        /* osfmk/kern/exception.c (Bergamota 0054) */
++extern int begonia_disp_dcs(uint8_t cmd, int param);                           /* begonia_disp.c */
++extern bool begonia_disp_alive(void);
+ 
+ void begonia_usb_init(void);
+ 
+@@ -1055,16 +1065,224 @@ parse_hex(const char *s, uint32_t *out)
+ 	return digits > 0;
+ }
+ 
++/*
++ * 26 Nov 2026 (Loxy 940): touches without a finger. "tap X Y" and "swipe X0 Y0 X1 Y1 MS" in panel pixels (1080x2340) go
++ * to SweetHIDTouch as finger 0: down, a move every 8 ms along the line, up. One at a time; the poll loop runs them.
++ */
++#define INJ_PANEL_H 2340u
++static struct {
++	bool     active, down;
++	int      x0, y0, x1, y1;
++	uint64_t t0, dur, next, step;
++} inj;
++
++static int
++inj_hid_y(int y)
++{
++	int v = (int)(((uint32_t)(y < 0 ? 0 : y) * 2400u + INJ_PANEL_H / 2u) / INJ_PANEL_H);
++	return v > 2399 ? 2399 : v;
++}
++
++static void
++inj_start(int x0, int y0, int x1, int y1, uint32_t ms)
++{
++	if (inj.active && inj.down) {
++		sweet_hid_touch(0, 0, inj.x1, inj_hid_y(inj.y1));
++	}
++	inj.x0 = x0;
++	inj.y0 = y0;
++	inj.x1 = x1;
++	inj.y1 = y1;
++	nanoseconds_to_absolutetime((uint64_t)(ms < 30u ? 30u : (ms > 5000u ? 5000u : ms)) * NSEC_PER_MSEC, &inj.dur);
++	nanoseconds_to_absolutetime(8ULL * NSEC_PER_MSEC, &inj.step);
++	inj.t0 = mach_absolute_time();
++	inj.next = inj.t0;
++	inj.down = false;
++	inj.active = true;
++}
++
++static void
++inj_poll(void)
++{
++	if (!inj.active) {
++		return;
++	}
++	uint64_t now = mach_absolute_time();
++	if (now < inj.next) {
++		return;
++	}
++	inj.next = now + inj.step;
++	uint64_t el = now - inj.t0;
++	if (el >= inj.dur) {
++		if (inj.down) {
++			sweet_hid_touch(0, 1, inj.x1, inj_hid_y(inj.y1));
++		}
++		sweet_hid_touch(0, 0, inj.x1, inj_hid_y(inj.y1));
++		inj.active = inj.down = false;
++		return;
++	}
++	int x = inj.x0 + (int)(((int64_t)(inj.x1 - inj.x0) * (int64_t)el) / (int64_t)inj.dur);
++	int y = inj.y0 + (int)(((int64_t)(inj.y1 - inj.y0) * (int64_t)el) / (int64_t)inj.dur);
++	sweet_hid_touch(0, 1, x, inj_hid_y(y));
++	inj.down = true;
++}
++
++/*
++ * "top [S]": CPU time of every process over S seconds (default 5; live threads, user + system), the 14 busiest.
++ * "smp NAME": the threads of the processes called NAME with their user backtraces (Bergamota's sampler).
++ */
++#define TOP_MAX 200
++struct top_ent {
++	int      pid;
++	char     name[24];
++	uint64_t us;
++};
++static struct top_ent top_a[TOP_MAX], top_b[TOP_MAX];
++static uint32_t top_na, top_nb;
++static uint64_t top_t0, top_at;
++static struct top_ent *top_fill;
++static uint32_t *top_fill_n;
++static char smp_name[32];
++
++static int
++top_cb(proc_t p, __unused void *arg)
++{
++	if (*top_fill_n >= TOP_MAX) {
++		return PROC_RETURNED;
++	}
++	task_t task = proc_task(p);
++	if (task == TASK_NULL) {
++		return PROC_RETURNED;
++	}
++	struct task_thread_times_info tt;
++	mach_msg_type_number_t cnt = TASK_THREAD_TIMES_INFO_COUNT;
++	if (task_info(task, TASK_THREAD_TIMES_INFO, (task_info_t)&tt, &cnt) != KERN_SUCCESS) {
++		return PROC_RETURNED;
++	}
++	struct top_ent *e = &top_fill[(*top_fill_n)++];
++	e->pid = proc_pid(p);
++	proc_name(e->pid, e->name, sizeof(e->name));
++	e->us = (uint64_t)tt.user_time.seconds * 1000000ull + (uint64_t)tt.user_time.microseconds +
++	    (uint64_t)tt.system_time.seconds * 1000000ull + (uint64_t)tt.system_time.microseconds;
++	return PROC_RETURNED;
++}
++
++static void
++top_snap(struct top_ent *t, uint32_t *n)
++{
++	*n = 0;
++	top_fill = t;
++	top_fill_n = n;
++	proc_iterate(PROC_ALLPROCLIST, top_cb, NULL, NULL, NULL);
++}
++
++static void
++top_poll(void)
++{
++	if (top_at == 0 || mach_absolute_time() < top_at) {
++		return;
++	}
++	top_at = 0;
++	top_snap(top_b, &top_nb);
++	uint64_t wall;
++	absolutetime_to_nanoseconds(mach_absolute_time() - top_t0, &wall);
++	wall /= 1000;
++	if (wall == 0) {
++		wall = 1;
++	}
++	/* delta per process (matched by pid), then the 14 biggest by selection */
++	uint64_t total = 0;
++	for (uint32_t i = 0; i < top_nb; i++) {
++		uint64_t before = 0;
++		for (uint32_t j = 0; j < top_na; j++) {
++			if (top_a[j].pid == top_b[i].pid) {
++				before = top_a[j].us;
++				break;
++			}
++		}
++		top_b[i].us = top_b[i].us > before ? top_b[i].us - before : 0;
++		total += top_b[i].us;
++	}
++	printf("BEGONIA TOP: %llu ms, %u processes, CPU time %llu ms = %llu.%01llu cores busy\n", wall / 1000, top_nb,
++	    total / 1000, total / wall, (total * 10 / wall) % 10);
++	for (uint32_t k = 0; k < 14; k++) {
++		uint32_t best = TOP_MAX;
++		for (uint32_t i = 0; i < top_nb; i++) {
++			if (top_b[i].pid >= 0 && (best == TOP_MAX || top_b[i].us > top_b[best].us)) {
++				best = i;
++			}
++		}
++		if (best == TOP_MAX || top_b[best].us == 0) {
++			break;
++		}
++		printf("BEGONIA TOP:   %-20s %5d  %llu.%01llu%%  (%llu ms)\n", top_b[best].name, top_b[best].pid,
++		    top_b[best].us * 100 / wall, (top_b[best].us * 1000 / wall) % 10, top_b[best].us / 1000);
++		top_b[best].pid = -1;
++	}
++}
++
++static int
++smp_cb(proc_t p, __unused void *arg)
++{
++	char name[32];
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (strcmp(name, smp_name) == 0) {
++		task_t task = proc_task(p);
++		if (task != TASK_NULL) {
++			sweet_sample_task(name, proc_pid(p), task);
++		}
++	}
++	return PROC_RETURNED;
++}
++
++static bool
++parse_ints(const char *s, int *v, int n)
++{
++	for (int i = 0; i < n; i++) {
++		while (*s == ' ') {
++			s++;
++		}
++		if (*s < '0' || *s > '9') {
++			return false;
++		}
++		int x = 0;
++		while (*s >= '0' && *s <= '9') {
++			x = x * 10 + (*s++ - '0');
++		}
++		v[i] = x;
++	}
++	return true;
++}
++
+ static void
+ usb_cmd(char *line)
+ {
+ 	uint32_t pa = 0;
++	int iv[5];
+ 
+ 	printf("BEGONIA USB: command \"%s\"\n", line);
+ 	if (strcmp(line, "help") == 0) {
+ 		printf("BEGONIA USB: commands: help | stat | log (send the whole console ring again) | "
+ 		    "reboot (restart; the picker then starts Android) | peek <physical address, hex, MMIO 0x10000000-0x13ffffff> | "
+-		    "fb [1|2|4] (framebuffer picture, every n-th pixel)\n");
++		    "fb [1|2|4] (framebuffer picture, every n-th pixel) | tap X Y | swipe X0 Y0 X1 Y1 MS | top [S] | smp NAME | "
++		    "bl LEVEL (panel brightness, DCS 0x51)\n");
++	} else if (strncmp(line, "tap ", 4) == 0 && parse_ints(line + 4, iv, 2)) {
++		inj_start(iv[0], iv[1], iv[0], iv[1], 60u);
++	} else if (strncmp(line, "swipe ", 6) == 0 && parse_ints(line + 6, iv, 5)) {
++		inj_start(iv[0], iv[1], iv[2], iv[3], (uint32_t)iv[4]);
++	} else if (strcmp(line, "top") == 0 || (strncmp(line, "top ", 4) == 0 && parse_ints(line + 4, iv, 1))) {
++		uint32_t secs = line[3] == ' ' ? (uint32_t)iv[0] : 5u;
++		uint64_t d;
++		nanoseconds_to_absolutetime((uint64_t)(secs < 1u ? 1u : (secs > 60u ? 60u : secs)) * NSEC_PER_SEC, &d);
++		top_snap(top_a, &top_na);
++		top_t0 = mach_absolute_time();
++		top_at = top_t0 + d;
++	} else if (strncmp(line, "smp ", 4) == 0 && line[4] != '\0') {
++		strlcpy(smp_name, line + 4, sizeof(smp_name));
++		proc_iterate(PROC_ALLPROCLIST, smp_cb, NULL, NULL, NULL);
++	} else if (strncmp(line, "bl ", 3) == 0 && parse_ints(line + 3, iv, 1)) {
++		int r = begonia_disp_dcs(0x51, iv[0] > 255 ? 255 : iv[0]);
++		printf("BEGONIA USB: DCS 0x51 %d -> %d, video %s\n", iv[0], r, begonia_disp_alive() ? "running" : "NOT RUNNING");
+ 	} else if (strcmp(line, "fb") == 0) {
+ 		usb_fb_start(2u);
+ 	} else if (strncmp(line, "fb ", 3) == 0) {
+@@ -1153,6 +1371,8 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+ 				usb_tx_poll();
+ 			}
+ 		}
++		inj_poll();             /* 940: injected touches */
++		top_poll();             /* 940: "top" results */
+ 		if (usb.reboot_at != 0 && mach_absolute_time() >= usb.reboot_at) {
+ 			usb.reboot_at = 0;
+ 			printf("BEGONIA USB: rebooting\n");
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -53,6 +53,12 @@ extern "C" uint32_t sweet_gpu_fence_snapshot(void);     /* bsd/dev/sweet_a630.c
+ extern "C" bool sweet_gpu_blit_window(uint64_t pa, uint64_t size);      /* bsd/dev/sweet_a630.c (0240) */
+ extern "C" uint32_t sweet_gpu_blit(uint64_t src_pa, uint32_t src_pitch, uint64_t dst_pa, uint32_t dst_pitch, uint32_t w, uint32_t h);
+ extern "C" bool sweet_gpu_fence_passed(uint32_t fence);                    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_hud (patch 0213) */
++/* begonia (Loxy 940): bsd/dev/begonia_disp.c, the MT6785 display engine LK left running */
++extern "C" bool begonia_disp_init(uint64_t fb_pa);
++extern "C" uint64_t begonia_disp_next_sof(uint64_t from, int64_t *err_out);
++extern "C" uint64_t begonia_disp_period(void);
++extern "C" int begonia_disp_dcs(uint8_t cmd, int param);
++extern "C" bool begonia_disp_alive(void);
+ 
+ /*
+  * 0228: per-frame trace for frame pacing (sysctl kern.sweet_fb_trace). One record per swap id (ring of 128, index id & 127):
+@@ -392,6 +398,8 @@ public:
+ 		uint64_t emptySwaps, emptyKept;                         /* 0233: swaps with no layer / of those, the ones that kept the frame */
+ 		uint64_t scanCopies, scanCopyAbs, scanCopyMaxAbs;       /* 0235: frames copied to a scan-out buffer, their time */
+ 		uint64_t scanGpuCopies, scanGpuFallbacks;               /* 0240: of those, copied by the GPU / by the CPU after a GPU failure */
++		uint64_t lateAbs, lateMaxAbs, lateN;                    /* begonia 940: vsync ticks after their deadline: total, max, count */
++		int64_t  phaseErrAbs;                                   /* begonia 940: last phase correction of the hardware vsync */
+ 		uint64_t scanGpuSubmitFails, scanGpuLate, scanGpuWaitMaxAbs; /* 0247: blits not submitted / not landed in 1 s; longest wait */
+ 	} fSt, fStPrev;
+ 	/*
+@@ -473,6 +481,17 @@ public:
+ 	vm_offset_t   fBlPwm;           /* begonia MT6785 disp_pwm0 @ 0x1100e000 */
+ 	uint32_t      fBlPwmPeriod;
+ 	bool          begoniaPwmWrite(uint32_t high);
++	/*
++	 * begonia (Loxy 940): fBegoniaVs = the vsync tick runs on the panel's frame starts (bsd/dev/begonia_disp.c line
++	 * counter), fVsLeadAbs before each one, so the copy at the tick stays ahead of the scan (no tearing) and CoreAnimation
++	 * gets 60 even ticks; fVsDeadline = the tick asked for. fBlDcs: the backlight follows the display power through DCS
++	 * 0x51 (boot-arg begoniabl=<level 1..255>, 0 = off), fBlLevel = the level put back at power on.
++	 */
++	bool          fBegonia, fBegoniaVs, fBlDcs;
++	uint64_t      fVsLeadAbs, fVsDeadline;
++	uint32_t      fBlLevel;
++	uint64_t      fRateT;           /* last "rate" log line */
++	void          rearmVsync(IOTimerEventSource *sender, uint32_t nextUS);
+ 	void          blInit(void);
+ 	bool          blStep(int dir);
+ 	bool          blSet(bool on);   /* 0242: the backlight straight to iOS's state (no ramp), retried; false: it did not take */
+@@ -815,6 +834,29 @@ AppleCLCD::start(IOService *provider)
+ 			IOLog("SWEET FB: backlight fade off (sweetfb_blfade=0): black in one step\n");
+ 		}
+ 	}
++	if (sweet_board_begonia()) {
++		/*
++		 * begonia (Loxy 940): the panel's own frame clock for the vsync tick (begoniavsync=0: the free-running 60 Hz
++		 * timer as before), begoniavslead=<us> before each frame start (default 2000), and the backlight through DCS
++		 * 0x51 with the display power (begoniabl=<1..255>; 1 = level 200; default off until it is proven on the panel).
++		 */
++		fBegonia = begonia_disp_init(fPhys);
++		int vs = 1, lead = 2000, bl = 0;
++		PE_parse_boot_argn("begoniavsync", &vs, sizeof(vs));
++		PE_parse_boot_argn("begoniavslead", &lead, sizeof(lead));
++		PE_parse_boot_argn("begoniabl", &bl, sizeof(bl));
++		fBegoniaVs = fBegonia && vs != 0 && begonia_disp_period() != 0;
++		nanoseconds_to_absolutetime((uint64_t)(lead < 0 ? 0 : (lead > 8000 ? 8000 : lead)) * 1000, &fVsLeadAbs);
++		if (fBegonia && bl > 0) {
++			fBlDcs = true;
++			fBlOK = true;
++			fBlPos = SWEET_FB_BL_STEPS;
++			fBlLevel = bl == 1 ? 200u : (bl > 255 ? 255u : (uint32_t)bl);
++		}
++		IOLog("SWEET FB: begonia display: %s, vsync %s (lead %d us), backlight %s (level %u)\n",
++		    fBegonia ? "engine found" : "engine NOT found", fBegoniaVs ? "on the panel's frame starts" : "free-running timer",
++		    lead, fBlDcs ? "DCS 0x51 with the display power" : "untouched (begoniabl=0)", fBlLevel);
++	}
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+@@ -922,6 +964,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	fb->fSt.ticks++;
++	if (fb->fBegoniaVs && fb->fVsDeadline != 0 && now > fb->fVsDeadline) {
++		uint64_t late = now - fb->fVsDeadline;  /* begonia 940: how late the timer ran after the deadline it was given */
++		fb->fSt.lateAbs += late;
++		fb->fSt.lateN++;
++		if (late > fb->fSt.lateMaxAbs) {
++			fb->fSt.lateMaxAbs = late;
++		}
++	}
+ 	/*
+ 	 * 0216: with sweetfb_vsyncalign the notification carries the time of the latest panel vsync that SwapWait saw (the
+ 	 * MDP latch, a real vsync of the panel) projected forward by whole periods, and the timer is re-armed for the next
+@@ -982,11 +1032,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		if (fb->fBlOK && fb->fBlPos != 0 && !fb->fBlOffFailed && !fb->blSet(false)) {
+ 			fb->fBlOffFailed = true;
+ 		}
+-		if ((!fb->fBlOK || fb->fBlOffFailed) && !fb->fBlackDone) {
++		if ((!fb->fBlOK || fb->fBlOffFailed || fb->fBegonia) && !fb->fBlackDone) {
+ 			fb->fBlackDone = true;
+-			fb->blackout();
++			fb->blackout();         /* begonia 940: black as well, whatever the backlight did */
+ 		}
+-		sender->setTimeoutUS(nextUS);
++		fb->rearmVsync(sender, nextUS);
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && fb->gpuGateOpen(mach_absolute_time());
+@@ -1030,6 +1080,30 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	sweet_hold_release(taken);      /* copied: CA may render into them again */
+ 	fb->statsTick(now);
+ 	fb->hudTick(now);
++	fb->rearmVsync(sender, nextUS);
++}
++
++/*
++ * begonia 940: the next tick fVsLeadAbs before the panel's next frame start (begonia_disp_next_sof re-measures the phase
++ * from the line counter each time), at an absolute deadline so the handler's own time never stretches the period. The
++ * frame start is taken at least a quarter frame after now + lead, so a late tick never fires twice for one frame.
++ * Elsewhere (and when the hardware gave no phase): the old relative timer.
++ */
++void
++AppleCLCD::rearmVsync(IOTimerEventSource *sender, uint32_t nextUS)
++{
++	if (fBegoniaVs) {
++		uint64_t now = mach_absolute_time(), per = begonia_disp_period();
++		int64_t err = 0;
++		uint64_t sof = begonia_disp_next_sof(now + fVsLeadAbs + per / 4, &err);
++		if (sof != 0 && sof > fVsLeadAbs) {
++			fSt.phaseErrAbs = err;
++			uint64_t dl = sof - fVsLeadAbs;
++			fVsDeadline = dl;
++			sender->wakeAtTime(*(AbsoluteTime *)&dl);
++			return;
++		}
++	}
+ 	sender->setTimeoutUS(nextUS);
+ }
+ 
+@@ -1190,6 +1264,21 @@ AppleCLCD::statsTick(uint64_t now)
+ 	    c.scanGpuSubmitFails, c.scanGpuLate, sweet_abs_us(c.scanGpuWaitMaxAbs));
+ 	#undef PER_S
+ 	sweet_fb_stats_publish(line);
++	if (fBegonia && (dSwaps != 0 || fRateT == 0 || sweet_abs_us(now - fRateT) >= 10000000)) {
++		/* begonia 940: one short line a second while frames come (IOLog cuts the long one above): rates, copy time, how
++		 * late the vsync timer ran after its deadline, and the last phase correction from the panel's line counter */
++		fRateT = now;
++		uint64_t dLateN = c.lateN - p.lateN;
++		uint64_t lateAvg = dLateN ? sweet_abs_us(c.lateAbs - p.lateAbs) / dLateN : 0;
++		int64_t pe = c.phaseErrAbs;
++		uint64_t peUS = sweet_abs_us((uint64_t)(pe < 0 ? -pe : pe));
++		IOLog("SWEET FB: rate swaps_s=%u.%02u copies_s=%u.%02u coal_s=%u.%02u ticks_s=%u.%02u copy_us=%u.%02u copy_max_us=%llu "
++		    "late_us=%llu late_max_us=%llu phase_err_us=%s%llu\n",
++		    SW_F2(dSwaps * 100000000ull / winUS), SW_F2(dCopy * 100000000ull / winUS), SW_F2(dCoal * 100000000ull / winUS),
++		    SW_F2(dTicks * 100000000ull / winUS), SW_F2(copyAvg), sweet_abs_us(c.copyMaxAbs), lateAvg,
++		    sweet_abs_us(c.lateMaxAbs), pe < 0 ? "-" : "", peUS);
++		fSt.lateMaxAbs = 0;
++	}
+ 	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
+ 		fStLogT = now;
+ 		IOLog("SWEET FB: stats %s", line);
+@@ -2668,6 +2757,25 @@ bool
+ AppleCLCD::blSet(bool on)
+ {
+ 	if (sweet_board_begonia()) {
++		/*
++		 * begonia 940: the panel's brightness register (DCS 0x51) as a video-mode command packet; its PWM output drives
++		 * the LM36273, so 0 is a dark panel. The video stream is checked afterwards (the line counter still moves).
++		 */
++		if (fBlDcs) {
++			uint32_t lvl = on ? fBlLevel : 0u;
++			int r = begonia_disp_dcs(0x51, (int)lvl);
++			bool alive = begonia_disp_alive();
++			static uint32_t told;
++			if (told++ < 40 || r != 0 || !alive) {
++				IOLog("SWEET FB: begonia backlight %s: DCS 0x51 %u -> %d, video %s\n", on ? "on" : "off", lvl, r,
++				    alive ? "running" : "NOT RUNNING");
++			}
++			if (r == 0) {
++				fBlPos = on ? SWEET_FB_BL_STEPS : 0;
++				return true;
++			}
++			return false;
++		}
+ 		uint32_t high = on ? (((uint32_t)(fBlRaw[0] & 0xfffu) * fBlPwmPeriod + 2047u) / 4095u) : 0u;
+ 		if (begoniaPwmWrite(high)) {
+ 			fBlPos = on ? SWEET_FB_BL_STEPS : 0;
+diff --git a/bsd/dev/begonia_disp.c b/bsd/dev/begonia_disp.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/begonia_disp.c
+@@ -0,0 +1,341 @@
++/*
++ * begonia_disp.c (Loxy, 26 Nov 2026): the MT6785 display engine as LK left it, for the SweetFB framebuffer
++ * (iokit/Kernel/arm/SweetFramebuffer.cpp) on begonia (Redmi Note 8 Pro, CSOT NT36672A video-mode panel).
++ *
++ * LK configures OVL0/OVL0_2L -> RDMA0 -> DSI0 in video mode and scans its framebuffer by physical address (M4U off).
++ * The panel refreshes on its own at ~60 Hz; nothing here starts or stops that.
++ *
++ *  - Probe (read only): which OVL layer scans the boot framebuffer, the DSI timing, and how the line counters move
++ *    (RDMA0 OUT_LINE_CNT +0x12c, DSI0 STATE_DBG9 +0x16c), sampled for ~70 ms: frame period and the time of a frame
++ *    start (SOF) in mach absolute time.
++ *  - Phase: begonia_disp_sof() returns the predicted time of the next frame start, re-measured from one line counter
++ *    read (no spinning), so the framebuffer's vsync tick runs on the panel's own clock and copies a frame just before
++ *    the scan reaches it (the copy is ~7x faster than the scan, so it stays ahead of the beam: no tearing).
++ *  - Backlight: DCS 0x51 (Write Display Brightness, one byte) as a video-mode command packet (DSI_VM_CMD_CON +0x130,
++ *    DSI_START.VM_CMD_START bit 16, DSI_INTSTA.VM_CMD_DONE bit 5; begonia's Linux ddp_dsi.c DSI_send_vm_cmd). The
++ *    panel's PWM output drives the LM36273 backlight, so 0x51 = 0 is a dark screen and the level comes back on 0x51.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <libkern/libkern.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_board.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void delay(int usec);
++
++#define OVL0_PA         0x14008000u
++#define OVL0_2L_PA      0x14009000u
++#define RDMA0_PA        0x1400b000u
++#define DSI0_PA         0x14014000u
++#define MUTEX_PA        0x14016000u
++
++#define OVL_STA         0x000u
++#define OVL_INTEN       0x004u
++#define OVL_INTSTA      0x008u
++#define OVL_EN          0x00cu
++#define OVL_SRC_CON     0x02cu
++#define OVL_L0_CON      0x030u
++#define OVL_L0_SRC_SIZE 0x038u
++#define OVL_L0_PITCH    0x044u
++#define OVL_LAYER_STRIDE 0x20u
++#define OVL_L0_ADDR     0xf40u
++
++#define RDMA_INT_STATUS 0x004u
++#define RDMA_IN_LINE    0x124u
++#define RDMA_OUT_LINE   0x12cu
++
++#define DSI_START       0x000u
++#define DSI_INTEN       0x008u
++#define DSI_INTSTA      0x00cu
++#define DSI_MODE_CTRL   0x014u
++#define DSI_VSA_NL      0x020u
++#define DSI_VBP_NL      0x024u
++#define DSI_VFP_NL      0x028u
++#define DSI_VACT_NL     0x02cu
++#define DSI_VM_CMD_CON  0x130u
++#define DSI_STATE_DBG9  0x16cu
++#define DSI_VM_CMD_START (1u << 16)
++#define DSI_VM_CMD_DONE (1u << 5)
++
++static vm_offset_t g_ovl[2], g_rdma, g_dsi, g_mutex;
++static int g_ovl_idx = -1, g_layer = -1;
++static uint32_t g_vsa, g_vbp, g_vfp, g_vact, g_vtotal, g_mode;
++static int g_counter;                   /* 0 none, 1 DSI line counter (all lines), 2 RDMA out line (active lines) */
++static uint32_t g_counter_max;          /* largest value the counter took in the probe */
++static uint64_t g_period;               /* frame period, mach absolute units; 0 = unknown */
++static uint64_t g_sof;                  /* a measured (or corrected) frame start, mach absolute */
++static uint64_t g_line;                 /* one line in mach absolute units (period / lines per frame) */
++static bool g_ready;
++static uint32_t g_dcs_sent, g_dcs_fail;
++
++static inline uint32_t
++rd(vm_offset_t b, uint32_t o)
++{
++	uint32_t v = *(volatile uint32_t *)(b + o);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++wr(vm_offset_t b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static uint32_t
++counter_now(void)
++{
++	if (g_counter == 1) {
++		return rd(g_dsi, DSI_STATE_DBG9) & 0x3fffffu;
++	}
++	if (g_counter == 2) {
++		return rd(g_rdma, RDMA_OUT_LINE) & 0x1fffu;
++	}
++	return 0;
++}
++
++static uint64_t
++abs_us(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000;
++}
++
++/*
++ * Watch one counter for up to ~70 ms: the times it wrapped (a value well below the previous one = a new frame).
++ * Returns the number of wraps (up to 4) and fills the times and the largest value seen.
++ */
++static uint32_t
++watch_counter(int which, uint64_t *wraps, uint32_t *maxv, uint32_t *samples)
++{
++	uint64_t t0 = mach_absolute_time(), limit, now;
++	uint32_t prev = 0, n = 0, cnt = 0, mx = 0;
++	bool first = true;
++
++	nanoseconds_to_absolutetime(70ULL * NSEC_PER_MSEC, &limit);
++	int saved = g_counter;
++	g_counter = which;
++	do {
++		uint32_t v = counter_now();
++		now = mach_absolute_time();
++		cnt++;
++		if (v > mx) {
++			mx = v;
++		}
++		if (!first && v + 64u < prev && n < 4) {
++			wraps[n++] = now;
++		}
++		prev = v;
++		first = false;
++	} while (now - t0 < limit);
++	g_counter = saved;
++	*maxv = mx;
++	*samples = cnt;
++	return n;
++}
++
++static void
++probe_layer(uint64_t fb_pa)
++{
++	for (int i = 0; i < 2; i++) {
++		if (g_ovl[i] == 0) {
++			continue;
++		}
++		vm_offset_t o = g_ovl[i];
++		uint32_t src = rd(o, OVL_SRC_CON);
++		printf("BEGONIA DISP: OVL%s sta %#x inten %#x intsta %#x en %#x src_con %#x\n", i ? "0_2L" : "0",
++		    rd(o, OVL_STA), rd(o, OVL_INTEN), rd(o, OVL_INTSTA), rd(o, OVL_EN), src);
++		for (uint32_t l = 0; l < 4; l++) {
++			uint32_t off = l * OVL_LAYER_STRIDE;
++			uint32_t con = rd(o, OVL_L0_CON + off), addr = rd(o, OVL_L0_ADDR + off);
++			uint32_t pitch = rd(o, OVL_L0_PITCH + off), size = rd(o, OVL_L0_SRC_SIZE + off);
++			if (!(src & (1u << l)) && addr == 0) {
++				continue;
++			}
++			printf("BEGONIA DISP:   layer %u %s con %#x addr %#x pitch %#x size %#x%s\n", l, (src & (1u << l)) ? "on " : "off",
++			    con, addr, pitch, size, addr == (uint32_t)fb_pa ? "  <- boot framebuffer" : "");
++			if ((src & (1u << l)) && addr == (uint32_t)fb_pa && g_ovl_idx < 0) {
++				g_ovl_idx = i;
++				g_layer = (int)l;
++			}
++		}
++	}
++}
++
++/* Called once by the framebuffer's start() with the boot framebuffer's physical address. */
++bool begonia_disp_init(uint64_t fb_pa);
++bool
++begonia_disp_init(uint64_t fb_pa)
++{
++	if (!sweet_board_begonia() || g_ready) {
++		return g_ready;
++	}
++	g_ovl[0] = ml_io_map(OVL0_PA, 0x1000);
++	g_ovl[1] = ml_io_map(OVL0_2L_PA, 0x1000);
++	g_rdma = ml_io_map(RDMA0_PA, 0x1000);
++	g_dsi = ml_io_map(DSI0_PA, 0x1000);
++	g_mutex = ml_io_map(MUTEX_PA, 0x1000);
++	if (g_rdma == 0 || g_dsi == 0) {
++		printf("BEGONIA DISP: ml_io_map failed\n");
++		return false;
++	}
++	probe_layer(fb_pa);
++	g_mode = rd(g_dsi, DSI_MODE_CTRL);
++	g_vsa = rd(g_dsi, DSI_VSA_NL) & 0x3ffu;
++	g_vbp = rd(g_dsi, DSI_VBP_NL) & 0x3ffu;
++	g_vfp = rd(g_dsi, DSI_VFP_NL) & 0x3ffu;
++	g_vact = rd(g_dsi, DSI_VACT_NL) & 0x3fffu;
++	g_vtotal = g_vsa + g_vbp + g_vfp + g_vact;
++	printf("BEGONIA DISP: DSI0 start %#x inten %#x intsta %#x mode %#x (%s) vsa %u vbp %u vfp %u vact %u -> %u lines, "
++	    "vm_cmd_con %#x dbg9 %#x; RDMA0 int %#x in_line %u out_line %u; MUTEX intsta %#x mutex0 en %#x sof %#x\n",
++	    rd(g_dsi, DSI_START), rd(g_dsi, DSI_INTEN), rd(g_dsi, DSI_INTSTA), g_mode, (g_mode & 3u) ? "video" : "command",
++	    g_vsa, g_vbp, g_vfp, g_vact, g_vtotal, rd(g_dsi, DSI_VM_CMD_CON), rd(g_dsi, DSI_STATE_DBG9),
++	    rd(g_rdma, RDMA_INT_STATUS), rd(g_rdma, RDMA_IN_LINE), rd(g_rdma, RDMA_OUT_LINE),
++	    g_mutex ? rd(g_mutex, 0x004) : 0, g_mutex ? rd(g_mutex, 0x020) : 0, g_mutex ? rd(g_mutex, 0x02c) : 0);
++
++	/* which counter moves: the DSI one counts every line of the frame (blanking too), RDMA only the active ones */
++	uint64_t w[4];
++	uint32_t mx, samples, n;
++	n = watch_counter(1, w, &mx, &samples);
++	printf("BEGONIA DISP: DSI line counter: %u wraps in 70 ms, max %u, %u samples%s\n", n, mx, samples,
++	    n >= 2 ? "" : " (not usable)");
++	if (n >= 3 && mx > 1000) {
++		g_counter = 1;
++	} else {
++		n = watch_counter(2, w, &mx, &samples);
++		printf("BEGONIA DISP: RDMA out line counter: %u wraps in 70 ms, max %u, %u samples%s\n", n, mx, samples,
++		    n >= 2 ? "" : " (not usable)");
++		if (n >= 3 && mx > 1000) {
++			g_counter = 2;
++		}
++	}
++	if (g_counter != 0) {
++		g_counter_max = mx;
++		uint64_t p1 = w[1] - w[0], p2 = w[2] - w[1];
++		g_period = (p1 + p2) / 2;
++		g_sof = w[n - 1];
++		/* lines per frame as the counter sees them: the DSI counter wraps at vtotal; RDMA's stops at vact for the blanking */
++		uint32_t lines = g_counter == 1 ? (mx + 1u) : (g_vtotal > mx ? g_vtotal : mx + 1u);
++		g_line = g_period / (lines ? lines : 1u);
++		printf("BEGONIA DISP: frame period %llu us (%llu.%02llu Hz; periods %llu/%llu us), %u lines per frame by the %s counter, "
++		    "line %llu ns\n", abs_us(g_period), 100000000ull / (abs_us(g_period) ? abs_us(g_period) : 1) / 100,
++		    100000000ull / (abs_us(g_period) ? abs_us(g_period) : 1) % 100, abs_us(p1), abs_us(p2), lines,
++		    g_counter == 1 ? "DSI" : "RDMA", abs_us(g_line * 1000));
++	} else {
++		printf("BEGONIA DISP: no line counter moves: the vsync tick stays on its own clock\n");
++	}
++	g_ready = true;
++	return true;
++}
++
++/*
++ * The predicted start of the first frame at or after `from` (mach absolute), re-measured now from one counter read:
++ * the frame started counter * line ago. Reads during RDMA's blanking (counter parked at its maximum) are skipped.
++ * 0 = no hardware phase.
++ */
++uint64_t begonia_disp_next_sof(uint64_t from, int64_t *err_out);
++uint64_t
++begonia_disp_next_sof(uint64_t from, int64_t *err_out)
++{
++	if (!g_ready || g_period == 0 || g_counter == 0) {
++		return 0;
++	}
++	uint64_t now = mach_absolute_time();
++	uint32_t c = counter_now();
++	int64_t err = 0;
++	if (c > 2u && c + 2u < g_counter_max) {
++		uint64_t meas = now - (uint64_t)c * g_line;      /* this frame's start as the counter says */
++		/* the prediction for this frame: g_sof advanced by whole periods to just before meas */
++		uint64_t pred = g_sof;
++		if (meas > pred) {
++			pred += ((meas - pred + g_period / 2) / g_period) * g_period;
++		}
++		err = (int64_t)(meas - pred);
++		/* follow the panel slowly (the counter read jitters by a line or two); a large error (a frame start we
++		 * mis-predicted by more than 2 ms) is taken at once */
++		int64_t lim;
++		nanoseconds_to_absolutetime(2 * NSEC_PER_MSEC, (uint64_t *)&lim);
++		g_sof = (err > lim || err < -lim) ? meas : (uint64_t)((int64_t)pred + err / 4);
++	}
++	if (err_out) {
++		*err_out = err;
++	}
++	uint64_t next = g_sof;
++	if (from > next) {
++		next += ((from - next + g_period - 1) / g_period) * g_period;
++	}
++	return next;
++}
++
++uint64_t begonia_disp_period(void);
++uint64_t
++begonia_disp_period(void)
++{
++	return g_period;
++}
++
++/* DCS short write (cmd, one parameter or none) as a video-mode command packet. 0 or an errno. */
++int begonia_disp_dcs(uint8_t cmd, int param);
++int
++begonia_disp_dcs(uint8_t cmd, int param)
++{
++	if (!g_ready || g_dsi == 0 || (g_mode & 3u) == 0) {
++		return ENODEV;
++	}
++	uint32_t con = rd(g_dsi, DSI_VM_CMD_CON);
++	uint32_t low = (con & 0x3du) | 1u;                 /* VM_CMD_EN, keep TIME_SEL and the porch choice */
++	if (!(low & 0x38u)) {
++		low |= 1u << 5;                                 /* TS_VFP_EN: in the vertical front porch */
++	}
++	uint32_t id = param >= 0 ? 0x15u : 0x05u;          /* DCS short write, one / no parameter */
++	uint32_t v = low | (id << 8) | ((uint32_t)cmd << 16) | ((uint32_t)(param >= 0 ? param & 0xff : 0) << 24);
++	wr(g_dsi, DSI_INTSTA, ~DSI_VM_CMD_DONE);           /* write 0 to clear */
++	wr(g_dsi, DSI_VM_CMD_CON, v);
++	uint32_t st = rd(g_dsi, DSI_START);
++	wr(g_dsi, DSI_START, st & ~DSI_VM_CMD_START);
++	wr(g_dsi, DSI_START, st | DSI_VM_CMD_START);
++	for (uint32_t us = 0; us < 60000u; us += 50u) {
++		if (rd(g_dsi, DSI_INTSTA) & DSI_VM_CMD_DONE) {
++			wr(g_dsi, DSI_INTSTA, ~DSI_VM_CMD_DONE);
++			g_dcs_sent++;
++			return 0;
++		}
++		delay(50);
++	}
++	g_dcs_fail++;
++	return ETIMEDOUT;
++}
++
++/* Is the video stream still running (the line counter moves)? For a check after a command packet. */
++bool begonia_disp_alive(void);
++bool
++begonia_disp_alive(void)
++{
++	if (!g_ready || g_counter == 0) {
++		return true;
++	}
++	uint32_t a = counter_now();
++	delay(200);
++	uint32_t b = counter_now();
++	delay(200);
++	uint32_t c = counter_now();
++	return a != b || b != c;
++}
++
++void begonia_disp_stats(uint32_t *sent, uint32_t *failed);
++void
++begonia_disp_stats(uint32_t *sent, uint32_t *failed)
++{
++	*sent = g_dcs_sent;
++	*failed = g_dcs_fail;
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
