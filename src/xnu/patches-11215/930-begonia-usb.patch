@@ -33,7 +33,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_usb.c
-@@ -0,0 +1,1183 @@
+@@ -0,0 +1,1190 @@
 +/*
 + * begonia_usb.c (Loxy, 25 Nov 2026): USB device port for iOS on begonia (Redmi Note 8 Pro, MT6785).
 + *
@@ -160,9 +160,11 @@ new file mode 100644
 +/* TXnCSR0 / RXnCSR0 */
 +#define TX_AUTOSET              (1u << 30)
 +#define TX_DMAREQEN             (1u << 29)
++#define TX_FIFOFULL             (1u << 25)
 +#define TX_SENTSTALL            (1u << 22)
 +#define TX_SENDSTALL            (1u << 21)
 +#define TX_TXPKTRDY             (1u << 16)
++#define TX_BUSY                 (TX_TXPKTRDY | TX_FIFOFULL)
 +#define RX_AUTOCLEAR            (1u << 30)
 +#define RX_DMAREQEN             (1u << 29)
 +#define RX_SENTSTALL            (1u << 22)
@@ -841,13 +843,13 @@ new file mode 100644
 +		return;
 +	}
 +	switch (usb.ep0) {
-+	case EP0_TX:
-+		if (!(csr & EP0_TXPKTRDY)) {
++	case EP0_TX:                    /* room for the next packet (mtu3: "irq on clearing txpktrdy", FIFOFULL clear) */
++		if (!(csr & (EP0_TXPKTRDY | EP0_FIFOFULL))) {
 +			ep0_tx();
 +		}
 +		break;
-+	case EP0_TX_END:
-+		if (!(csr & EP0_TXPKTRDY)) {
++	case EP0_TX_END:                /* the last packet has left the FIFO */
++		if (!(csr & (EP0_TXPKTRDY | EP0_FIFOFULL))) {
 +			ep0_csr(EP0_DATAEND);   /* the controller runs the status stage */
 +			usb.ep0 = EP0_IDLE;
 +		}
@@ -1001,7 +1003,12 @@ new file mode 100644
 +	return n;
 +}
 +
-+/* up to 32 packets per poll: the next one goes as soon as the host has taken the last (<= 25 us wait) */
++/*
++ * Up to 32 packets per poll: the next one goes as soon as there is room (<= 25 us wait). Room means TXPKTRDY
++ * clear AND TX_FIFOFULL clear, as mu3d_hal_write_fifo_burst polls: the controller clears TXPKTRDY as soon as a
++ * packet moves on inside the FIFO, so TXPKTRDY alone let v24 write into a full FIFO under load; the host then
++ * saw broken packets and halted the pipe (WinUsb_ReadPipe error 31).
++ */
 +static void
 +usb_tx_poll(void)
 +{
@@ -1009,9 +1016,9 @@ new file mode 100644
 +
 +	for (unsigned burst = 0; burst < 32u; burst++) {
 +		uint32_t csr = usb_rd(U3D_TXCSR0(1));
-+		if (csr & TX_TXPKTRDY) {
++		if (csr & TX_BUSY) {
 +			unsigned spin = 0;
-+			while (spin < 25u && (usb_rd(U3D_TXCSR0(1)) & TX_TXPKTRDY)) {
++			while (spin < 25u && (usb_rd(U3D_TXCSR0(1)) & TX_BUSY)) {
 +				delay(1);
 +				spin++;
 +			}
