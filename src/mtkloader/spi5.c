@@ -121,17 +121,37 @@ static int spi5_wait_status(void)
     }
 }
 
+/*
+ * 25 Nov 2026 (v22 log: the loader's touch FW start failed 3/3 with 1408 SPI timeouts, dbg 0x13): begonia's own
+ * Linux driver (drivers/spi/spi-mt65xx.c, mt6765_compat) never lets the controller FINISH a transfer. set_cs()
+ * sets PAUSE_EN before the first transfer of a message, every FIFO load ends in PAUSE (CS stays asserted), the
+ * next one starts with RESUME, and the message ends with PAUSE_EN cleared and a reset (CS deasserted) while the
+ * controller is idle. Here a reset ran before every transfer and single-load transfers ran to FINISH; the stalls
+ * (busy, no FINISH) came in runs that the reset did not end. Now the same sequence as Linux; after a stall the
+ * timing registers are written again too.
+ */
+static void spi5_setup_regs(void)
+{
+    mmio_write32(MT6785_SPI5_BASE + SPI_PAD_SEL_REG, 0u);
+    mmio_write32(MT6785_SPI5_BASE + SPI_CFG2_REG, ((3u - 1u) << 0) | ((3u - 1u) << 16));
+    mmio_write32(MT6785_SPI5_BASE + SPI_CFG0_REG, ((6u - 1u) << 0) | ((6u - 1u) << 16));
+    mmio_write32(MT6785_SPI5_BASE + SPI_CFG1_REG, 5u);
+    (void)mmio_read32(MT6785_SPI5_BASE + SPI_CFG1_REG);
+}
+
 int spi5_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
 {
     if (len == 0u) {
         return 0;
     }
 
-    uint32_t base_cmd = SPI_CMD_TXMSBF | SPI_CMD_RXMSBF | SPI_CMD_FINISH_IE | SPI_CMD_PAUSE_IE;
+    uint32_t base_cmd = SPI_CMD_TXMSBF | SPI_CMD_RXMSBF | SPI_CMD_FINISH_IE | SPI_CMD_PAUSE_IE |
+                        SPI_CMD_PAUSE_EN;
     uint32_t off = 0;
+    int rc = 0;
 
-    spi5_reset();
-    /* mode bits first, like Linux (prepare_message), the start bit later in its own write */
+    (void)mmio_read32(MT6785_SPI5_BASE + SPI_STATUS0_REG);     /* read-clear a stale FINISH/PAUSE */
+    /* mode bits and PAUSE_EN first (Linux prepare_message + set_cs), the start bit later in its own write */
     mmio_write32(MT6785_SPI5_BASE + SPI_CMD_REG, base_cmd);
     (void)mmio_read32(MT6785_SPI5_BASE + SPI_CMD_REG);
 
@@ -140,7 +160,6 @@ int spi5_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
         if (chunk > SPI_FIFO_BYTES) {
             chunk = SPI_FIFO_BYTES;
         }
-        int has_more = (off + chunk) < len;
         int is_first = (off == 0u);
 
         uint32_t cfg1 = mmio_read32(MT6785_SPI5_BASE + SPI_CFG1_REG);
@@ -162,8 +181,7 @@ int spi5_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
             mmio_write32(MT6785_SPI5_BASE + SPI_TX_DATA_REG, w);
         }
 
-        uint32_t cmd = base_cmd | (has_more ? SPI_CMD_PAUSE_EN : 0u) |
-                       (is_first ? SPI_CMD_ACT : SPI_CMD_RESUME);
+        uint32_t cmd = base_cmd | (is_first ? SPI_CMD_ACT : SPI_CMD_RESUME);
         mmio_write32(MT6785_SPI5_BASE + SPI_CMD_REG, cmd);
 
         if (spi5_wait_status() != 0) {
@@ -171,8 +189,8 @@ int spi5_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
             /* [31:24] STATUS1 (bit 0 busy), [23:16] CMD low byte, [15:0] transfer length */
             spi5_last_fail = ((mmio_read32(MT6785_SPI5_BASE + SPI_STATUS1_REG) & 0xffu) << 24) |
                              ((cmd & 0xffu) << 16) | (len & 0xffffu);
-            spi5_reset();
-            return -1;
+            rc = -1;
+            break;
         }
 
         for (uint32_t i = 0; i < chunk; i += 4u) {
@@ -189,5 +207,12 @@ int spi5_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
         }
         off += chunk;
     }
-    return 0;
+    /* end of the message (Linux set_cs(deassert)): PAUSE_EN off, then the reset deasserts CS */
+    mmio_write32(MT6785_SPI5_BASE + SPI_CMD_REG, base_cmd & ~SPI_CMD_PAUSE_EN);
+    (void)mmio_read32(MT6785_SPI5_BASE + SPI_CMD_REG);
+    spi5_reset();
+    if (rc != 0) {
+        spi5_setup_regs();
+    }
+    return rc;
 }
