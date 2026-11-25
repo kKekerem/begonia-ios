@@ -33,7 +33,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_usb.c
-@@ -0,0 +1,1173 @@
+@@ -0,0 +1,1183 @@
 +/*
 + * begonia_usb.c (Loxy, 25 Nov 2026): USB device port for iOS on begonia (Redmi Note 8 Pro, MT6785).
 + *
@@ -317,6 +317,7 @@ new file mode 100644
 +	uint32_t        tx1_fifo, tx2_fifo, rx1_fifo;
 +	uint64_t        log_pos;
 +	uint64_t        tx_bytes, rx_bytes, tx_pkts, rx_pkts;
++	uint64_t        loops, t0;      /* poll loops since the thread started at t0 (mach_absolute_time) */
 +	uint32_t        resets, setups, stalls, suspends, logged;
 +	uint64_t        reboot_at;      /* mach_absolute_time deadline of a requested reboot, 0 = none */
 +	char            cmd[128];
@@ -381,13 +382,17 @@ new file mode 100644
 +	return (usb_rd(off) & mask) == want;
 +}
 +
++/* critical urgency, no leeway: a plain 1 ms wait came back after ~28 ms (v22: ~35 polls/s) */
 +static void
 +usb_sleep_ms(unsigned ms)
 +{
 +	uint64_t deadline;
 +	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
-+	(void)assert_wait_deadline(&usb.chan, THREAD_UNINT, deadline);
-+	thread_block(THREAD_CONTINUE_NULL);
++	if (assert_wait_deadline_with_leeway((event_t)&usb.chan, THREAD_UNINT,
++	    TIMEOUT_URGENCY_SYS_CRITICAL | TIMEOUT_URGENCY_LEEWAY, deadline, 0) == THREAD_WAITING) {
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++	usb.loops++;
 +}
 +
 +/* PIO, as mu3d_hal_write_fifo / read_fifo: 32-bit words, then a 16- and an 8-bit write for the tail */
@@ -1034,11 +1039,15 @@ new file mode 100644
 +static void
 +usb_stat(void)
 +{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - usb.t0, &ns);
 +	printf("BEGONIA USB: stat speed %u cfg %d dtr %d; tx %llu B in %llu pkts, rx %llu B in %llu pkts; resets %u "
-+	    "setups %u stalls %u suspends %u; log %llu / %llu; PM %#x CONF %#x EP0CSR %#x TX1 %#x RX1 %#x\n",
++	    "setups %u stalls %u suspends %u; log %llu / %llu; %llu polls in %llu ms; PM %#x CONF %#x EP0CSR %#x "
++	    "TX1 %#x RX1 %#x\n",
 +	    usb.speed, usb.configured, usb.dtr, usb.tx_bytes, usb.tx_pkts, usb.rx_bytes, usb.rx_pkts, usb.resets,
-+	    usb.setups, usb.stalls, usb.suspends, usb.log_pos, sweet_log_position(), usb_rd(U3D_POWER_MANAGEMENT),
-+	    usb_rd(U3D_DEVICE_CONF), usb_rd(U3D_EP0CSR), usb_rd(U3D_TXCSR0(1)), usb_rd(U3D_RXCSR0(1)));
++	    usb.setups, usb.stalls, usb.suspends, usb.log_pos, sweet_log_position(), usb.loops, ns / 1000000ULL,
++	    usb_rd(U3D_POWER_MANAGEMENT), usb_rd(U3D_DEVICE_CONF), usb_rd(U3D_EP0CSR), usb_rd(U3D_TXCSR0(1)),
++	    usb_rd(U3D_RXCSR0(1)));
 +}
 +
 +static bool
@@ -1158,7 +1167,8 @@ new file mode 100644
 +		return;
 +	}
 +	nanoseconds_to_absolutetime(30ULL * NSEC_PER_SEC, &stat_gap);
-+	next_stat = mach_absolute_time() + stat_gap;
++	usb.t0 = mach_absolute_time();
++	next_stat = usb.t0 + stat_gap;
 +	for (;;) {
 +		usb_bus_poll();
 +		ep0_poll();
