@@ -1881,7 +1881,7 @@ diff --git a/bsd/dev/begonia_touch.c b/bsd/dev/begonia_touch.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_touch.c
-@@ -0,0 +1,498 @@
+@@ -0,0 +1,509 @@
 +/*
 + * Polled MT6785 SPI5 + Novatek NT36672A touchscreen driver for Redmi Note 8 Pro (begonia).
 + * Ports proven mtkloader SPI5 (0x11019000) + NVT (0x21C00) protocol to XNU HID events.
@@ -2265,26 +2265,37 @@ new file mode 100644
 +	 * 25 Nov: plus the SPI timeouts, how often the touch INT line (GPIO1, active low) was low at a poll, and the
 +	 * first 12 bytes of the event buffer each time they change (60 lines at most), to see what the FW reports.
 +	 */
-+	uint32_t polls = 0, fails = 0, frames = 0, stat_lines = 0, int_low = 0, raw_lines = 0;
++	uint32_t polls = 0, fails = 0, frames = 0, stat_lines = 0, int_low = 0, raw_lines = 0, page_sets = 0;
 +	uint8_t last[8] = { 0 };
 +	uint8_t prev[12];
++	/*
++	 * 25 Nov 2026 (v21 log): most failed polls were the 3-byte page-select write (last 0x1010003: busy, ACT, 3
++	 * bytes) that ran before every read. The NT36672A keeps the selected page; Linux selects the event page once
++	 * and reads only. So: select it once (3 tries), and again only after a failed read.
++	 */
++	bool page_ok = nvt_set_page(NVT_EVENT_BUF_ADDR) == 0;
 +	memset(prev, 0xa5, sizeof(prev));
 +	for (;;) {
 +		uint8_t pts[65];
 +		if (++polls % 1250u == 0u && stat_lines < 36u) {
 +			stat_lines++;
-+			printf("BEGONIA TOUCH: polls=%u read_fail=%u spi_timeouts=%u (last %#x) int_low=%u frames_with_points=%u "
-+			    "last=%02x %02x %02x %02x %02x %02x\n",
-+			    polls, fails, spi5_timeouts, spi5_last_fail, int_low, frames,
++			printf("BEGONIA TOUCH: polls=%u read_fail=%u spi_timeouts=%u (last %#x) page_sets=%u int_low=%u "
++			    "frames_with_points=%u last=%02x %02x %02x %02x %02x %02x\n",
++			    polls, fails, spi5_timeouts, spi5_last_fail, page_sets, int_low, frames,
 +			    last[0], last[1], last[2], last[3], last[4], last[5]);
 +		}
 +		bool int_is_low = (reg_rd(gpio_base, 0x0200u) & (1u << 1)) == 0u;
 +		if (int_is_low) {
 +			int_low++;
 +		}
-+		bool rd = nvt_set_page(NVT_EVENT_BUF_ADDR) == 0 && nvt_read_event_buf(pts, sizeof(pts)) == 0;
++		for (uint32_t tries = 0; tries < 3u && !page_ok; tries++) {
++			page_sets++;
++			page_ok = nvt_set_page(NVT_EVENT_BUF_ADDR) == 0;
++		}
++		bool rd = page_ok && nvt_read_event_buf(pts, sizeof(pts)) == 0;
 +		if (!rd) {
 +			fails++;
++			page_ok = false;        /* select the page again before the next read */
 +		} else {
 +			if ((pts[0] >> 3) >= 1u && (pts[0] >> 3) <= NVT_MAX_SLOTS) {
 +				frames++;
