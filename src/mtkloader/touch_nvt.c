@@ -18,6 +18,7 @@
 #define NVT_G_DLM_CHECKSUM_ADDR     0x3F104u
 #define NVT_BLD_CRC_EN_ADDR         0x3F30Eu
 #define NVT_CHIP_ID_ADDR            0x1F600u
+#define NVT_ENG_RST_ADDR            0x7FFF80u
 
 #define EVENT_MAP_HOST_CMD          0x50u
 #define EVENT_MAP_RESET_COMPLETE    0x60u
@@ -411,10 +412,44 @@ void touch_init(uintptr_t android_img_pa, uint64_t android_img_len, struct touch
  * downloads the firmware after every display reset (nvt_ts_resume -> nvt_update_firmware) and so does this, up
  * to three times like nvt_download_firmware_hw_crc, then waits for the ReK state like nvt_ts_resume.
  */
+/*
+ * 25 Nov 2026: nvt_ts_probe's cold start (begonia kernel nt36xxx.c): TP_RST (GPIO2) low (gpio_request_one
+ * GPIOF_OUT_INIT_LOW), eng reset (0x5A to ENG_RST_ADDR 0x7FFF80, "eng reset before TP_RESX high"), TP_RST high,
+ * 10 ms after POR. Android does this on every boot with the panel lit, so it is safe for the display (TP_RST only
+ * resets the touch half of the TDDI; the display reset is GPIO44).
+ */
+static void nvt_hw_reset_like_probe(void)
+{
+    spi5_gpio_set_dout(2u, 0);
+    delay_ms(1u);
+    (void)nvt_write_addr(NVT_ENG_RST_ADDR, 0x5Au);
+    delay_ms(1u);
+    spi5_gpio_set_dout(2u, 1);
+    delay_ms(10u);
+}
+
+/* RESET_STATE_REK (0xA1) or later, up to 1 s (nvt_ts_resume -> nvt_check_fw_reset_state: 50 x 10 ms) */
+static int nvt_wait_rek(struct touch_state *st)
+{
+    for (uint32_t i = 0; i < 100u; i++) {
+        uint8_t rst_state = 0;
+        if (nvt_set_page(NVT_EVENT_BUF_ADDR) == 0 &&
+            nvt_spi_read(EVENT_MAP_RESET_COMPLETE, &rst_state, 1u) == 0) {
+            st->boot_state = rst_state;
+            if (rst_state >= 0xA1u && rst_state <= 0xAFu) {
+                return 1;
+            }
+        }
+        delay_ms(10u);
+    }
+    return 0;
+}
+
 void touch_boot_fw(uintptr_t android_img_pa, uint64_t android_img_len, struct touch_state *st)
 {
     const uint8_t *fw;
     uint32_t tries;
+    int downloaded = 0;
 
     st->boot_tries = 0;
     st->boot_state = 0;
@@ -427,34 +462,35 @@ void touch_boot_fw(uintptr_t android_img_pa, uint64_t android_img_len, struct to
         st->dbg = (st->dbg & ~0xffU) | 0x03U;
         return;
     }
+    /*
+     * Try 1 is nvt_ts_resume (TP_RST stays high, bootloader reset, download). Tries 2 and 3 first do the cold
+     * start of nvt_ts_probe (TP_RST pulse + eng reset), for a touch MCU that LK's reboot left in a state the SPI
+     * bootloader reset does not clear. A try also counts as failed when the FW boots (0xA0) but never reaches ReK.
+     */
     for (tries = 1; tries <= 3u; tries++) {
         st->boot_tries = tries;
         st->dbg &= ~0xffffU;
-        if (nvt_download_fw(fw, st) == 0) {
+        if (tries > 1u) {
+            nvt_hw_reset_like_probe();
+        }
+        if (nvt_download_fw(fw, st) != 0) {
+            continue;
+        }
+        downloaded = 1;
+        if (nvt_wait_rek(st)) {
             break;
         }
+        st->dbg = (st->dbg & ~0xffU) | 0x15U;   /* booted, no ReK in 1 s */
     }
-    if (tries > 3u) {
+    if (!downloaded) {
         st->ready = 0;
         return;
-    }
-    /* wait for RESET_STATE_REK (0xA1) and later, up to 600 ms (nvt_check_fw_reset_state: 50 x 10 ms) */
-    for (uint32_t i = 0; i < 60u; i++) {
-        uint8_t rst_state = 0;
-        if (nvt_set_page(NVT_EVENT_BUF_ADDR) == 0 &&
-            nvt_spi_read(EVENT_MAP_RESET_COMPLETE, &rst_state, 1u) == 0) {
-            st->boot_state = rst_state;
-            if (rst_state >= 0xA1u && rst_state <= 0xAFu) {
-                break;
-            }
-        }
-        delay_ms(10u);
     }
     if (nvt_read_fw_info(st)) {
         st->ready = 1;
         st->fw_uploaded = 1;
         st->boot_ok = 1;
-        st->dbg = (st->dbg & ~0xffU) | 0x07U;
+        st->dbg = (st->dbg & ~0xffU) | (tries <= 3u ? 0x07U : 0x15U);
     }
     (void)nvt_set_page(NVT_EVENT_BUF_ADDR);
 }
