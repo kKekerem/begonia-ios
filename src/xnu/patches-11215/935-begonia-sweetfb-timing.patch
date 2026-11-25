@@ -1,0 +1,18 @@
+# begonia: SweetFB frame timing in the console log (the stats line is cut by IOLog before copy_us). Applied after 930.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1180,6 +1180,12 @@
+ 	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
+ 		fStLogT = now;
+ 		IOLog("SWEET FB: stats %s", line);
++		/* 25 Nov 2026 (begonia): IOLog cuts the line above after scan_replaced_s, so the times go in their own line */
++		IOLog("SWEET FB: timing copy_s=%u.%02u copy_us=%u.%02u copy_us_max=%llu clean_us=%u.%02u cleans=%llu "
++		    "latch_waits=%llu latch_wait_us=%u.%02u swaps_s=%u.%02u empty_swaps=%llu zc_us=%u.%02u\n",
++		    SW_F2(dCopy * 100000000ull / winUS), SW_F2(copyAvg), sweet_abs_us(c.copyMaxAbs), SW_F2(clAvg),
++		    c.cleans, c.latchWaits, SW_F2(lwAvg), SW_F2(dSwaps * 100000000ull / winUS), c.emptySwaps,
++		    SW_F2(zcAvg));
+ 	}
+ 	fStPrev = fSt;
+ 	fStPrev.swaps = swaps;

@@ -234,7 +234,11 @@ def build_begonia_adt(
 
     children = [chosen, defaults, cpus, arm_io, sweet_ufs, fbcon, buttons]
     if product_adt_path:
-        children.append(make_node("product", [ph.prop()] + extract_product_props(product_adt_path)))
+        # 25 Nov 2026: MobileGestalt takes the UI scale from /product artwork-scale-factor (2 on the n841 donor).
+        # On the native canvas (display_scale 3) iOS kept 2x and laid out 540x1170 points: everything too small.
+        props = [(k, u32(display_scale) if k == "artwork-scale-factor" else v)
+                 for k, v in extract_product_props(product_adt_path)]
+        children.append(make_node("product", [ph.prop()] + props))
 
     return make_node(
         "device-tree",
