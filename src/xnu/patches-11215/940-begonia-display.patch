@@ -81,7 +81,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  
  void begonia_usb_init(void);
  
-@@ -1055,16 +1066,234 @@ parse_hex(const char *s, uint32_t *out)
+@@ -1055,16 +1066,284 @@ parse_hex(const char *s, uint32_t *out)
  	return digits > 0;
  }
  
@@ -241,6 +241,54 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +	}
 +}
 +
++/*
++ * "cpufreq": the clock of every CPU, measured. This thread is bound to each processor in turn and times a chain of
++ * 20 million dependent adds (one cycle each on the A55 and on the A76) against mach_absolute_time.
++ */
++extern processor_t cpu_to_processor(int cpu);
++extern processor_t thread_bind(processor_t processor);
++
++static uint64_t
++cpufreq_khz_here(void)
++{
++	uint64_t x = 1, n = 20000000ull, ns;
++	uint64_t t0 = mach_absolute_time();
++	__asm__ volatile (
++                "1: add %0, %0, #1\n"
++                "   add %0, %0, #1\n"
++                "   add %0, %0, #1\n"
++                "   add %0, %0, #1\n"
++                "   subs %1, %1, #4\n"
++                "   b.ne 1b\n"
++                : "+r"(x), "+r"(n) : : "cc");
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	/* 20M dependent adds + 5M sub/branch that run alongside: ~20M cycles */
++	return ns ? (20000000ull * 1000000ull) / ns : 0;
++}
++
++static void
++cpufreq_report(void)
++{
++	char line[200];
++	size_t n = (size_t)snprintf(line, sizeof(line), "BEGONIA CPU: MHz");
++	for (unsigned int cpu = 0; cpu <= ml_get_max_cpu_number() && cpu < 8u; cpu++) {
++		processor_t p = cpu_to_processor((int)cpu);
++		if (p == (processor_t)NULL) {
++			continue;
++		}
++		thread_bind(p);
++		thread_block(THREAD_CONTINUE_NULL);     /* move there */
++		uint64_t khz = cpufreq_khz_here();
++		n += (size_t)snprintf(line + n, sizeof(line) - n, " cpu%u=%llu", cpu, khz / 1000);
++		if (n >= sizeof(line)) {
++			break;
++		}
++	}
++	thread_bind((processor_t)NULL);
++	thread_block(THREAD_CONTINUE_NULL);
++	printf("%s\n", line);
++}
++
 +static int
 +smp_cb(proc_t p, __unused void *arg)
 +{
@@ -301,6 +349,8 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +	} else if (strncmp(line, "smp ", 4) == 0 && line[4] != '\0') {
 +		strlcpy(smp_name, line + 4, sizeof(smp_name));
 +		proc_iterate(PROC_ALLPROCLIST, smp_cb, NULL, NULL, NULL);
++	} else if (strcmp(line, "cpufreq") == 0) {
++		cpufreq_report();
 +	} else if (strncmp(line, "key ", 4) == 0) {
 +		int k = strcmp(line + 4, "power") == 0 ? 0 : (strcmp(line + 4, "volup") == 0 ? 1 :
 +		    (strcmp(line + 4, "voldown") == 0 ? 2 : -1));
@@ -317,7 +367,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  	} else if (strcmp(line, "fb") == 0) {
  		usb_fb_start(2u);
  	} else if (strncmp(line, "fb ", 3) == 0) {
-@@ -1079,7 +1308,7 @@ usb_cmd(char *line)
+@@ -1079,7 +1358,7 @@ usb_cmd(char *line)
  		usb.reboot_at = mach_absolute_time() + delta;
  		printf("BEGONIA USB: reboot in 2 s\n");
  	} else if (strncmp(line, "peek ", 5) == 0 && parse_hex(line + 5, &pa) && (pa & 3u) == 0 &&
@@ -326,7 +376,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		uint32_t page = pa & ~0xfffu;
  		if (usb.peek_va == 0 || usb.peek_page != page) {
  			usb.peek_va = ml_io_map(page, 0x1000);
-@@ -1153,6 +1382,8 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1153,6 +1432,8 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  				usb_tx_poll();
  			}
  		}
