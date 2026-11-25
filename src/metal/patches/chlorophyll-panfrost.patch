@@ -127,7 +127,7 @@ index 67912be..659f1aa 100644
  
     /* The viewport, and now its z as well. Gallium's window depth is
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index b3a614e..8d1776f 100644
+index b3a614e..5591032 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
 @@ -600,6 +600,45 @@ ensure_protocol(Class cls, const char *proto)
@@ -192,6 +192,19 @@ index b3a614e..8d1776f 100644
     char why[512] = { 0 };
     struct rwa_compute_info info = { 0 };
     bg_lock();
+@@ -1169,6 +1210,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+          /* A draw the runtime refuses is skipped and logged, and the rest of the command buffer still runs. Failing the
+           * whole command buffer left the frame's later passes undrawn (the wallpaper area black or grey, stale wedges in
+           * the poster editor) and counted towards the watchdog that switches Metal off. */
++         /* Loxy (26 Nov 2026): CoreAnimation's luma_boost_lph is a full-screen pass every frame (destination + a LUT
++          * term); with framebuffer fetch it costs Panfrost a flush, a full-screen preload and a write-back per frame.
++          * /private/var/tmp/bgmtl-bb.noluma skips it (A/B switch while its effect on the picture is checked). */
++         static int noluma = -1;
++         if (noluma < 0) noluma = access("/private/var/tmp/bgmtl-bb.noluma", F_OK) == 0;
++         if (noluma && strstr(rp->_names, "luma_boost")) continue;
+          if (rwa_render_draw(rp->_render, &dr, why, sizeof(why)) != 0)
+             BG_LOG("draw skipped: %s\n", why);
+          // debugging (/private/var/tmp/bgmtl.dumpatt with the trace): colour 0 right after each blur-chain draw, before any
 diff --git a/test/bg_render.metal b/test/bg_render.metal
 index 4c7d2f6..a0aabf4 100644
 --- a/test/bg_render.metal
