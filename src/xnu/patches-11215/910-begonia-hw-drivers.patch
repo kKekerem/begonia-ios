@@ -298,7 +298,7 @@ diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_mali.c
-@@ -0,0 +1,1114 @@
+@@ -0,0 +1,1113 @@
 +/*
 + * ARM Mali-G76 MC4 (r0p0, 0x7211 @ 0x13040000) driver for Redmi Note 8 Pro (begonia / MT6785).
 + */
@@ -540,8 +540,7 @@ new file mode 100644
 +		uint64_t cache = __atomic_exchange_n(&g_stat_cache_ns, 0u, __ATOMIC_RELAXED);
 +		g_stat_lines++;
 +		printf("BEGONIA MALI: %llu ms: fragment %u jobs %llu ms busy (max %llu us), vertex/tiler %u jobs %llu ms busy "
-+		    "(max %llu us), cache sync %llu ms
-+",
++		    "(max %llu us), cache sync %llu ms\n",
 +		    el / 1000000ull, g_stat_jobs[0], g_stat_busy_ns[0] / 1000000ull, g_stat_max_ns[0] / 1000ull,
 +		    g_stat_jobs[1], g_stat_busy_ns[1] / 1000000ull, g_stat_max_ns[1] / 1000ull, cache / 1000000ull);
 +	}
