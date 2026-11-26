@@ -55,7 +55,7 @@ diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
  	BGMTL_DIR "bgmtl-bb.full",      /* bit 3: backboardd redraws in full (no dirty regions) */
  	BGMTL_DIR "bgmtl.dumpatt",      /* bit 4: with the trace, attachments dumped to /private/var/tmp/att */
  	BGMTL_DIR "bgmtl.probe",        /* bit 5 (24 Nov): bgl-launch runs bgmtl_render_probe once -> bgmtl-probe.txt */
-+	BGMTL_DIR "bgmtl.airdump",      /* bit 6 (26 Nov, Loxy 940): every pipeline's AIR modules -> /private/var/tmp/air/<process> */
++	BGMTL_DIR "bgmtl.mercury",      /* bit 6 (26 Nov, Loxy 940): MercuryPoster (wallpaper) re-armed with its float RTs as RGB10A2 */
 +	BGMTL_DIR "bgmtl-bb.noluma",    /* bit 7 (26 Nov): backboardd skips CoreAnimation's per-frame luma_boost pass */
  };
  
@@ -69,7 +69,7 @@ diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
  		/* wait for the root mount (rd=ufsroot0), at most 120 s */
  		for (int i = 0; i < 1200 && rootvnode == NULLVP; i++) {
  			IOSleep(100);
-@@ -87,6 +98,16 @@ begonia_autotest_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -87,7 +98,23 @@ begonia_autotest_thread(void *arg __unused, wait_result_t wr __unused)
  			} else if (autotest_bgmtl == 0) {
  				autotest_remove(BGMTL_DIR "bgmtl-bb.arm");
  			}
@@ -84,9 +84,16 @@ diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
 +				}
 +			}
  			if (autotest_bgflags != ~0u) {
++				if (autotest_bgflags & (1u << 6)) {
++					/* the wallpaper's process back on the GPU: its kill switch (written by the RAW64 fault) goes */
++					autotest_remove(BGMTL_DIR "bgmtl.off");
++					autotest_remove(BGMTL_DIR "bgmtl.state");
++					autotest_touch(BGMTL_DIR "bgmtl.arm");
++				}
  				for (uint32_t i = 0; i < sizeof(autotest_flag_files) / sizeof(autotest_flag_files[0]); i++) {
  					if (autotest_bgflags & (1u << i)) {
-@@ -123,11 +144,12 @@ begonia_autotest_init(void)
+ 						autotest_touch(autotest_flag_files[i]);
+@@ -123,11 +150,12 @@ begonia_autotest_init(void)
  	(void)PE_parse_boot_argn("begoniabgmtl", &autotest_bgmtl, sizeof(autotest_bgmtl));
  	(void)PE_parse_boot_argn("begoniareboot", &autotest_reboot, sizeof(autotest_reboot));
  	(void)PE_parse_boot_argn("begoniabgflags", &autotest_bgflags, sizeof(autotest_bgflags));
