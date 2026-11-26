@@ -124,10 +124,60 @@ diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
  		thread_deallocate(thread);
  	} else {
  		printf("BEGONIA AUTOTEST: kernel_thread_start failed\n");
+diff --git a/bsd/dev/begonia_drivers.h b/bsd/dev/begonia_drivers.h
+--- a/bsd/dev/begonia_drivers.h
++++ b/bsd/dev/begonia_drivers.h
+@@ -34,6 +34,8 @@ void begonia_mali_unmap_range(uint64_t gpu_va, uint64_t size);
+ void begonia_mali_mmu_flush(void);
+ uint64_t begonia_mali_submit(uint64_t jc_va, bool fragment);
+ bool begonia_mali_wait(uint64_t seq, uint64_t timeout_ns);
++uint64_t begonia_mali_submitted_seq(void);   /* 950: last job queued */
++uint64_t begonia_mali_done_seq(void);        /* 950: last job finished */
+ void begonia_mali_note_cache_ns(uint64_t ns);     /* 25 Nov: SweetMali cache sync time, for the GPU stats */
+ void begonia_mali_note_client(int delta);
+ void begonia_mali_note_buffer(uint64_t addr, uint64_t size);
 diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
 --- a/bsd/dev/begonia_mali.c
 +++ b/bsd/dev/begonia_mali.c
-@@ -945,6 +945,7 @@ begonia_mali_init(void)
+@@ -9,6 +9,7 @@
+ #include <kern/clock.h>
+ #include <kern/locks.h>
+ #include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+@@ -199,6 +200,8 @@ static LCK_MTX_DECLARE(mali_mtx, &mali_grp);
+ static uint32_t g_stage, g_gpu_id, g_shader_mask, g_tiler_mask, g_l2_mask, g_js_mask, g_va_bits, g_freq_khz;
+ static uint32_t g_clients, g_buffers, g_submits, g_faults, g_resets;
+ static uint64_t g_seq, g_done_seq;
++static uint32_t g_async;                 /* 950: asynchronous job queue (defined with the queue below) */
++static void mali_q_worker(void *arg, wait_result_t wr);
+ static bool g_started, g_ready, g_lost;
+ static uint32_t g_exp_mask, g_exp_adapt, g_exp_step, g_exp_step_faults, g_dumps;
+ static uint32_t g_exp_done_logged = ~0u, g_lost_faults = MALI_LOST_FAULTS;
+@@ -900,6 +903,20 @@ begonia_mali_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	begonia_mali_bringup();
+ 	printf("BEGONIA MALI: bring-up done: stage %u/6, %s\n", g_stage, g_ready ? "GPU ready" : "no GPU");
++	(void)PE_parse_boot_argn("begoniamaliasync", &g_async, sizeof(g_async));
++	if (g_ready && g_async) {
++		thread_t jt;
++		if (kernel_thread_start(mali_q_worker, NULL, &jt) == KERN_SUCCESS) {
++			thread_set_thread_name(jt, "begonia mali jobs");
++			thread_deallocate(jt);
++			printf("BEGONIA MALI: asynchronous job queue on (begoniamaliasync=0 = synchronous)\n");
++		} else {
++			g_async = 0u;
++			printf("BEGONIA MALI: job thread failed: synchronous submits\n");
++		}
++	} else {
++		g_async = 0u;
++	}
+ 	/* returning ends the thread (Call_continuation -> thread_terminate) */
+ }
+ 
+@@ -945,6 +962,7 @@ begonia_mali_init(void)
  	 * GPU wait for the SweetMali service / begonia_mali_ready().
  	 */
  	if (kernel_thread_start(begonia_mali_thread, NULL, &thread) == KERN_SUCCESS) {
@@ -135,6 +185,290 @@ diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
  		thread_deallocate(thread);
  		printf("BEGONIA MALI: bring-up started in a kernel thread\n");
  	} else {
+@@ -957,7 +975,7 @@ bool begonia_mali_ready(void) { return g_ready; }
+ bool begonia_mali_lost(void) { return g_lost || g_faults > g_lost_faults; }
+ uint32_t begonia_mali_gpu_id(void) { return g_gpu_id; }
+ uint32_t begonia_mali_va_bits(void) { return g_va_bits; }
+-uint64_t begonia_mali_last_seq(void) { return g_done_seq; }
++uint64_t begonia_mali_last_seq(void) { return g_seq; }
+ uint32_t begonia_mali_faults(void) { return g_faults; }
+ 
+ bool
+@@ -994,26 +1012,24 @@ begonia_mali_param(uint32_t which, uint64_t *value)
+ 	return false;
+ }
+ 
+-uint64_t
+-begonia_mali_submit(uint64_t jc_va, bool fragment)
++static bool
++mali_run_job(uint64_t jc_va, bool fragment, uint64_t seq)
+ {
+ 	uint32_t slot = fragment ? 0u : 1u;
+ 	uint32_t js = JS_SLOT(slot);
+ 	uint32_t done = 1u << slot;
+ 	uint32_t irqm = done | (1u << (slot + 16u));
+ 	uint32_t irq = 0u;
+-	uint64_t seq;
+ 
+ 	if (!g_ready || jc_va == 0u) {
+-		return 0u;
++		return false;
+ 	}
+ 	lck_mtx_lock(&mali_mtx);
+ 	if (g_lost) {
+ 		lck_mtx_unlock(&mali_mtx);
+-		return 0u;
++		return false;
+ 	}
+ 	g_submits++;
+-	seq = ++g_seq;
+ 	wr32(mali, JOB_INT_CLEAR, irqm);
+ 	if (!wait_mask(mali, js + JS_COMMAND_NEXT, 0xffu, 0u, 50u)) {
+ 		printf("BEGONIA MALI: slot %u still busy (JS_STATE=%#x): resetting\n", slot, rd32(mali, JOB_INT_JS_STATE));
+@@ -1021,7 +1037,7 @@ begonia_mali_submit(uint64_t jc_va, bool fragment)
+ 			g_lost = true;
+ 			printf("BEGONIA MALI: GPU reset failed: reporting the GPU LOST\n");
+ 			lck_mtx_unlock(&mali_mtx);
+-			return 0u;
++			return false;
+ 		}
+ 	}
+ 	uint32_t affinity = (g_exp_mask & EXP_ONE_CORE) ? (g_shader_mask & (~g_shader_mask + 1u)) : g_shader_mask;
+@@ -1083,15 +1099,108 @@ begonia_mali_submit(uint64_t jc_va, bool fragment)
+ 	wr32(mali, JOB_INT_CLEAR, irqm);
+ 	g_done_seq = seq;
+ 	lck_mtx_unlock(&mali_mtx);
++	return true;
++}
++
++/*
++ * 27 Nov 2026 (Loxy 950): asynchronous submission. A submit used to start its job and poll for the end in the caller:
++ * Chlorophyll's commit (~20 render passes a frame = ~40 jobs) waited for every job, so the compositor could never run
++ * ahead of the GPU and each frame cost its CPU time PLUS its GPU time. Now a submit queues the job and returns its
++ * sequence number; the "begonia mali jobs" thread runs the queue in order with the same start/poll code, and
++ * begonia_mali_wait() blocks until a number is done (WAIT_SEQ, WAIT_BO, Mesa's fences, GEM_CLOSE, SweetFB's swap gate).
++ * begoniamaliasync=0 keeps the synchronous path.
++ */
++#define MALI_QLEN       256u
++struct mali_qjob {
++	uint64_t jc_va;
++	uint64_t seq;
++	bool fragment;
++};
++static struct mali_qjob g_q[MALI_QLEN];
++static uint32_t g_q_head, g_q_tail;     /* head: next job to run, tail: next free entry */
++static uint32_t g_async = 1u;
++static LCK_MTX_DECLARE(mali_q_mtx, &mali_grp);
++
++static void
++mali_q_worker(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		lck_mtx_lock(&mali_q_mtx);
++		while (g_q_head == g_q_tail) {
++			(void)lck_mtx_sleep(&mali_q_mtx, LCK_SLEEP_DEFAULT, (event_t)&g_q_tail, THREAD_UNINT);
++		}
++		struct mali_qjob j = g_q[g_q_head];
++		lck_mtx_unlock(&mali_q_mtx);
++		(void)mali_run_job(j.jc_va, j.fragment, j.seq);    /* a failed or lost job is done as well */
++		lck_mtx_lock(&mali_q_mtx);
++		if (j.seq > g_done_seq) {
++			g_done_seq = j.seq;
++		}
++		g_q_head = (g_q_head + 1u) % MALI_QLEN;
++		lck_mtx_unlock(&mali_q_mtx);
++		thread_wakeup((event_t)&g_q_head);
++		thread_wakeup((event_t)&g_done_seq);
++	}
++}
++
++uint64_t
++begonia_mali_submit(uint64_t jc_va, bool fragment)
++{
++	uint64_t seq;
++
++	if (!g_ready || jc_va == 0u || g_lost) {
++		return 0u;
++	}
++	lck_mtx_lock(&mali_q_mtx);
++	if (!g_async) {
++		seq = ++g_seq;
++		lck_mtx_unlock(&mali_q_mtx);
++		bool ok = mali_run_job(jc_va, fragment, seq);
++		thread_wakeup((event_t)&g_done_seq);
++		return ok ? seq : 0u;
++	}
++	while ((g_q_tail + 1u) % MALI_QLEN == g_q_head) {
++		(void)lck_mtx_sleep(&mali_q_mtx, LCK_SLEEP_DEFAULT, (event_t)&g_q_head, THREAD_UNINT);
++	}
++	seq = ++g_seq;
++	g_q[g_q_tail].jc_va = jc_va;
++	g_q[g_q_tail].seq = seq;
++	g_q[g_q_tail].fragment = fragment;
++	g_q_tail = (g_q_tail + 1u) % MALI_QLEN;
++	lck_mtx_unlock(&mali_q_mtx);
++	thread_wakeup((event_t)&g_q_tail);
+ 	return seq;
+ }
+ 
+ bool
+-begonia_mali_wait(uint64_t seq, __unused uint64_t timeout_ns)
++begonia_mali_wait(uint64_t seq, uint64_t timeout_ns)
+ {
+-	return seq <= g_done_seq;
++	if (seq <= g_done_seq) {
++		return true;
++	}
++	if (timeout_ns == 0u) {
++		return false;
++	}
++	if (timeout_ns > 10ull * NSEC_PER_SEC) {
++		timeout_ns = 10ull * NSEC_PER_SEC;
++	}
++	uint64_t deadline = 0;
++	clock_interval_to_deadline((uint32_t)(timeout_ns / 1000u) + 1u, NSEC_PER_USEC, &deadline);
++	lck_mtx_lock(&mali_q_mtx);
++	while (seq > g_done_seq) {
++		if (lck_mtx_sleep_deadline(&mali_q_mtx, LCK_SLEEP_DEFAULT, (event_t)&g_done_seq, THREAD_UNINT, deadline) ==
++		    THREAD_TIMED_OUT) {
++			break;
++		}
++	}
++	bool ok = seq <= g_done_seq;
++	lck_mtx_unlock(&mali_q_mtx);
++	return ok;
+ }
+ 
++uint64_t begonia_mali_submitted_seq(void) { return g_seq; }
++uint64_t begonia_mali_done_seq(void) { return g_done_seq; }
++
+ void
+ begonia_mali_note_client(int delta)
+ {
+diff --git a/bsd/dev/begonia_mali_mmu.c b/bsd/dev/begonia_mali_mmu.c
+--- a/bsd/dev/begonia_mali_mmu.c
++++ b/bsd/dev/begonia_mali_mmu.c
+@@ -50,7 +50,6 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define MALI_VA_BASE            0x10000000ull
+ #define MALI_VA_LIMIT           0xf0000000ull
+-#define MALI_FREE_SLOTS         256u
+ #define PT_HASH_BUCKETS         1024u
+ 
+ struct pt_rec {
+@@ -59,11 +58,6 @@ struct pt_rec {
+ 	struct pt_rec *next;
+ };
+ 
+-struct va_free_slot {
+-	uint64_t addr;
+-	uint64_t size;
+-};
+-
+ static LCK_GRP_DECLARE(mali_mmu_grp, "begonia-mali-mmu");
+ static LCK_MTX_DECLARE(mali_mmu_mtx, &mali_mmu_grp);
+ 
+@@ -73,8 +67,17 @@ static vm_offset_t g_pt_slab_va, g_meta_slab_va;
+ static uint64_t g_pt_slab_pa, g_pt_root_pa, *g_pt_root_va;
+ static uint32_t g_pt_slab_off = PAGE_SIZE, g_meta_slab_off = PAGE_SIZE;
+ static struct pt_rec *g_pt_hash[PT_HASH_BUCKETS];
+-static uint64_t g_va_cursor = MALI_VA_BASE;
+-static struct va_free_slot g_va_free[MALI_FREE_SLOTS];
++/*
++ * 27 Nov 2026 (Loxy 950): GPU VA as a page bitmap, first fit. The old allocator was a bump cursor plus 256 free slots
++ * that never merged: past 256 outstanding frees a freed range was dropped for good, and every allocation that missed the
++ * slots took fresh VA (and fresh page tables). CoreAnimation makes and drops BOs all the time, so after a few minutes
++ * CREATE_BO failed ("DRM_IOCTL_PANFROST_CREATE_BO failed", panfrost_batch_init failed): black frames, then the GPU dead-
++ * man. First fit keeps the used VA low and compact, so page tables are reused as well.
++ */
++#define MALI_VA_PAGES           ((uint32_t)((MALI_VA_LIMIT - MALI_VA_BASE) >> 12))
++static uint64_t g_va_map[MALI_VA_PAGES / 64u];
++static uint32_t g_va_low;       /* no free page below this index */
++static uint32_t g_va_used;      /* pages in use */
+ /* AS0 MEMATTR: 0x88 = write-back, Midgard-inner shareability, implementation-defined allocation (kbase default) */
+ static uint32_t g_memattr_lo = 0x88888888u, g_memattr_hi = 0x88888888u;
+ 
+@@ -396,20 +399,44 @@ begonia_mali_va_alloc(uint64_t size)
+ 	if (size == 0u) {
+ 		return 0u;
+ 	}
++	uint64_t np = size >> 12;
++	if (np > MALI_VA_PAGES) {
++		return 0u;
++	}
+ 	lck_mtx_lock(&mali_mmu_mtx);
+-	for (uint32_t i = 0; i < MALI_FREE_SLOTS; i++) {
+-		if (g_va_free[i].size >= size) {
+-			addr = g_va_free[i].addr;
+-			g_va_free[i].addr += size;
+-			g_va_free[i].size -= size;
++	uint32_t run = 0, run_start = 0;
++	for (uint32_t pg = g_va_low; pg < MALI_VA_PAGES; pg++) {
++		if (run == 0u && (pg & 63u) == 0u && g_va_map[pg >> 6] == ~0ull) {
++			pg += 63u;      /* a full word */
++			continue;
++		}
++		if ((g_va_map[pg >> 6] >> (pg & 63u)) & 1ull) {
++			run = 0;
++			continue;
++		}
++		if (run == 0u) {
++			run_start = pg;
++		}
++		if (++run == (uint32_t)np) {
++			for (uint32_t q = run_start; q < run_start + run; q++) {
++				g_va_map[q >> 6] |= 1ull << (q & 63u);
++			}
++			addr = MALI_VA_BASE + ((uint64_t)run_start << 12);
++			g_va_used += run;
++			if (run_start == g_va_low) {
++				g_va_low = run_start + run;
++			}
+ 			break;
+ 		}
+ 	}
+-	if (addr == 0u && g_va_cursor + size <= MALI_VA_LIMIT) {
+-		addr = g_va_cursor;
+-		g_va_cursor += size;
+-	}
+ 	lck_mtx_unlock(&mali_mmu_mtx);
++	if (addr == 0u) {
++		static uint32_t told;
++		if (told++ < 8u) {
++			printf("BEGONIA MALI: GPU VA full: %llu pages wanted, %u of %u in use\n", (unsigned long long)np, g_va_used,
++			    MALI_VA_PAGES);
++		}
++	}
+ 	return addr;
+ }
+ 
+@@ -420,14 +447,21 @@ begonia_mali_va_free(uint64_t gpu_va, uint64_t size)
+ 	if (gpu_va == 0u || size == 0u) {
+ 		return;
+ 	}
++	if (gpu_va < MALI_VA_BASE || gpu_va + size > MALI_VA_LIMIT) {
++		return;
++	}
++	uint32_t first = (uint32_t)((gpu_va - MALI_VA_BASE) >> 12), n = (uint32_t)(size >> 12);
+ 	lck_mtx_lock(&mali_mmu_mtx);
+-	for (uint32_t i = 0; i < MALI_FREE_SLOTS; i++) {
+-		if (g_va_free[i].size == 0u) {
+-			g_va_free[i].addr = gpu_va;
+-			g_va_free[i].size = size;
+-			break;
++	for (uint32_t q = first; q < first + n; q++) {
++		uint64_t bit = 1ull << (q & 63u);
++		if (g_va_map[q >> 6] & bit) {
++			g_va_map[q >> 6] &= ~bit;
++			g_va_used--;
+ 		}
+ 	}
++	if (first < g_va_low) {
++		g_va_low = first;
++	}
+ 	lck_mtx_unlock(&mali_mmu_mtx);
+ }
+ 
 diff --git a/bsd/dev/begonia_touch.c b/bsd/dev/begonia_touch.c
 --- a/bsd/dev/begonia_touch.c
 +++ b/bsd/dev/begonia_touch.c
@@ -227,7 +561,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  
  void begonia_usb_init(void);
  
-@@ -1055,16 +1074,1111 @@ parse_hex(const char *s, uint32_t *out)
+@@ -1055,16 +1074,1112 @@ parse_hex(const char *s, uint32_t *out)
  	return digits > 0;
  }
  
@@ -874,9 +1208,10 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +begonia_uc_account(uint32_t cls, uint32_t sel, uint64_t abs)
 +{
 +	int want = uc_pid;
-+	if (want < 0 || cls >= 4u || sel >= 64u || (want > 0 && proc_selfpid() != want)) {
++	if (want < 0 || cls >= 4u || (want > 0 && proc_selfpid() != want)) {
 +		return;
 +	}
++	sel &= 63u;     /* 950: SweetMali's selectors are 0x40..0x7d (SUBMIT 0x40 -> 0, CREATE_BO 0x42 -> 2, WAIT_SEQ 0x7d -> 61) */
 +	uc_cnt[cls][sel]++;
 +	uc_tot[cls][sel] += abs;
 +	if (abs > uc_max[cls][sel]) {
@@ -1340,7 +1675,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  	} else if (strcmp(line, "fb") == 0) {
  		usb_fb_start(2u);
  	} else if (strncmp(line, "fb ", 3) == 0) {
-@@ -1079,7 +2193,7 @@ usb_cmd(char *line)
+@@ -1079,7 +2194,7 @@ usb_cmd(char *line)
  		usb.reboot_at = mach_absolute_time() + delta;
  		printf("BEGONIA USB: reboot in 2 s\n");
  	} else if (strncmp(line, "peek ", 5) == 0 && parse_hex(line + 5, &pa) && (pa & 3u) == 0 &&
@@ -1349,7 +1684,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		uint32_t page = pa & ~0xfffu;
  		if (usb.peek_va == 0 || usb.peek_page != page) {
  			usb.peek_va = ml_io_map(page, 0x1000);
-@@ -1137,6 +2251,27 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1137,6 +2252,27 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  		printf("BEGONIA USB: ml_io_map failed\n");
  		return;
  	}
@@ -1377,7 +1712,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  	if (!usb_hw_start()) {
  		printf("BEGONIA USB: not started\n");
  		return;
-@@ -1144,7 +2279,19 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1144,7 +2280,19 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  	nanoseconds_to_absolutetime(30ULL * NSEC_PER_SEC, &stat_gap);
  	usb.t0 = mach_absolute_time();
  	next_stat = usb.t0 + stat_gap;
@@ -1397,7 +1732,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		usb_bus_poll();
  		ep0_poll();
  		if (usb.configured) {
-@@ -1153,6 +2300,9 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1153,6 +2301,9 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  				usb_tx_poll();
  			}
  		}
@@ -1407,7 +1742,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		if (usb.reboot_at != 0 && mach_absolute_time() >= usb.reboot_at) {
  			usb.reboot_at = 0;
  			printf("BEGONIA USB: rebooting\n");
-@@ -1186,6 +2336,7 @@ begonia_usb_init(void)
+@@ -1186,6 +2337,7 @@ begonia_usb_init(void)
  		return;
  	}
  	if (kernel_thread_start(begonia_usb_thread, NULL, &thread) == KERN_SUCCESS) {
@@ -1418,7 +1753,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -49,10 +49,19 @@ extern "C" void sweet_busy_init(void);          /* iokit/Kernel/arm/SweetBusy.cp
+@@ -49,10 +49,47 @@ extern "C" void sweet_busy_init(void);          /* iokit/Kernel/arm/SweetBusy.cp
  extern "C" int sweet_smmu_probe_sid(unsigned sid, unsigned level); /* bsd/dev/sweet_smmu.c, read only */
  extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb */
  extern "C" int sweet_fb_hud;
@@ -1428,6 +1763,34 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  extern "C" bool sweet_gpu_blit_window(uint64_t pa, uint64_t size);      /* bsd/dev/sweet_a630.c (0240) */
  extern "C" uint32_t sweet_gpu_blit(uint64_t src_pa, uint32_t src_pitch, uint64_t dst_pa, uint32_t dst_pitch, uint32_t w, uint32_t h);
  extern "C" bool sweet_gpu_fence_passed(uint32_t fence);                    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_hud (patch 0213) */
++extern "C" uint64_t begonia_mali_submitted_seq(void);   /* bsd/dev/begonia_mali.c (950) */
++extern "C" uint64_t begonia_mali_done_seq(void);
++/*
++ * begonia 950: Mali jobs run asynchronously, so a swap can arrive before the GPU has finished drawing the frame. The
++ * swap gate (0229) used the Adreno ring's fence, which is 0 (= always passed) on begonia; these take the Mali sequence
++ * numbers instead: a swap waits for every job queued before it.
++ */
++static uint32_t
++bg_fence_snapshot(void)
++{
++	uint32_t f = sweet_gpu_fence_snapshot();
++	if (f != 0u || !sweet_board_begonia()) {
++		return f;
++	}
++	f = (uint32_t)begonia_mali_submitted_seq();
++	return f != 0u ? f : 0u;
++}
++static bool
++bg_fence_passed(uint32_t f)
++{
++	if (f == 0u) {
++		return true;
++	}
++	if (!sweet_board_begonia() || sweet_gpu_fence_snapshot() != 0u) {
++		return sweet_gpu_fence_passed(f);
++	}
++	return (int32_t)((uint32_t)begonia_mali_done_seq() - f) >= 0;
++}
 +/* begonia (Loxy 940): bsd/dev/begonia_disp.c, the MT6785 display engine LK left running */
 +extern "C" bool begonia_disp_init(uint64_t fb_pa);
 +extern "C" uint64_t begonia_disp_next_sof(uint64_t from, int64_t *err_out);
@@ -1438,7 +1801,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  
  /*
   * 0228: per-frame trace for frame pacing (sysctl kern.sweet_fb_trace). One record per swap id (ring of 128, index id & 127):
-@@ -392,6 +401,8 @@ public:
+@@ -392,6 +429,8 @@ public:
  		uint64_t emptySwaps, emptyKept;                         /* 0233: swaps with no layer / of those, the ones that kept the frame */
  		uint64_t scanCopies, scanCopyAbs, scanCopyMaxAbs;       /* 0235: frames copied to a scan-out buffer, their time */
  		uint64_t scanGpuCopies, scanGpuFallbacks;               /* 0240: of those, copied by the GPU / by the CPU after a GPU failure */
@@ -1447,7 +1810,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint64_t scanGpuSubmitFails, scanGpuLate, scanGpuWaitMaxAbs; /* 0247: blits not submitted / not landed in 1 s; longest wait */
  	} fSt, fStPrev;
  	/*
-@@ -473,6 +484,17 @@ public:
+@@ -473,6 +512,17 @@ public:
  	vm_offset_t   fBlPwm;           /* begonia MT6785 disp_pwm0 @ 0x1100e000 */
  	uint32_t      fBlPwmPeriod;
  	bool          begoniaPwmWrite(uint32_t high);
@@ -1465,7 +1828,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	void          blInit(void);
  	bool          blStep(int dir);
  	bool          blSet(bool on);   /* 0242: the backlight straight to iOS's state (no ramp), retried; false: it did not take */
-@@ -485,6 +507,7 @@ public:
+@@ -485,6 +535,7 @@ public:
  	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
  	IOMemoryMap  *fMap;
  	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
@@ -1473,7 +1836,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLock       *fLock;            /* swaps and client list */
  	OSArray      *fClients;
  	uint32_t      fSwapID;
-@@ -815,6 +838,55 @@ AppleCLCD::start(IOService *provider)
+@@ -815,6 +866,55 @@ AppleCLCD::start(IOService *provider)
  			IOLog("SWEET FB: backlight fade off (sweetfb_blfade=0): black in one step\n");
  		}
  	}
@@ -1529,7 +1892,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
  	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
  		IOLog("SWEET FB: no vsync timer\n");
-@@ -921,7 +993,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -921,7 +1021,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	AppleCLCD *fb = (AppleCLCD *)owner;
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
@@ -1548,7 +1911,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	/*
  	 * 0216: with sweetfb_vsyncalign the notification carries the time of the latest panel vsync that SwapWait saw (the
  	 * MDP latch, a real vsync of the panel) projected forward by whole periods, and the timer is re-armed for the next
-@@ -982,11 +1065,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -982,11 +1093,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		if (fb->fBlOK && fb->fBlPos != 0 && !fb->fBlOffFailed && !fb->blSet(false)) {
  			fb->fBlOffFailed = true;
  		}
@@ -1563,7 +1926,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		return;
  	}
  	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && fb->gpuGateOpen(mach_absolute_time());
-@@ -1030,6 +1113,30 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -1030,6 +1141,30 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	sweet_hold_release(taken);      /* copied: CA may render into them again */
  	fb->statsTick(now);
  	fb->hudTick(now);
@@ -1594,7 +1957,16 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	sender->setTimeoutUS(nextUS);
  }
  
-@@ -1190,6 +1297,21 @@ AppleCLCD::statsTick(uint64_t now)
+@@ -1046,7 +1181,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ bool
+ AppleCLCD::gpuGateOpen(uint64_t now)
+ {
+-	if (sweet_gpu_fence_passed(fPendFence)) {
++	if (bg_fence_passed(fPendFence)) {
+ 		return true;
+ 	}
+ 	uint64_t cap;
+@@ -1190,6 +1325,21 @@ AppleCLCD::statsTick(uint64_t now)
  	    c.scanGpuSubmitFails, c.scanGpuLate, sweet_abs_us(c.scanGpuWaitMaxAbs));
  	#undef PER_S
  	sweet_fb_stats_publish(line);
@@ -1616,7 +1988,39 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
  		fStLogT = now;
  		IOLog("SWEET FB: stats %s", line);
-@@ -2668,6 +2790,31 @@ bool
+@@ -1288,7 +1438,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ 	IOLockLock(fLock);
+ 	fSt.swaps++;
+-	fPendFence = sweet_gpu_fence_snapshot();
++	fPendFence = bg_fence_snapshot();
+ 	fPendAbs = mach_absolute_time();
+ 	__atomic_store_n(&fSwapNewest, get32(rec, 0x50), __ATOMIC_RELEASE);
+ 	{
+@@ -2294,7 +2444,7 @@ AppleCLCD::scanBlitPoll(void)
+ 	 * buffer scanned anyway, as before, so the panel cannot freeze for good.
+ 	 */
+ 	uint64_t waited = mach_absolute_time() - fScanBlitAbs;
+-	if (!sweet_gpu_fence_passed(fScanBlitFence)) {
++	if (!bg_fence_passed(fScanBlitFence)) {
+ 		uint64_t lim;
+ 		nanoseconds_to_absolutetime(1000 * NSEC_PER_MSEC, &lim);
+ 		if (waited < lim) {
+@@ -2437,11 +2587,11 @@ AppleCLCD::scanCopyPresent(SweetSurface *s, uint32_t id)
+ 			/* 0241: swapFired did not hold this swap for the GPU (it expected a GPU copy): wait for its work here */
+ 			uint64_t lim;
+ 			nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &lim);
+-			while (!sweet_gpu_fence_passed(fPendFence) && mach_absolute_time() - t0 < lim) {
++			while (!bg_fence_passed(fPendFence) && mach_absolute_time() - t0 < lim) {
+ 				IODelay(50);
+ 			}
+ 			/* a GPU copy still in flight into this buffer would land on top of the CPU's: let it finish, and drop its scan */
+-			while (fScanBlitT >= 0 && !sweet_gpu_fence_passed(fScanBlitFence) && mach_absolute_time() - t0 < 2 * lim) {
++			while (fScanBlitT >= 0 && !bg_fence_passed(fScanBlitFence) && mach_absolute_time() - t0 < 2 * lim) {
+ 				IODelay(50);
+ 			}
+ 			fScanBlitT = -1;
+@@ -2668,6 +2818,31 @@ bool
  AppleCLCD::blSet(bool on)
  {
  	if (sweet_board_begonia()) {
@@ -1648,7 +2052,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint32_t high = on ? (((uint32_t)(fBlRaw[0] & 0xfffu) * fBlPwmPeriod + 2047u) / 4095u) : 0u;
  		if (begoniaPwmWrite(high)) {
  			fBlPos = on ? SWEET_FB_BL_STEPS : 0;
-@@ -3436,6 +3583,22 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -3436,6 +3611,22 @@ AppleCLCD::present(const uint8_t *rec)
  				}
  			}
  		}
@@ -1671,7 +2075,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
  		if (w <= 0 || h <= 0) {
  			w = (int32_t)s->width;
-@@ -3590,18 +3753,30 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+@@ -3590,18 +3781,30 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
  
  static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
  
@@ -1706,7 +2110,15 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
 --- a/iokit/Kernel/arm/SweetMali.cpp
 +++ b/iokit/Kernel/arm/SweetMali.cpp
-@@ -443,6 +443,11 @@ void SweetMaliUserClient::syncSubmitSurfaces(struct sweet_mali_submit *r, uint32
+@@ -196,6 +196,7 @@ void SweetMaliUserClient::freeSlot(struct mali_gem_slot *b)
+ 
+ IOReturn SweetMaliUserClient::clientClose(void)
+ {
++	(void)begonia_mali_wait(begonia_mali_submitted_seq(), 2000ull * NSEC_PER_MSEC);   /* 950: queued jobs may use its BOs */
+ 	IOLockLock(gMaliClientLock);
+ 	if (!fClosed) {
+ 		fClosed = true;
+@@ -443,6 +444,12 @@ void SweetMaliUserClient::syncSubmitSurfaces(struct sweet_mali_submit *r, uint32
  			if (cached && !b->readonly) {
  				mali_cache_range(b->kva, b->size, true);
  			}
@@ -1714,11 +2126,12 @@ diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
 +				/* 940: the GPU may have written it; a CPU lock (SweetSurface) or the framebuffer's copy drops stale
 +				 * CPU lines of it before reading */
 +				__atomic_add_fetch(&b->surface->gpuBlits, 1u, __ATOMIC_RELEASE);
++				__atomic_store_n(&b->surface->gpuWriteSeq, seq, __ATOMIC_RELEASE);     /* 950: CPU locks wait for it */
 +			}
  			/* display-sized surfaces only: the compositor's framebuffers (828x1792 here) */
  			if (fragment && b->surface != NULL && !b->readonly && b->surface->width >= 600u &&
  			    b->surface->height >= 1200u) {
-@@ -479,9 +484,21 @@ IOReturn SweetMaliUserClient::submitJobs(struct sweet_mali_submit *r)
+@@ -479,9 +486,21 @@ IOReturn SweetMaliUserClient::submitJobs(struct sweet_mali_submit *r)
  	return kIOReturnSuccess;
  }
  
@@ -1740,6 +2153,25 @@ diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
  	union {
  		struct sweet_mali_gem_close close;
  		struct sweet_mali_submit submit;
+@@ -531,6 +550,18 @@ IOReturn SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethod
+ 		return ret;
+ 	}
+ 
++	if (selector == SWEET_MALI_SEL_GEM_CLOSE) {      /* 950: a queued job may still use the BO: wait for it first */
++		uint64_t ls = 0;
++		IOLockLock(gMaliClientLock);
++		struct mali_gem_slot *gb = boSlot(req.close.handle);
++		if (gb != NULL) {
++			ls = gb->last_seq;
++		}
++		IOLockUnlock(gMaliClientLock);
++		if (ls != 0u) {
++			(void)begonia_mali_wait(ls, 2000ull * NSEC_PER_MSEC);
++		}
++	}
+ 	IOLockLock(gMaliClientLock);
+ 	switch (selector) {
+ 	case SWEET_MALI_SEL_GET_PARAM:
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
@@ -1824,7 +2256,7 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
  	uint64_t arg0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
  
  	switch (selector) {
-@@ -1648,6 +1703,62 @@ sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
+@@ -1648,6 +1703,70 @@ sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
  	return kIOReturnSuccess;
  }
  
@@ -1866,9 +2298,17 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
 +	}
 +}
 +
++extern "C" bool begonia_mali_wait(uint64_t seq, uint64_t timeout_ns);   /* bsd/dev/begonia_mali.c (950) */
++
 +static void
 +sweet_surface_cpu_acquire(SweetSurface *s)
 +{
++	if (sweet_board_begonia()) {    /* 950: Mali jobs run asynchronously: a CPU reader waits for the GPU's writes */
++		uint64_t ws = __atomic_load_n(&s->gpuWriteSeq, __ATOMIC_ACQUIRE);
++		if (ws != 0u) {
++			(void)begonia_mali_wait(ws, 200ull * NSEC_PER_MSEC);
++		}
++	}
 +	if (!sweet_board_begonia() || s->pooled || s->wrapped || s->memory == NULL ||
 +	    OSDynamicCast(IOBufferMemoryDescriptor, s->memory) == NULL) {
 +		return;
@@ -1887,7 +2327,7 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
  /* Retained surface this client created or looked up, or NULL. */
  static SweetSurface *
  sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
-@@ -1674,6 +1785,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+@@ -1674,6 +1793,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
  	if (s == NULL) {
  		return kIOReturnNotFound;
  	}
@@ -1895,7 +2335,7 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
  	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
  	s->release();
  	return ret;
-@@ -1689,6 +1801,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+@@ -1689,6 +1809,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
  	}
  	if (!((uintptr_t)options & kIOSurfaceLockReadOnly)) {
  		__atomic_add_fetch(&s->cpuWrites, 1, __ATOMIC_RELEASE);        /* the CPU may have written pixels: sweetfb_zcclean=3 cleans */
@@ -1906,19 +2346,20 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
 diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
 --- a/iokit/Kernel/arm/SweetSurface.h
 +++ b/iokit/Kernel/arm/SweetSurface.h
-@@ -52,8 +52,10 @@ public:
+@@ -52,8 +52,11 @@ public:
  	uint32_t                  gpuBlitsSeen; /* ... of which the framebuffer has already presented */
  	uint32_t                  cpuWrites;    /* write-unlocks (IOSurfaceUnlock without ReadOnly), patch 0216 */
  	uint32_t                  cpuWritesSeen;        /* ... of which the framebuffer has already scanned */
 +	uint32_t                  gpuBlitsCpuSeen;      /* begonia 940: GPU writes the CPU caches were invalidated for (at a lock) */
 +	uint32_t                  gpuBlitsFbSeen;       /* begonia 940: ... and for the framebuffer's copy */
++	uint64_t                  gpuWriteSeq;          /* begonia 950: last (asynchronous) Mali job that writes it */
  
 -	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; pooled = false; poolPages = 0; poolPA = 0; scanned = false; gpuBlits = 0; gpuBlitsSeen = 0; cpuWrites = 0; cpuWritesSeen = 0; return OSObject::init(); }
-+	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; pooled = false; poolPages = 0; poolPA = 0; scanned = false; gpuBlits = 0; gpuBlitsSeen = 0; cpuWrites = 0; cpuWritesSeen = 0; gpuBlitsCpuSeen = 0; gpuBlitsFbSeen = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; pooled = false; poolPages = 0; poolPA = 0; scanned = false; gpuBlits = 0; gpuBlitsSeen = 0; cpuWrites = 0; cpuWritesSeen = 0; gpuBlitsCpuSeen = 0; gpuBlitsFbSeen = 0; gpuWriteSeq = 0; return OSObject::init(); }
  	void free() APPLE_KEXT_OVERRIDE;
  
  	/* Kernel address of the pixels (mapped on first use; wrapped memory: of the first pixel), or 0. */
-@@ -71,6 +73,9 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+@@ -71,6 +74,9 @@ SweetSurface *sweet_surface_copy(uint32_t id);
  SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
      uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
  
