@@ -127,7 +127,7 @@ index 67912be..659f1aa 100644
  
     /* The viewport, and now its z as well. Gallium's window depth is
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index b3a614e..447df3e 100644
+index b3a614e..a5232bf 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
 @@ -175,6 +175,8 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCO
@@ -420,7 +420,7 @@ index b3a614e..447df3e 100644
        bg_unlock();
     }
     if (_linSrc && _tex) {
-@@ -1951,8 +2155,76 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1951,8 +2155,78 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
                  f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
        }
     }
@@ -429,9 +429,10 @@ index b3a614e..447df3e 100644
 +   // exact. The first 32 of them, in every process: their uniforms (fragment buffer 1), texture matrix (vertex buffer 3)
 +   // and the vertices of the indexed draw (vertex buffer 1, 48-byte vertices: position, texcoord0, texcoord1, colour).
 +   {
-+      static int tcn;
++      static int tcn, tcon = -1;
++      if (tcon < 0) tcon = access("/private/var/tmp/bgmtl.dumpatt", F_OK) == 0;
 +      const char *nm = _pipeline->_names;
-+      if (tcn < 32 && nm && strstr(nm, "+Tcim")) {
++      if (tcon && tcn < 32 && nm && strstr(nm, "+Tcim")) {
 +         tcn++;
 +         const float *u = _fbuf[1] ? (const float *)((const uint8_t *)[(BGMTLBuffer *)_fbuf[1] contents] + _foff[1]) : NULL;
 +         const float *tm = _vbuf[3] ? (const float *)((const uint8_t *)[(BGMTLBuffer *)_vbuf[3] contents] + _voff[3]) : NULL;
@@ -467,12 +468,13 @@ index b3a614e..447df3e 100644
 +   // Loxy (26 Nov 2026): the draws of CoreAnimation's corner clip (Tcim*, *S1* writing attachment 1, *M0/*M1 fetching an
 +   // attachment, *_Isup) get their attachments sampled after they ran (commit), at their vertices' pixel bounds: the first 60
 +   // per process, to see which step of the clip comes out wrong.
-+   static int dgn;
++   static int dgn, dgon = -1;      // only with /private/var/tmp/bgmtl.dumpatt (bgflags bit 4): each sample costs a GPU finish
++   if (dgon < 0) dgon = access("/private/var/tmp/bgmtl.dumpatt", F_OK) == 0;
 +   float dbox[4] = { 1e9f, 1e9f, -1e9f, -1e9f };
 +   BOOL dsel = NO;
 +   {
 +      const char *nm = _pipeline->_names;
-+      if (dgn < 60 && nm && _vbuf[1] && count && count <= 4096 &&
++      if (dgon && dgn < 60 && nm && _vbuf[1] && count && count <= 4096 &&
 +          (strstr(nm, "+Tcim") || strstr(nm, "S1X") || strstr(nm, "M1") || strstr(nm, "M0") || strstr(nm, "_Isup"))) {
 +         const uint8_t *base = (const uint8_t *)[(BGMTLBuffer *)_vbuf[1] contents] + _voff[1];
 +         NSUInteger blen = [(BGMTLBuffer *)_vbuf[1] length] - _voff[1];
@@ -587,7 +589,7 @@ index 4c7d2f6..c133c4c 100644
 +}
 +fragment half4 bg_fs_read1(V in [[stage_in]], half4 d1 [[color(1)]]) { return d1; }
 diff --git a/test/bgmtl_render_probe.m b/test/bgmtl_render_probe.m
-index 48ce6a2..678c6d6 100644
+index 48ce6a2..814566a 100644
 --- a/test/bgmtl_render_probe.m
 +++ b/test/bgmtl_render_probe.m
 @@ -12,8 +12,15 @@
@@ -687,77 +689,77 @@ index 48ce6a2..678c6d6 100644
 +         }
 +      }
 +#endif
-+      // ---- P12 (Loxy, 26 Nov 2026): CoreAnimation's corner clip writes colour attachment 1 and reads it back with
-+      // framebuffer fetch ([[color(1)]]). Left half red, right half blue into attachment 1; then attachment 1 copied into
-+      // attachment 0 by a fetch, in the same pass (a) and in a second pass that loads both (b) ----
++      // ---- P13 (Loxy, 26 Nov 2026): P12 (attachment 1 written, then fetched into attachment 0: passed) with CoreAnimation's
++      // blend states: its *S1* pipelines blend attachment 1 (One, OneMinusSourceAlpha), its *M1* ones blend attachment 0 the
++      // same way, and a diagnostic boot showed TcimA2Xhf_IsrcM1 leaving attachment 0 untouched over a white attachment 1.
++      // v0: fetch with attachment 0 not blended (P12); v1: blended, one pass; v2: blended, second pass ----
 +      {
-+         printf("== P12 colour attachment 1: write, then framebuffer fetch of it\n");
++         printf("== P13 attachment 1 fetch with CoreAnimation's blend states\n");
 +         static const float fq[6 * 8] = {
 +            -1, -1, 0, 1, 1, 1, 1, 1,   1, -1, 0, 1, 1, 1, 1, 1,   -1, 1, 0, 1, 1, 1, 1, 1,
 +             1, -1, 0, 1, 1, 1, 1, 1,   1, 1, 0, 1, 1, 1, 1, 1,    -1, 1, 0, 1, 1, 1, 1, 1 };
 +         id vb = [g_dev newBufferWithBytes:fq length:sizeof(fq) options:0];
-+         MTLRenderPipelineDescriptor *pw = [[MTLRenderPipelineDescriptor alloc] init];
-+         pw.vertexFunction = [rlib newFunctionWithName:@"bg_vs"];
-+         pw.fragmentFunction = [rlib newFunctionWithName:@"bg_fs_write1"];
-+         pw.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-+         pw.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
-+         pw.colorAttachments[1].pixelFormat = MTLPixelFormatBGRA8Unorm;
-+         MTLRenderPipelineDescriptor *pr = [[MTLRenderPipelineDescriptor alloc] init];
-+         pr.vertexFunction = [rlib newFunctionWithName:@"bg_vs"];
-+         pr.fragmentFunction = [rlib newFunctionWithName:@"bg_fs_read1"];
-+         pr.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-+         pr.colorAttachments[1].pixelFormat = MTLPixelFormatBGRA8Unorm;
-+         pr.colorAttachments[1].writeMask = MTLColorWriteMaskNone;
 +         NSError *err = nil;
-+         id psw = [g_dev newRenderPipelineStateWithDescriptor:pw error:&err];
-+         printf("  write pipeline: %s\n", psw ? "created" : (err ? [[err localizedDescription] UTF8String] : "nil"));
-+         id psr = [g_dev newRenderPipelineStateWithDescriptor:pr error:&err];
-+         printf("  fetch pipeline: %s\n", psr ? "created" : (err ? [[err localizedDescription] UTF8String] : "nil"));
-+         for (int variant = 0; variant < 2 && psw && psr && vb; variant++) {
++         id ps[3] = { nil, nil, nil };
++         for (int k = 0; k < 3; k++) {
++            MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
++            pd.vertexFunction = [rlib newFunctionWithName:@"bg_vs"];
++            pd.fragmentFunction = [rlib newFunctionWithName:k == 0 ? @"bg_fs_write1" : @"bg_fs_read1"];
++            pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
++            pd.colorAttachments[1].pixelFormat = MTLPixelFormatBGRA8Unorm;
++            MTLRenderPipelineColorAttachmentDescriptor *bl = pd.colorAttachments[k == 0 ? 1 : 0];
++            pd.colorAttachments[k == 0 ? 0 : 1].writeMask = MTLColorWriteMaskNone;
++            if (k != 1) {
++               bl.blendingEnabled = YES;
++               bl.sourceRGBBlendFactor = MTLBlendFactorOne;
++               bl.sourceAlphaBlendFactor = MTLBlendFactorOne;
++               bl.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
++               bl.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
++            }
++            ps[k] = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
++            printf("  pipeline %d: %s\n", k, ps[k] ? "created" : (err ? [[err localizedDescription] UTF8String] : "nil"));
++         }
++         for (int variant = 0; variant < 3 && ps[0] && ps[1] && ps[2] && vb; variant++) {
 +            id rt0 = tex2d(MTLPixelFormatBGRA8Unorm, 64, 64, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
 +            id rt1 = tex2d(MTLPixelFormatBGRA8Unorm, 64, 64, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
 +            id cb = [g_queue commandBuffer];
-+            for (int pass = 0; pass < (variant ? 2 : 1); pass++) {
++            for (int pass = 0; pass < (variant == 2 ? 2 : 1); pass++) {
 +               MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
 +               rp.colorAttachments[0].texture = rt0;
 +               rp.colorAttachments[1].texture = rt1;
 +               rp.colorAttachments[0].loadAction = pass ? MTLLoadActionLoad : MTLLoadActionClear;
 +               rp.colorAttachments[1].loadAction = pass ? MTLLoadActionLoad : MTLLoadActionClear;
 +               rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
-+               rp.colorAttachments[1].clearColor = MTLClearColorMake(0, 0, 0, 1);
++               rp.colorAttachments[1].clearColor = MTLClearColorMake(0, 0, 0, 0);
 +               rp.colorAttachments[0].storeAction = MTLStoreActionStore;
 +               rp.colorAttachments[1].storeAction = MTLStoreActionStore;
 +               id e = [cb renderCommandEncoderWithDescriptor:rp];
 +               [e setVertexBuffer:vb offset:0 atIndex:0];
 +               if (pass == 0) {
-+                  [e setRenderPipelineState:psw];
++                  [e setRenderPipelineState:ps[0]];
 +                  [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
 +               }
-+               if (variant == 0 || pass == 1) {
-+                  [e setRenderPipelineState:psr];
++               if (variant < 2 || pass == 1) {
++                  [e setRenderPipelineState:ps[variant == 0 ? 1 : 2]];
 +                  [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
 +               }
 +               [e endEncoding];
 +            }
-+            CHECK(run(cb, variant ? "two passes" : "one pass"), "P12 render did not complete");
++            CHECK(run(cb, "P13"), "P13 render did not complete");
 +            static uint8_t p0[64 * 64 * 4], p1[64 * 64 * 4];
 +            [rt0 getBytes:p0 bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
 +            [rt1 getBytes:p1 bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
 +            unsigned ok0 = 0, ok1 = 0;
 +            for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
 +               const uint8_t *a = p0 + (y * 64 + x) * 4, *b = p1 + (y * 64 + x) * 4;   /* BGRA */
-+               bool left = x < 32;
-+               bool want_red = left;
++               bool want_red = x < 32;
 +               if ((want_red ? (b[2] > 200 && b[0] < 50) : (b[0] > 200 && b[2] < 50)) && b[1] < 50) ok1++;
 +               if ((want_red ? (a[2] > 200 && a[0] < 50) : (a[0] > 200 && a[2] < 50)) && a[1] < 50) ok0++;
 +            }
-+            printf("  %s: attachment 1 written right at %u/4096, fetched into attachment 0 right at %u/4096 "
-+                   "(0: px(8,8) %u %u %u %u, px(56,8) %u %u %u %u; 1: px(8,8) %u %u %u %u)\n", variant ? "two passes" : "one pass",
-+                   ok1, ok0, p0[(8 * 64 + 8) * 4 + 2], p0[(8 * 64 + 8) * 4 + 1], p0[(8 * 64 + 8) * 4], p0[(8 * 64 + 8) * 4 + 3],
-+                   p0[(8 * 64 + 56) * 4 + 2], p0[(8 * 64 + 56) * 4 + 1], p0[(8 * 64 + 56) * 4], p0[(8 * 64 + 56) * 4 + 3],
++            printf("  v%d: attachment 1 right at %u/4096, attachment 0 right at %u/4096 (0: px(8,8) %u %u %u %u; 1: %u %u %u %u)\n",
++                   variant, ok1, ok0, p0[(8 * 64 + 8) * 4 + 2], p0[(8 * 64 + 8) * 4 + 1], p0[(8 * 64 + 8) * 4], p0[(8 * 64 + 8) * 4 + 3],
 +                   p1[(8 * 64 + 8) * 4 + 2], p1[(8 * 64 + 8) * 4 + 1], p1[(8 * 64 + 8) * 4], p1[(8 * 64 + 8) * 4 + 3]);
-+            CHECK(ok1 == 4096, "P12 %s: attachment 1 wrong at %u pixels", variant ? "two passes" : "one pass", 4096 - ok1);
-+            CHECK(ok0 == 4096, "P12 %s: fetch of attachment 1 wrong at %u pixels", variant ? "two passes" : "one pass", 4096 - ok0);
++            CHECK(ok1 == 4096 && ok0 == 4096, "P13 v%d wrong (attachment 1 %u, attachment 0 %u of 4096)", variant, ok1, ok0);
 +         }
 +      }
        printf("== result: %d checks passed, %d failed\n", g_pass, g_fail);
