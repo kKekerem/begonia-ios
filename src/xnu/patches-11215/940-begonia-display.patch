@@ -189,7 +189,7 @@ diff --git a/bsd/dev/begonia_touch.c b/bsd/dev/begonia_touch.c
 diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 --- a/bsd/dev/begonia_usb.c
 +++ b/bsd/dev/begonia_usb.c
-@@ -44,6 +44,19 @@ extern int reboot_kernel(int howto, char *message);
+@@ -44,6 +44,22 @@ extern int reboot_kernel(int howto, char *message);
  extern void begonia_wdt_stop_kicking(void);                                     /* begonia_reboot.c */
  extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);       /* sweet_ufs.c */
  extern uint64_t sweet_log_position(void);
@@ -198,6 +198,9 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +#include <sys/proc_internal.h>
 +#include <mach/task_info.h>
 +#include <mach/thread_info.h>
++#include <mach/mach_types.h>
++#include <mach/host_info.h>
++#include <mach/vm_statistics.h>
 +#include <sys/bsdtask_info.h>
 +extern void sweet_hid_touch(int finger, int down, int x, int y);              /* SweetHIDTouch (Bergamota 0058) */
 +extern void sweet_hid_key(int key, int down);                                   /* 0 power, 1 volume up, 2 volume down */
@@ -209,7 +212,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  
  void begonia_usb_init(void);
  
-@@ -1055,16 +1068,732 @@ parse_hex(const char *s, uint32_t *out)
+@@ -1055,16 +1071,772 @@ parse_hex(const char *s, uint32_t *out)
  	return digits > 0;
  }
  
@@ -330,6 +333,42 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 + * threads: ours are named at kernel_thread_start ("begonia touch", "begonia usb", ...), SweetFB's work loop names
 + * itself; others show as "-" with their thread id and priority. Idle threads are skipped.
 + */
++/*
++ * 26 Nov 2026: memory pressure next to it (daemons were killed at their jetsam high watermarks over and over:
++ * donotdisturbd 13x, linkd 8x, lsd, iconservicesagent...): free / wired / compressor pages and the compressor and
++ * page-in rates over the same interval (host_statistics64 HOST_VM_INFO64).
++ */
++extern kern_return_t host_statistics64(host_t host, host_flavor_t flavor, host_info64_t info, mach_msg_type_number_t *count);
++extern host_t host_self(void);
++static vm_statistics64_data_t top_vm_a;
++
++static bool
++vm_snap(vm_statistics64_data_t *v)
++{
++	mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
++	bzero(v, sizeof(*v));
++	return host_statistics64(host_self(), HOST_VM_INFO64, (host_info64_t)v, &cnt) == KERN_SUCCESS;
++}
++
++static void
++vm_report(const vm_statistics64_data_t *a, uint64_t wall_us)
++{
++	vm_statistics64_data_t b;
++	if (!vm_snap(&b)) {
++		printf("BEGONIA VM: host_statistics64 failed\n");
++		return;
++	}
++	uint64_t pg = (uint64_t)PAGE_SIZE, ms = wall_us / 1000u ? wall_us / 1000u : 1u;
++	printf("BEGONIA VM: MB free %llu active %llu inactive %llu wired %llu spec %llu anon %llu file %llu, compressor %llu MB "
++	    "holding %llu MB; per s: compressions %llu decompressions %llu pageins %llu faults %llu (page %llu B)\n",
++	    (uint64_t)b.free_count * pg >> 20, (uint64_t)b.active_count * pg >> 20, (uint64_t)b.inactive_count * pg >> 20,
++	    (uint64_t)b.wire_count * pg >> 20, (uint64_t)b.speculative_count * pg >> 20, (uint64_t)b.internal_page_count * pg >> 20,
++	    (uint64_t)b.external_page_count * pg >> 20, (uint64_t)b.compressor_page_count * pg >> 20,
++	    b.total_uncompressed_pages_in_compressor * pg >> 20,
++	    a ? (b.compressions - a->compressions) * 1000u / ms : 0u, a ? (b.decompressions - a->decompressions) * 1000u / ms : 0u,
++	    a ? (b.pageins - a->pageins) * 1000u / ms : 0u, a ? (b.faults - a->faults) * 1000u / ms : 0u, pg);
++}
++
 +#define KTOP_MAX 640
 +struct ktop_ent {
 +	uint64_t tid;
@@ -443,6 +482,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +		top_b[best].pid = -1;
 +	}
 +	ktop_report(wall);
++	vm_report(&top_vm_a, wall);
 +}
 +
 +/*
@@ -903,6 +943,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +		nanoseconds_to_absolutetime((uint64_t)(secs < 1u ? 1u : (secs > 60u ? 60u : secs)) * NSEC_PER_SEC, &d);
 +		top_snap(top_a, &top_na);
 +		ktop_snap(ktop_a, &ktop_na);
++		(void)vm_snap(&top_vm_a);
 +		top_t0 = mach_absolute_time();
 +		top_at = top_t0 + d;
 +	} else if (strncmp(line, "smp ", 4) == 0 && line[4] != '\0') {
@@ -910,6 +951,8 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +		proc_iterate(PROC_ALLPROCLIST, smp_cb, NULL, NULL, NULL);
 +	} else if (strcmp(line, "cpufreq") == 0) {
 +		cpufreq_report();
++	} else if (strcmp(line, "vmstat") == 0) {
++		vm_report(NULL, 1000000u);
 +	} else if (strcmp(line, "membw") == 0) {
 +		membw_report();
 +	} else if (strcmp(line, "cpuinfo") == 0) {
@@ -943,7 +986,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  	} else if (strcmp(line, "fb") == 0) {
  		usb_fb_start(2u);
  	} else if (strncmp(line, "fb ", 3) == 0) {
-@@ -1079,7 +1808,7 @@ usb_cmd(char *line)
+@@ -1079,7 +1851,7 @@ usb_cmd(char *line)
  		usb.reboot_at = mach_absolute_time() + delta;
  		printf("BEGONIA USB: reboot in 2 s\n");
  	} else if (strncmp(line, "peek ", 5) == 0 && parse_hex(line + 5, &pa) && (pa & 3u) == 0 &&
@@ -952,7 +995,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		uint32_t page = pa & ~0xfffu;
  		if (usb.peek_va == 0 || usb.peek_page != page) {
  			usb.peek_va = ml_io_map(page, 0x1000);
-@@ -1137,6 +1866,27 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1137,6 +1909,27 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  		printf("BEGONIA USB: ml_io_map failed\n");
  		return;
  	}
@@ -980,7 +1023,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  	if (!usb_hw_start()) {
  		printf("BEGONIA USB: not started\n");
  		return;
-@@ -1144,7 +1894,19 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1144,7 +1937,19 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  	nanoseconds_to_absolutetime(30ULL * NSEC_PER_SEC, &stat_gap);
  	usb.t0 = mach_absolute_time();
  	next_stat = usb.t0 + stat_gap;
@@ -1000,7 +1043,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		usb_bus_poll();
  		ep0_poll();
  		if (usb.configured) {
-@@ -1153,6 +1915,8 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1153,6 +1958,8 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  				usb_tx_poll();
  			}
  		}
@@ -1009,7 +1052,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		if (usb.reboot_at != 0 && mach_absolute_time() >= usb.reboot_at) {
  			usb.reboot_at = 0;
  			printf("BEGONIA USB: rebooting\n");
-@@ -1186,6 +1950,7 @@ begonia_usb_init(void)
+@@ -1186,6 +1993,7 @@ begonia_usb_init(void)
  		return;
  	}
  	if (kernel_thread_start(begonia_usb_thread, NULL, &thread) == KERN_SUCCESS) {
