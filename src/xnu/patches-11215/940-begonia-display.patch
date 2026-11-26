@@ -63,16 +63,17 @@ diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
  
  /*
   * begoniabgflags=<mask> (20 Nov 2026): Chlorophyll's switch files, read when a process starts (docs/FIXES.md):
-@@ -45,6 +54,8 @@ static const char *const autotest_flag_files[] = {
+@@ -45,6 +54,9 @@ static const char *const autotest_flag_files[] = {
  	BGMTL_DIR "bgmtl-bb.full",      /* bit 3: backboardd redraws in full (no dirty regions) */
  	BGMTL_DIR "bgmtl.dumpatt",      /* bit 4: with the trace, attachments dumped to /private/var/tmp/att */
  	BGMTL_DIR "bgmtl.probe",        /* bit 5 (24 Nov): bgl-launch runs bgmtl_render_probe once -> bgmtl-probe.txt */
 +	BGMTL_DIR "bgmtl.mercury",      /* bit 6 (26 Nov, Loxy 940): MercuryPoster (wallpaper) re-armed with its float RTs as RGB10A2 */
 +	BGMTL_DIR "bgmtl-bb.noluma",    /* bit 7 (26 Nov): backboardd skips CoreAnimation's per-frame luma_boost pass */
++	BGMTL_DIR "bgmtl-bb.upscale",   /* bit 8 (27 Nov, 952): backboardd upscales each frame to the panel on the GPU */
  };
  
  static void
-@@ -72,7 +83,7 @@ begonia_autotest_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -72,7 +84,7 @@ begonia_autotest_thread(void *arg __unused, wait_result_t wr __unused)
  	uint64_t t0 = mach_absolute_time();
  	uint64_t ns;
  
@@ -81,7 +82,7 @@ diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
  		/* wait for the root mount (rd=ufsroot0), at most 120 s */
  		for (int i = 0; i < 1200 && rootvnode == NULLVP; i++) {
  			IOSleep(100);
-@@ -87,7 +98,23 @@ begonia_autotest_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -87,7 +99,23 @@ begonia_autotest_thread(void *arg __unused, wait_result_t wr __unused)
  			} else if (autotest_bgmtl == 0) {
  				autotest_remove(BGMTL_DIR "bgmtl-bb.arm");
  			}
@@ -105,7 +106,7 @@ diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
  				for (uint32_t i = 0; i < sizeof(autotest_flag_files) / sizeof(autotest_flag_files[0]); i++) {
  					if (autotest_bgflags & (1u << i)) {
  						autotest_touch(autotest_flag_files[i]);
-@@ -123,15 +150,17 @@ begonia_autotest_init(void)
+@@ -123,15 +151,17 @@ begonia_autotest_init(void)
  	(void)PE_parse_boot_argn("begoniabgmtl", &autotest_bgmtl, sizeof(autotest_bgmtl));
  	(void)PE_parse_boot_argn("begoniareboot", &autotest_reboot, sizeof(autotest_reboot));
  	(void)PE_parse_boot_argn("begoniabgflags", &autotest_bgflags, sizeof(autotest_bgflags));
@@ -1837,7 +1838,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLock       *fLock;            /* swaps and client list */
  	OSArray      *fClients;
  	uint32_t      fSwapID;
-@@ -815,6 +867,58 @@ AppleCLCD::start(IOService *provider)
+@@ -815,6 +867,60 @@ AppleCLCD::start(IOService *provider)
  			IOLog("SWEET FB: backlight fade off (sweetfb_blfade=0): black in one step\n");
  		}
  	}
@@ -1876,13 +1877,15 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		int defsurf = 1;
 +		PE_parse_boot_argn("begoniadefsurf", &defsurf, sizeof(defsurf));
 +		if (defsurf != 0 && (fRowBytes & 63u) != 0) {
-+			uint32_t bpr = (fWidth * 4u + 63u) & ~63u;
-+			fDefault = sweet_surface_create_buffer(fWidth, fHeight, bpr, SWEET_FB_FORMAT_BGRA);
++			/* 952: canvas-sized (the XR canvas is 828x1792 on the 1080x2340 panel; native: the panel size) */
++			uint32_t dw = fLogicalW ? fLogicalW : fWidth, dh = fLogicalH ? fLogicalH : fHeight;
++			uint32_t bpr = (dw * 4u + 63u) & ~63u;
++			fDefault = sweet_surface_create_buffer(dw, dh, bpr, SWEET_FB_FORMAT_BGRA);
 +			if (fDefault != NULL) {
 +				(void)sweet_surface_pin(fDefault);     /* 951: stays importable by ID (backdrop blurs sample it) */
 +			}
 +			uintptr_t dst = fDefault != NULL ? fDefault->kernelAddress() : 0;
-+			if (dst != 0) {
++			if (dst != 0 && dw == fWidth && dh == fHeight) {
 +				/* what the panel shows now (the boot screen), for a compositor that starts from its default surface */
 +				for (uint32_t y = 0; y < fHeight; y++) {
 +					memcpy((void *)(dst + (uintptr_t)y * bpr), (const void *)(fPixels + (uintptr_t)y * fRowBytes), fWidth * 4u);
@@ -1896,7 +1899,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
  	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
  		IOLog("SWEET FB: no vsync timer\n");
-@@ -921,7 +1025,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -921,7 +1027,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	AppleCLCD *fb = (AppleCLCD *)owner;
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
@@ -1915,7 +1918,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	/*
  	 * 0216: with sweetfb_vsyncalign the notification carries the time of the latest panel vsync that SwapWait saw (the
  	 * MDP latch, a real vsync of the panel) projected forward by whole periods, and the timer is re-armed for the next
-@@ -982,11 +1097,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -982,11 +1099,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		if (fb->fBlOK && fb->fBlPos != 0 && !fb->fBlOffFailed && !fb->blSet(false)) {
  			fb->fBlOffFailed = true;
  		}
@@ -1930,7 +1933,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		return;
  	}
  	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && fb->gpuGateOpen(mach_absolute_time());
-@@ -1030,6 +1145,30 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -1030,6 +1147,30 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	sweet_hold_release(taken);      /* copied: CA may render into them again */
  	fb->statsTick(now);
  	fb->hudTick(now);
@@ -1961,7 +1964,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	sender->setTimeoutUS(nextUS);
  }
  
-@@ -1046,7 +1185,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -1046,7 +1187,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  bool
  AppleCLCD::gpuGateOpen(uint64_t now)
  {
@@ -1970,7 +1973,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		return true;
  	}
  	uint64_t cap;
-@@ -1190,6 +1329,21 @@ AppleCLCD::statsTick(uint64_t now)
+@@ -1190,6 +1331,21 @@ AppleCLCD::statsTick(uint64_t now)
  	    c.scanGpuSubmitFails, c.scanGpuLate, sweet_abs_us(c.scanGpuWaitMaxAbs));
  	#undef PER_S
  	sweet_fb_stats_publish(line);
@@ -1992,7 +1995,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
  		fStLogT = now;
  		IOLog("SWEET FB: stats %s", line);
-@@ -1288,7 +1442,7 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -1288,7 +1444,7 @@ AppleCLCD::swap(const uint8_t *rec)
  	}
  	IOLockLock(fLock);
  	fSt.swaps++;
@@ -2001,7 +2004,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fPendAbs = mach_absolute_time();
  	__atomic_store_n(&fSwapNewest, get32(rec, 0x50), __ATOMIC_RELEASE);
  	{
-@@ -2294,7 +2448,7 @@ AppleCLCD::scanBlitPoll(void)
+@@ -2294,7 +2450,7 @@ AppleCLCD::scanBlitPoll(void)
  	 * buffer scanned anyway, as before, so the panel cannot freeze for good.
  	 */
  	uint64_t waited = mach_absolute_time() - fScanBlitAbs;
@@ -2010,7 +2013,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint64_t lim;
  		nanoseconds_to_absolutetime(1000 * NSEC_PER_MSEC, &lim);
  		if (waited < lim) {
-@@ -2437,11 +2591,11 @@ AppleCLCD::scanCopyPresent(SweetSurface *s, uint32_t id)
+@@ -2437,11 +2593,11 @@ AppleCLCD::scanCopyPresent(SweetSurface *s, uint32_t id)
  			/* 0241: swapFired did not hold this swap for the GPU (it expected a GPU copy): wait for its work here */
  			uint64_t lim;
  			nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &lim);
@@ -2024,7 +2027,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				IODelay(50);
  			}
  			fScanBlitT = -1;
-@@ -2668,6 +2822,31 @@ bool
+@@ -2668,6 +2824,31 @@ bool
  AppleCLCD::blSet(bool on)
  {
  	if (sweet_board_begonia()) {
@@ -2056,7 +2059,42 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint32_t high = on ? (((uint32_t)(fBlRaw[0] & 0xfffu) * fBlPwmPeriod + 2047u) / 4095u) : 0u;
  		if (begoniaPwmWrite(high)) {
  			fBlPos = on ? SWEET_FB_BL_STEPS : 0;
-@@ -3436,6 +3615,22 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -3261,6 +3442,34 @@ AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy,
+ 	    (s->bytesPerElement && s->bytesPerElement != 4)) {
+ 		return;
+ 	}
++	/*
++	 * begonia 952: Chlorophyll upscales the frame on the GPU (bgmtl-bb.upscale): the surface names a panel-sized
++	 * companion (IOSurface value "LoxyUpscale") holding the same picture filtered to the panel, and a full-screen layer
++	 * copies that 1:1 instead of the nearest-neighbour scaling below (which made text look dotted).
++	 */
++	if (dx == 0 && dy == 0 && sx == 0 && sy == 0 && (uint32_t)w >= fLogicalW && (uint32_t)h >= fLogicalH &&
++	    s->values != NULL) {
++		OSNumber *num = OSDynamicCast(OSNumber, s->values->getObject("LoxyUpscale"));
++		SweetSurface *c = num != NULL ? sweet_surface_copy(num->unsigned32BitValue()) : NULL;
++		if (c != NULL) {
++			uintptr_t ca = c->kernelAddress();
++			if (ca != 0 && c->memory != NULL && c->width == fWidth && c->height == fHeight && c->bytesPerRow >= fWidth * 4u &&
++			    (uint64_t)c->offset + (uint64_t)(fHeight - 1u) * c->bytesPerRow + fWidth * 4u <= c->memory->getLength()) {
++				uint32_t gb = __atomic_load_n(&c->gpuBlits, __ATOMIC_ACQUIRE);
++				if (gb != c->gpuBlitsFbSeen) {
++					sweet_dma_sync_va((const void *)(ca + c->offset), (size_t)c->bytesPerRow * fHeight);
++					c->gpuBlitsFbSeen = gb;
++				}
++				for (uint32_t y = 0; y < fHeight; y++) {
++					memcpy((void *)(fDraw + (uint64_t)y * fRowBytes), (const void *)(ca + c->offset + (uint64_t)y * c->bytesPerRow),
++					    (size_t)fWidth * 4u);
++				}
++				c->release();
++				return;
++			}
++			c->release();
++		}
++	}
+ 	/* clip the logical rect to the surface and the logical display */
+ 	if (w > (int32_t)s->width - sx) {
+ 		w = (int32_t)s->width - sx;
+@@ -3436,6 +3645,22 @@ AppleCLCD::present(const uint8_t *rec)
  				}
  			}
  		}
@@ -2079,7 +2117,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
  		if (w <= 0 || h <= 0) {
  			w = (int32_t)s->width;
-@@ -3590,18 +3785,30 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+@@ -3590,18 +3815,30 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
  
  static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
  
