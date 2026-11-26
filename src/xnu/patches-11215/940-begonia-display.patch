@@ -1671,6 +1671,41 @@ diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
  /*
   * Zero-copy scanout (SweetFramebuffer.cpp, boot-arg sweetfb_zc=1; patch 0127,
   * docs/DISPLAY_HW.md section 3). The MDP's source address registers are 32 bit
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -7465,6 +7465,31 @@ task_set_phys_footprint_limit_internal(
+ 	kern_return_t ret;
+ #if DEVELOPMENT || DEBUG
+ 	diagthreshold_check_return diag_threshold_validity;
++#endif
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * begonia (Loxy, 26 Nov 2026): the per-process memory limits launchd and RunningBoard set are tuned for Apple's own
++	 * devices; here many small daemons run a few MB above theirs (iconservicesagent, linkd, donotdisturbd,
++	 * liveactivitiesd, nehelper, softposreaderd, pkd...), were killed at the limit (jetsam reason 7) and relaunched
++	 * over and over: ~350 relaunches in five minutes, each with its crash report, while the UI waited. With 3 GB for
++	 * iOS every limit is multiplied by begoniajetsamx (default 3, 1 = Apple's), at most 2048 MB (never lowered).
++	 */
++	if (new_limit_mb > 0) {
++		static int bg_jetsam_x = -1;
++		if (bg_jetsam_x < 0) {
++			int v = 3;
++			(void)PE_parse_boot_argn("begoniajetsamx", &v, sizeof(v));
++			if (v < 1 || v > 16) {
++				v = 3;
++			}
++			bg_jetsam_x = v;
++		}
++		int64_t scaled = (int64_t)new_limit_mb * bg_jetsam_x;
++		if (scaled > 2048) {
++			scaled = new_limit_mb > 2048 ? new_limit_mb : 2048;
++		}
++		new_limit_mb = (int)scaled;
++	}
+ #endif
+ 	ret = ledger_get_limit(task->ledger, task_ledgers.phys_footprint, &old);
+ 
 diff --git a/bsd/dev/begonia_disp.c b/bsd/dev/begonia_disp.c
 new file mode 100644
 --- /dev/null
