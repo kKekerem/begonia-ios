@@ -157,7 +157,31 @@ diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
  static bool g_started, g_ready, g_lost;
  static uint32_t g_exp_mask, g_exp_adapt, g_exp_step, g_exp_step_faults, g_dumps;
  static uint32_t g_exp_done_logged = ~0u, g_lost_faults = MALI_LOST_FAULTS;
-@@ -900,6 +903,20 @@ begonia_mali_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -742,7 +745,22 @@ mali_job_fault(uint32_t slot, uint64_t jc_va, uint32_t irq)
+ 			printf("BEGONIA MALI: GPU reset failed: reporting the GPU LOST\n");
+ 		}
+ 	}
+-	if (g_faults > g_lost_faults && !g_lost) {
++	/*
++	 * 953: LOST only for a burst (more than g_lost_faults faults within 10 s), not for the boot's total. Each fault
++	 * already resets the GPU and it runs on; counting all faults of a boot let one process's bad jobs (the wallpaper
++	 * renderer) end the GPU for every process after a while: every dead-man fired, backboardd and the wallpaper went
++	 * to the stock path (black wallpaper, CPU compositing, ~25 fps).
++	 */
++	static uint64_t win_t0;
++	static uint32_t win_n;
++	uint64_t now = mach_absolute_time(), win_ns = 0;
++	absolutetime_to_nanoseconds(now - win_t0, &win_ns);
++	if (win_t0 == 0u || win_ns > 10ull * NSEC_PER_SEC) {
++		win_t0 = now;
++		win_n = 0u;
++	}
++	win_n++;
++	if (win_n > g_lost_faults && !g_lost) {
+ 		g_lost = true;
+ 		printf("BEGONIA MALI: %u faults: reporting the GPU LOST\n", g_faults);
+ 	}
+@@ -900,6 +918,20 @@ begonia_mali_thread(__unused void *arg, __unused wait_result_t wr)
  {
  	begonia_mali_bringup();
  	printf("BEGONIA MALI: bring-up done: stage %u/6, %s\n", g_stage, g_ready ? "GPU ready" : "no GPU");
@@ -178,7 +202,7 @@ diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
  	/* returning ends the thread (Call_continuation -> thread_terminate) */
  }
  
-@@ -945,6 +962,7 @@ begonia_mali_init(void)
+@@ -945,6 +977,7 @@ begonia_mali_init(void)
  	 * GPU wait for the SweetMali service / begonia_mali_ready().
  	 */
  	if (kernel_thread_start(begonia_mali_thread, NULL, &thread) == KERN_SUCCESS) {
@@ -186,8 +210,12 @@ diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
  		thread_deallocate(thread);
  		printf("BEGONIA MALI: bring-up started in a kernel thread\n");
  	} else {
-@@ -957,7 +975,7 @@ bool begonia_mali_ready(void) { return g_ready; }
- bool begonia_mali_lost(void) { return g_lost || g_faults > g_lost_faults; }
+@@ -954,10 +987,10 @@ begonia_mali_init(void)
+ }
+ 
+ bool begonia_mali_ready(void) { return g_ready; }
+-bool begonia_mali_lost(void) { return g_lost || g_faults > g_lost_faults; }
++bool begonia_mali_lost(void) { return g_lost; }
  uint32_t begonia_mali_gpu_id(void) { return g_gpu_id; }
  uint32_t begonia_mali_va_bits(void) { return g_va_bits; }
 -uint64_t begonia_mali_last_seq(void) { return g_done_seq; }
@@ -195,7 +223,7 @@ diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
  uint32_t begonia_mali_faults(void) { return g_faults; }
  
  bool
-@@ -994,26 +1012,24 @@ begonia_mali_param(uint32_t which, uint64_t *value)
+@@ -994,26 +1027,24 @@ begonia_mali_param(uint32_t which, uint64_t *value)
  	return false;
  }
  
@@ -226,7 +254,7 @@ diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
  	wr32(mali, JOB_INT_CLEAR, irqm);
  	if (!wait_mask(mali, js + JS_COMMAND_NEXT, 0xffu, 0u, 50u)) {
  		printf("BEGONIA MALI: slot %u still busy (JS_STATE=%#x): resetting\n", slot, rd32(mali, JOB_INT_JS_STATE));
-@@ -1021,7 +1037,7 @@ begonia_mali_submit(uint64_t jc_va, bool fragment)
+@@ -1021,7 +1052,7 @@ begonia_mali_submit(uint64_t jc_va, bool fragment)
  			g_lost = true;
  			printf("BEGONIA MALI: GPU reset failed: reporting the GPU LOST\n");
  			lck_mtx_unlock(&mali_mtx);
@@ -235,7 +263,7 @@ diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
  		}
  	}
  	uint32_t affinity = (g_exp_mask & EXP_ONE_CORE) ? (g_shader_mask & (~g_shader_mask + 1u)) : g_shader_mask;
-@@ -1083,15 +1099,108 @@ begonia_mali_submit(uint64_t jc_va, bool fragment)
+@@ -1083,15 +1114,108 @@ begonia_mali_submit(uint64_t jc_va, bool fragment)
  	wr32(mali, JOB_INT_CLEAR, irqm);
  	g_done_seq = seq;
  	lck_mtx_unlock(&mali_mtx);
