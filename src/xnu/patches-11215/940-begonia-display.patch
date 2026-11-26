@@ -32,6 +32,18 @@ diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
  	if (gc_initialized && gc_enabled) {
  		VCPUTC_LOCK_LOCK();
  		if (gc_enabled) {
+diff --git a/osfmk/conf/files b/osfmk/conf/files
+--- a/osfmk/conf/files
++++ b/osfmk/conf/files
+@@ -127,7 +127,8 @@
+ osfmk/kern/ext_paniclog.c 	standard
+ osfmk/kern/ecc_logging.c			optional config_ecc_logging
+ osfmk/kern/energy_perf.c		standard
+ osfmk/kern/exception.c		standard
++osfmk/kern/begonia_kprof.c		standard
+ osfmk/kern/exclaves.c		standard
+ osfmk/kern/exclaves_boot.c		standard
+ osfmk/kern/exclaves_conclave.c	standard
 diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
 --- a/bsd/dev/begonia_autotest.c
 +++ b/bsd/dev/begonia_autotest.c
@@ -212,7 +224,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  
  void begonia_usb_init(void);
  
-@@ -1055,16 +1071,772 @@ parse_hex(const char *s, uint32_t *out)
+@@ -1055,16 +1071,927 @@ parse_hex(const char *s, uint32_t *out)
  	return digits > 0;
  }
  
@@ -282,7 +294,8 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 + * "top [S]": CPU time of every process over S seconds (default 5; live threads, user + system), the 14 busiest.
 + * "smp NAME": the threads of the processes called NAME with their user backtraces (Bergamota's sampler).
 + */
-+#define TOP_MAX 200
++#define TOP_MAX 1024     /* 26 Nov: was 200, and the list starts at the newest process: SpringBoard (pid 27)
++                                 * and backboardd (62) never made it into the table */
 +struct top_ent {
 +	int      pid;
 +	char     name[24];
@@ -531,6 +544,158 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +	thread_bind((processor_t)NULL);
 +	thread_block(THREAD_CONTINUE_NULL);
 +	printf("%s\n", line);
++}
++
++/*
++ * "kprof [S]" (26 Nov 2026): S seconds (default 3, at most 6) of osfmk/kern/begonia_kprof.c's sampling: every 10 ms
++ * each other CPU reports what it interrupted. Printed: idle / user / kernel shares, busy share per CPU, the processes
++ * seen most (user and kernel samples, in % of one core), the kernel threads seen most with a PC of theirs, and the
++ * hottest kernel PCs (unslid: look them up in the kernel's symbol table).
++ */
++struct begonia_kprof_sample {
++	uint64_t pc;
++	uint64_t tid;
++	int32_t  pid;
++	uint8_t  cpu;
++	uint8_t  mode;
++	uint8_t  pri;
++	uint8_t  pad;
++};
++extern uint32_t begonia_kprof_run(struct begonia_kprof_sample *out, uint32_t max, uint32_t rounds, uint32_t gap_us);
++
++#define KP_TOP 64
++struct kp_cnt {
++	uint64_t key;
++	uint64_t aux;
++	uint32_t n, n2;
++	uint32_t pri;
++};
++
++static void
++kp_add(struct kp_cnt *t, uint32_t *nt, uint64_t key, uint64_t aux, bool second, uint32_t pri)
++{
++	for (uint32_t i = 0; i < *nt; i++) {
++		if (t[i].key == key) {
++			if (second) {
++				t[i].n2++;
++			} else {
++				t[i].n++;
++			}
++			return;
++		}
++	}
++	if (*nt < KP_TOP) {
++		t[*nt].key = key;
++		t[*nt].aux = aux;
++		t[*nt].n = second ? 0u : 1u;
++		t[*nt].n2 = second ? 1u : 0u;
++		t[*nt].pri = pri;
++		(*nt)++;
++	}
++}
++
++static uint32_t
++kp_pick(struct kp_cnt *t, uint32_t nt)
++{
++	uint32_t best = KP_TOP;
++	for (uint32_t i = 0; i < nt; i++) {
++		if (t[i].n + t[i].n2 != 0u && (best == KP_TOP || t[i].n + t[i].n2 > t[best].n + t[best].n2)) {
++			best = i;
++		}
++	}
++	return best;
++}
++
++static void
++kprof_report(uint32_t secs)
++{
++	if (secs < 1u) {
++		secs = 1u;
++	}
++	if (secs > 6u) {
++		secs = 6u;
++	}
++	uint32_t rounds = secs * 100u, max = rounds * 8u;
++	struct begonia_kprof_sample *s = kalloc_data(max * sizeof(*s), Z_WAITOK | Z_ZERO);
++	struct kp_cnt *procs = kalloc_data(3u * KP_TOP * sizeof(struct kp_cnt), Z_WAITOK | Z_ZERO);
++	if (s == NULL || procs == NULL) {
++		printf("BEGONIA KPROF: no memory\n");
++		if (s != NULL) {
++			kfree_data(s, max * sizeof(*s));
++		}
++		if (procs != NULL) {
++			kfree_data(procs, 3u * KP_TOP * sizeof(struct kp_cnt));
++		}
++		return;
++	}
++	struct kp_cnt *kthr = procs + KP_TOP, *kpcs = procs + 2u * KP_TOP;
++	uint32_t np = 0, nk = 0, nc = 0;
++	uint32_t n = begonia_kprof_run(s, max, rounds, 10000u);
++	uint32_t m[4] = { 0, 0, 0, 0 }, cpu_busy[16], cpu_all[16];
++	bzero(cpu_busy, sizeof(cpu_busy));
++	bzero(cpu_all, sizeof(cpu_all));
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t md = s[i].mode < 3u ? s[i].mode : 3u;
++		m[md]++;
++		if (s[i].cpu < 16u) {
++			cpu_all[s[i].cpu]++;
++			if (md != 0u) {
++				cpu_busy[s[i].cpu]++;
++			}
++		}
++		if (md == 0u) {
++			continue;
++		}
++		if (s[i].pid > 0) {
++			kp_add(procs, &np, (uint64_t)s[i].pid, 0, md == 2u, s[i].pri);
++		} else if (s[i].pid == 0) {
++			kp_add(kthr, &nk, s[i].tid, s[i].pc, false, s[i].pri);
++		}
++		if (md == 2u) {
++			kp_add(kpcs, &nc, s[i].pc, s[i].tid, false, (uint32_t)(s[i].pid < 0 ? 0 : s[i].pid));
++		}
++	}
++	uint32_t tot = n ? n : 1u;
++	printf("BEGONIA KPROF: %u samples in %u s (%u rounds): idle %u%%, user %u%%, kernel %u%%, no state %u%%\n", n, secs,
++	    rounds, m[0] * 100u / tot, m[1] * 100u / tot, m[2] * 100u / tot, m[3] * 100u / tot);
++	char line[220];
++	size_t l = (size_t)snprintf(line, sizeof(line), "BEGONIA KPROF: busy");
++	for (uint32_t c = 0; c < 16u && l < sizeof(line) - 16u; c++) {
++		if (cpu_all[c] != 0u) {
++			l += (size_t)snprintf(line + l, sizeof(line) - l, " cpu%u=%u%%", c, cpu_busy[c] * 100u / cpu_all[c]);
++		}
++	}
++	printf("%s\n", line);
++	for (uint32_t k = 0; k < 18u; k++) {
++		uint32_t b = kp_pick(procs, np);
++		if (b == KP_TOP) {
++			break;
++		}
++		char name[32];
++		proc_name((int)procs[b].key, name, sizeof(name));
++		printf("BEGONIA KPROF:   %-20s %5llu %3u%% of a core (user %u, kernel %u samples, pri %u)\n", name,
++		    procs[b].key, (procs[b].n + procs[b].n2) * 100u / rounds, procs[b].n, procs[b].n2, procs[b].pri);
++		procs[b].n = procs[b].n2 = 0;
++	}
++	for (uint32_t k = 0; k < 8u; k++) {
++		uint32_t b = kp_pick(kthr, nk);
++		if (b == KP_TOP) {
++			break;
++		}
++		printf("BEGONIA KPROF:   kthread tid %llu pri %u: %u%% of a core, pc %#llx\n", kthr[b].key, kthr[b].pri,
++		    kthr[b].n * 100u / rounds, kthr[b].aux);
++		kthr[b].n = 0;
++	}
++	for (uint32_t k = 0; k < 24u; k++) {
++		uint32_t b = kp_pick(kpcs, nc);
++		if (b == KP_TOP) {
++			break;
++		}
++		printf("BEGONIA KPROF:   kpc %#llx: %u (tid %llu, pid %u)\n", kpcs[b].key, kpcs[b].n, kpcs[b].aux, kpcs[b].pri);
++		kpcs[b].n = 0;
++	}
++	kfree_data(s, max * sizeof(*s));
++	kfree_data(procs, 3u * KP_TOP * sizeof(struct kp_cnt));
 +}
 +
 +/*
@@ -951,6 +1116,8 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +		proc_iterate(PROC_ALLPROCLIST, smp_cb, NULL, NULL, NULL);
 +	} else if (strcmp(line, "cpufreq") == 0) {
 +		cpufreq_report();
++	} else if (strcmp(line, "kprof") == 0 || (strncmp(line, "kprof ", 6) == 0 && parse_ints(line + 6, iv, 1))) {
++		kprof_report(line[5] == ' ' ? (uint32_t)iv[0] : 3u);
 +	} else if (strcmp(line, "vmstat") == 0) {
 +		vm_report(NULL, 1000000u);
 +	} else if (strcmp(line, "membw") == 0) {
@@ -986,7 +1153,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  	} else if (strcmp(line, "fb") == 0) {
  		usb_fb_start(2u);
  	} else if (strncmp(line, "fb ", 3) == 0) {
-@@ -1079,7 +1851,7 @@ usb_cmd(char *line)
+@@ -1079,7 +2006,7 @@ usb_cmd(char *line)
  		usb.reboot_at = mach_absolute_time() + delta;
  		printf("BEGONIA USB: reboot in 2 s\n");
  	} else if (strncmp(line, "peek ", 5) == 0 && parse_hex(line + 5, &pa) && (pa & 3u) == 0 &&
@@ -995,7 +1162,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		uint32_t page = pa & ~0xfffu;
  		if (usb.peek_va == 0 || usb.peek_page != page) {
  			usb.peek_va = ml_io_map(page, 0x1000);
-@@ -1137,6 +1909,27 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1137,6 +2064,27 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  		printf("BEGONIA USB: ml_io_map failed\n");
  		return;
  	}
@@ -1023,7 +1190,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  	if (!usb_hw_start()) {
  		printf("BEGONIA USB: not started\n");
  		return;
-@@ -1144,7 +1937,19 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1144,7 +2092,19 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  	nanoseconds_to_absolutetime(30ULL * NSEC_PER_SEC, &stat_gap);
  	usb.t0 = mach_absolute_time();
  	next_stat = usb.t0 + stat_gap;
@@ -1043,7 +1210,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		usb_bus_poll();
  		ep0_poll();
  		if (usb.configured) {
-@@ -1153,6 +1958,8 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1153,6 +2113,8 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  				usb_tx_poll();
  			}
  		}
@@ -1052,7 +1219,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		if (usb.reboot_at != 0 && mach_absolute_time() >= usb.reboot_at) {
  			usb.reboot_at = 0;
  			printf("BEGONIA USB: rebooting\n");
-@@ -1186,6 +1993,7 @@ begonia_usb_init(void)
+@@ -1186,6 +2148,7 @@ begonia_usb_init(void)
  		return;
  	}
  	if (kernel_thread_start(begonia_usb_thread, NULL, &thread) == KERN_SUCCESS) {
@@ -1962,6 +2129,128 @@ new file mode 100644
 +	}
 +	printf("BEGONIA I2C: LM36273 backlight %s -> %d (%u ok, %u failed)\n", on ? "on" : "off", r, g_i2c_ok, g_i2c_fail);
 +	return r;
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/osfmk/kern/begonia_kprof.c b/osfmk/kern/begonia_kprof.c
+new file mode 100644
+--- /dev/null
++++ b/osfmk/kern/begonia_kprof.c
+@@ -0,0 +1,117 @@
++/*
++ * begonia (Loxy, 26 Nov 2026): a sampling profiler for the USB console ("kprof S" in bsd/dev/begonia_usb.c).
++ *
++ * The UI ran at 1-10 fps with the GPU ~1 % busy, and an unnamed kernel thread at MAXPRI_KERNEL held a whole CPU on
++ * every boot; per-process CPU times ("top") could not say what the CPUs actually execute. Every 10 ms all other CPUs
++ * get a cross-call (cpu_broadcast_xcall_simple, which waits for them); in the IPI each records what it interrupted:
++ * the idle thread, a user PC (and the process), or a kernel PC (unslid, so it can be looked up in the kernel's symbol
++ * table offline) with the thread id and its scheduler priority. Nothing is changed and no lock is taken in the IPI.
++ */
++#include <mach/mach_types.h>
++#include <mach/vm_param.h>
++#include <kern/kern_types.h>
++#include <kern/thread.h>
++#include <kern/task.h>
++#include <kern/cpu_number.h>
++#include <kern/kalloc.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <arm/cpu_data.h>
++#include <arm/cpu_data_internal.h>
++#include <arm64/proc_reg.h>
++#include <mach/arm/thread_status.h>
++#include <libkern/libkern.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++struct begonia_kprof_sample {
++	uint64_t pc;            /* user PC, or the kernel PC unslid */
++	uint64_t tid;
++	int32_t  pid;           /* 0 = kernel_task, -1 = unknown */
++	uint8_t  cpu;
++	uint8_t  mode;          /* 0 idle, 1 user, 2 kernel, 3 no interrupted state */
++	uint8_t  pri;
++	uint8_t  pad;
++};
++
++#define BGK_CPUS        16
++#define BGK_UNANSWERED  0xffu
++
++struct bgk_round {
++	struct begonia_kprof_sample s[BGK_CPUS];
++};
++
++static void
++bgk_cb(void *arg)
++{
++	struct bgk_round *r = (struct bgk_round *)arg;
++	int cpu = cpu_number();
++	if (cpu < 0 || cpu >= BGK_CPUS) {
++		return;
++	}
++	struct begonia_kprof_sample *s = &r->s[cpu];
++	thread_t th = current_thread();
++	s->cpu = (uint8_t)cpu;
++	s->tid = th->thread_id;
++	s->pri = (uint8_t)th->sched_pri;
++	s->pid = -1;
++	s->pc = 0;
++	if (th->options & TH_OPT_IDLE_THREAD) {
++		s->mode = 0;
++		return;
++	}
++	task_t t = get_threadtask(th);
++	if (t == kernel_task) {
++		s->pid = 0;
++	} else if (t != TASK_NULL) {
++		s->pid = task_pid(t);
++	}
++	arm_saved_state_t *st = (arm_saved_state_t *)getCpuDatap()->cpu_int_state;
++	if (st == NULL || !is_saved_state64(st)) {
++		s->mode = 3;
++		return;
++	}
++	uint64_t pc = get_saved_state_pc(st);
++	if (PSR64_IS_USER(get_saved_state_cpsr(st))) {
++		s->mode = 1;
++		s->pc = pc;
++	} else {
++		s->mode = 2;
++		s->pc = (uint64_t)VM_KERNEL_UNSLIDE(pc);
++	}
++}
++
++/* `rounds` samples of every other CPU, `gap_us` apart (the caller's CPU is not sampled); returns the records written */
++uint32_t begonia_kprof_run(struct begonia_kprof_sample *out, uint32_t max, uint32_t rounds, uint32_t gap_us);
++
++uint32_t
++begonia_kprof_run(struct begonia_kprof_sample *out, uint32_t max, uint32_t rounds, uint32_t gap_us)
++{
++	struct bgk_round *r = kalloc_data(sizeof(*r), Z_WAITOK | Z_ZERO);
++	uint32_t n = 0;
++
++	if (r == NULL || out == NULL) {
++		if (r != NULL) {
++			kfree_data(r, sizeof(*r));
++		}
++		return 0;
++	}
++	for (uint32_t i = 0; i < rounds && n < max; i++) {
++		for (int c = 0; c < BGK_CPUS; c++) {
++			r->s[c].mode = BGK_UNANSWERED;
++		}
++		(void)cpu_broadcast_xcall_simple(FALSE, bgk_cb, r);
++		for (int c = 0; c < BGK_CPUS && n < max; c++) {
++			if (r->s[c].mode != BGK_UNANSWERED) {
++				out[n++] = r->s[c];
++			}
++		}
++		if (gap_us != 0) {
++			delay((int)gap_us);
++		}
++	}
++	kfree_data(r, sizeof(*r));
++	return n;
 +}
 +
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
