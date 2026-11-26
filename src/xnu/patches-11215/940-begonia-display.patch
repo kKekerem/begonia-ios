@@ -107,6 +107,33 @@ diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
  		return;
  	}
  	printf("BEGONIA AUTOTEST: bgmtl=%u reboot=%u s bgflags=%#x\n", autotest_bgmtl, autotest_reboot, autotest_bgflags);
+diff --git a/bsd/dev/begonia_touch.c b/bsd/dev/begonia_touch.c
+--- a/bsd/dev/begonia_touch.c
++++ b/bsd/dev/begonia_touch.c
+@@ -227,6 +227,7 @@ spi5_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
+ 		cfg1 &= ~0x03ffff00u;
+ 		cfg1 |= ((chunk - 1u) << 16);
+ 		reg_wr(spi5_base, SPI_CFG1_REG, cfg1);
++		(void)reg_rd(spi5_base, SPI_CFG1_REG);
+ 
+ 		for (uint32_t i = 0; i < chunk; i += 4u) {
+ 			uint32_t w = 0u;
+@@ -241,6 +242,15 @@ spi5_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
+ 			}
+ 			reg_wr(spi5_base, SPI_TX_DATA_REG, w);
+ 		}
++		/*
++		 * 26 Nov 2026: with the CPU clusters raised to 1.5/1.67 GHz the timeouts went from ~17 % of the polls to ~90 %
++		 * (read failures 0.15 % -> 5 %): the length and the TX words cross into the controller's 26 MHz clock domain
++		 * (the same race as the reset pulse above), and a start written a few bus cycles after them can find the FIFO
++		 * count not yet there; the controller then waits for data that never comes. A read-back and 2 us (~50 cycles
++		 * of the 26 MHz clock) before the start.
++		 */
++		(void)reg_rd(spi5_base, SPI_CFG1_REG);
++		delay(2);
+ 
+ 		uint32_t cmd = base_cmd | (is_first ? SPI_CMD_ACT : SPI_CMD_RESUME);
+ 		reg_wr(spi5_base, SPI_CMD_REG, cmd);
 diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 --- a/bsd/dev/begonia_usb.c
 +++ b/bsd/dev/begonia_usb.c
