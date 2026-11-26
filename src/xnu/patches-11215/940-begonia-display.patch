@@ -2171,7 +2171,7 @@ diff --git a/osfmk/kern/begonia_kprof.c b/osfmk/kern/begonia_kprof.c
 new file mode 100644
 --- /dev/null
 +++ b/osfmk/kern/begonia_kprof.c
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,116 @@
 +/*
 + * begonia (Loxy, 26 Nov 2026): a sampling profiler for the USB console ("kprof S" in bsd/dev/begonia_usb.c).
 + *
@@ -2194,7 +2194,6 @@ new file mode 100644
 +#include <arm/cpu_data_internal.h>
 +#include <arm64/proc_reg.h>
 +#include <mach/arm/thread_status.h>
-+#include <libkern/libkern.h>
 +
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +
