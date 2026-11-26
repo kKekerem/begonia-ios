@@ -205,7 +205,10 @@ $CC -o "$OUT/probes/bgmtl_probe" "$WORK/bgmtl.o" "$WORK/bgmtl_probe.o" \
   "$OUT/bgmtl/libbgair.dylib" "$OUT/bgmtl/libdrm.2.dylib" \
   -framework Foundation -framework Metal -framework IOSurface -Wl,-rpath,/usr/local/lib/bgmtl
 $CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -c "$CHL_WORK/test/bgmtl_render_probe.m" -o "$WORK/bgmtl_render_probe.o"
-$CC -o "$OUT/probes/bgmtl_render_probe" "$WORK/bgmtl.o" "$WORK/bgmtl_render_probe.o" \
+# 26 Nov 2026: the render probe's own copy of the device code at -Os (its installed file has no room left to grow)
+$CC -Os -fno-objc-arc -Wall -Wno-deprecated-declarations -I"$CHL_WORK/air" \
+  -c "$CHL_WORK/src/bgmtl.m" -o "$WORK/bgmtl_os.o"
+$CC -o "$OUT/probes/bgmtl_render_probe" "$WORK/bgmtl_os.o" "$WORK/bgmtl_render_probe.o" \
   "$OUT/bgmtl/libbgair.dylib" "$OUT/bgmtl/libdrm.2.dylib" \
   -framework Foundation -framework Metal -framework IOSurface -Wl,-rpath,/usr/local/lib/bgmtl
 xcrun strip -x "$OUT/probes/bgmtl_render_probe"   # 26 Nov 2026: the in-place install must fit (like the inject)

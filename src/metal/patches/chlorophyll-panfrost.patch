@@ -127,7 +127,7 @@ index 67912be..659f1aa 100644
  
     /* The viewport, and now its z as well. Gallium's window depth is
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index b3a614e..a5232bf 100644
+index b3a614e..06ac99d 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
 @@ -175,6 +175,8 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCO
@@ -165,7 +165,42 @@ index b3a614e..a5232bf 100644
  // -- libraries from files: system metallibs (QuartzCore's default.metallib) are fat wrappers, slice 0 the AIR container
  // ("MTLB"), slice 1 precompiled Apple GPU code. _MTLDevice's own URL/bundle loaders pick the slice through MTLLoader by the
  // device's target architecture, which this device does not have (assertion "Target device architecture is nil"), so the
-@@ -813,6 +825,29 @@ bg_air_slice(NSData *d)
+@@ -724,6 +736,25 @@ bg_air_slice(NSData *d)
+    return [[BGMTLSampler alloc] initWithBGDevice:self descriptor:d];
+ }
+ 
++// Loxy (26 Nov 2026): MercuryPoster (the default wallpaper) renders a float SDF into colour attachment 1 (RGBA16Float, a
++// 64-bit RAW render target on this Mali) and reads it back with framebuffer fetch; the GPU stopped on that pass with
++// INSTR_INVALID_ENC (fault dump: RT1 internal format RAW64) and the wallpaper has been black since. With
++// /private/var/tmp/bgmtl.mercury its 64-bit float render targets become RGB10A2Unorm, a format the Mali blends and
++// fetches in fixed function (the SDF values are 0.29..1: ten bits hold them).
++static unsigned
++bg_rt_format_remap(unsigned f, BOOL rt)
++{
++   static int on = -1;
++   if (on < 0) on = strstr(getprogname(), "MercuryPoster") && access("/private/var/tmp/bgmtl.mercury", F_OK) == 0;
++   if (!on || !rt) return f;
++   if (f == MTLPixelFormatRGBA16Float || f == MTLPixelFormatRG32Float) {
++      static unsigned told;
++      if (told++ < 4) BG_LOG("MercuryPoster: render target format %u stands in as RGB10A2Unorm\n", f);
++      return MTLPixelFormatRGB10A2Unorm;
++   }
++   return f;
++}
++
+ - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor error:(NSError **)error
+ {
+    static SEL bitcode;
+@@ -758,7 +789,7 @@ bg_air_slice(NSData *d)
+    shape.sample_count = (unsigned)[descriptor sampleCount];
+    for (unsigned i = 0; i < 8; i++) {
+       MTLRenderPipelineColorAttachmentDescriptor *a = [[descriptor colorAttachments] objectAtIndexedSubscript:i];
+-      shape.color_format[i] = a ? (unsigned)[a pixelFormat] : 0;
++      shape.color_format[i] = a ? bg_rt_format_remap((unsigned)[a pixelFormat], YES) : 0;
+       if (shape.color_format[i]) shape.color_count = i + 1;
+       if (!a) { shape.color_blend[i].write_mask = 0xf; continue; }
+       shape.color_blend[i].blending_enabled = [a isBlendingEnabled];
+@@ -813,6 +844,29 @@ bg_air_slice(NSData *d)
     BG_LOG("render pipeline %s + %s: vertex_buffers=%u fragment_buffers=%u fragment_textures=%u samplers=%u streams=%u\n",
            vertex ? [[vertex name] UTF8String] : "(generated)", [[fragment name] UTF8String], info.vertex_buffers, info.fragment_buffers,
            info.fragment_textures, info.fragment_samplers, info.vertex_streams);
@@ -195,7 +230,7 @@ index b3a614e..a5232bf 100644
     return p;
  }
  
-@@ -1169,8 +1204,48 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1169,8 +1223,48 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
           /* A draw the runtime refuses is skipped and logged, and the rest of the command buffer still runs. Failing the
            * whole command buffer left the frame's later passes undrawn (the wallpaper area black or grey, stale wedges in
            * the poster editor) and counted towards the watchdog that switches Metal off. */
@@ -244,7 +279,7 @@ index b3a614e..a5232bf 100644
           // debugging (/private/var/tmp/bgmtl.dumpatt with the trace): colour 0 right after each blur-chain draw, before any
           // later draw of the pass touches it
           if (bg_trace() && w->color_count && w->color[0] && access("/private/var/tmp/bgmtl.dumpatt", F_OK) == 0 &&
-@@ -1285,6 +1360,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1285,6 +1379,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     // round trip per attachment per commit over 10 MB surfaces (the largest cost in the first Metal-compositor profiles).
     static int in_compositor = -1;
     if (in_compositor < 0) in_compositor = getenv("BGMTL_BB") != NULL;
@@ -264,7 +299,7 @@ index b3a614e..a5232bf 100644
     if (_status == 4 && !in_compositor) {
        NSMutableSet *written = nil;
        for (BGWork *w in _work)
-@@ -1588,6 +1676,35 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1588,6 +1695,35 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  
  
  // ---- texture / sampler / render pipeline ----------------------------------------------------------------------------
@@ -300,7 +335,16 @@ index b3a614e..a5232bf 100644
  @implementation BGMTLTexture
  + (void)load { ensure_protocol(self, "MTLTexture"); ensure_protocol(self, "MTLTextureImplementation"); }
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d
-@@ -1620,6 +1737,23 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1602,7 +1738,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+    self = [super init];
+    if (!self) return nil;
+    if (![device rwa] || !d) { [self release]; return nil; }
+-   _shape.pixel_format = (unsigned)[d pixelFormat];
++   _shape.pixel_format = bg_rt_format_remap((unsigned)[d pixelFormat], ([d usage] & MTLTextureUsageRenderTarget) != 0);
+    _shape.type = (unsigned)[d textureType];
+    _shape.width = (unsigned)[d width];
+    _shape.height = (unsigned)[d height];
+@@ -1620,6 +1756,23 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
        bg_unlock();
        _surface = CFRetain(surface);
        _plane = plane;
@@ -324,7 +368,7 @@ index b3a614e..a5232bf 100644
     } else {
        bg_lock();
        _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
-@@ -1650,8 +1784,58 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1650,8 +1803,58 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     return t;
  }
  
@@ -383,7 +427,7 @@ index b3a614e..a5232bf 100644
     // An IOSurface another process draws with the CPU (SpringBoard's status bar, the volume HUD): its new pixels may still sit in
     // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
     // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
-@@ -1675,13 +1859,33 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1675,13 +1878,33 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  
  - (struct rwa_texture *)rwaTexture
  {
@@ -420,7 +464,7 @@ index b3a614e..a5232bf 100644
        bg_unlock();
     }
     if (_linSrc && _tex) {
-@@ -1951,8 +2155,78 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1951,8 +2174,78 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
                  f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
        }
     }
