@@ -127,10 +127,19 @@ index 67912be..659f1aa 100644
  
     /* The viewport, and now its z as well. Gallium's window depth is
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index b3a614e..604afa4 100644
+index b3a614e..447df3e 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
-@@ -343,7 +343,16 @@ bg_install_fallback(Class c)
+@@ -175,6 +175,8 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCO
+    BOOL have_scissor;
+    unsigned scissor[4];
+    // texture blits: source/destination slice+level, origins and the size of the region, buffer layout
++   int diag;                       // Loxy (26 Nov 2026): > 0 = a corner/attachment-1 draw whose attachments are sampled after it
++   float diag_box[4];              // ... at these pixel bounds (min x, min y, max x, max y of its vertices)
+    unsigned clear_mask;            // BG_WORK_CLEAR: bit i = colour attachment i is MTLLoadActionClear to clear_vals[i]
+    float clear_vals[8][4];
+    NSUInteger t_sslice, t_slevel, t_dslice, t_dlevel, t_sorg[3], t_dorg[3], t_size[3], t_bpr, t_bpi;
+@@ -343,7 +345,16 @@ bg_install_fallback(Class c)
     const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
     NSUInteger _ncLength;
     void (^_ncDealloc)(void *, NSUInteger);
@@ -148,7 +157,7 @@ index b3a614e..604afa4 100644
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
  - (struct rwa_texture *)rwaTexture;
-@@ -600,6 +609,7 @@ ensure_protocol(Class cls, const char *proto)
+@@ -600,6 +611,7 @@ ensure_protocol(Class cls, const char *proto)
     return [[BGMTLCommandQueue alloc] initWithBGDevice:self descriptor:use];
  }
  
@@ -156,10 +165,18 @@ index b3a614e..604afa4 100644
  // -- libraries from files: system metallibs (QuartzCore's default.metallib) are fat wrappers, slice 0 the AIR container
  // ("MTLB"), slice 1 precompiled Apple GPU code. _MTLDevice's own URL/bundle loaders pick the slice through MTLLoader by the
  // device's target architecture, which this device does not have (assertion "Target device architecture is nil"), so the
-@@ -813,6 +823,21 @@ bg_air_slice(NSData *d)
+@@ -813,6 +825,29 @@ bg_air_slice(NSData *d)
     BG_LOG("render pipeline %s + %s: vertex_buffers=%u fragment_buffers=%u fragment_textures=%u samplers=%u streams=%u\n",
            vertex ? [[vertex name] UTF8String] : "(generated)", [[fragment name] UTF8String], info.vertex_buffers, info.fragment_buffers,
            info.fragment_textures, info.fragment_samplers, info.vertex_streams);
++   const char *fnm = [[fragment name] UTF8String];
++   if (fnm && (!strncmp(fnm, "Tcim", 4) || strstr(fnm, "S1X") || strstr(fnm, "M1") || strstr(fnm, "M0") || strstr(fnm, "_Isup"))) {
++      BG_LOG("  %s colour 1: format %u blend %u rgb %u/%u op %u alpha %u/%u op %u mask %#x; colours %u\n", p->_names,
++             shape.color_format[1], shape.color_blend[1].blending_enabled, shape.color_blend[1].source_rgb_blend_factor,
++             shape.color_blend[1].destination_rgb_blend_factor, shape.color_blend[1].rgb_blend_operation,
++             shape.color_blend[1].source_alpha_blend_factor, shape.color_blend[1].destination_alpha_blend_factor,
++             shape.color_blend[1].alpha_blend_operation, shape.color_blend[1].write_mask, shape.color_count);
++   }
 +   if (!strncmp([[fragment name] UTF8String], "Tcim", 4)) {    // Loxy (26 Nov 2026): the corner pipelines' vertex layout and blend
 +      for (unsigned i = 0; i < RWA_MAX_VERTEX_ATTRIBUTES; i++)
 +         if (shape.vertex_attribute[i].format)
@@ -178,7 +195,7 @@ index b3a614e..604afa4 100644
     return p;
  }
  
-@@ -1169,6 +1194,21 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1169,8 +1204,48 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
           /* A draw the runtime refuses is skipped and logged, and the rest of the command buffer still runs. Failing the
            * whole command buffer left the frame's later passes undrawn (the wallpaper area black or grey, stale wedges in
            * the poster editor) and counted towards the watchdog that switches Metal off. */
@@ -199,8 +216,35 @@ index b3a614e..604afa4 100644
 +         }
           if (rwa_render_draw(rp->_render, &dr, why, sizeof(why)) != 0)
              BG_LOG("draw skipped: %s\n", why);
++         if (w->diag && rwa_finish([dev rwa], why, sizeof(why)) == 0) {   // Loxy (26 Nov 2026): see bgRecordDraw
++            char line[1200];
++            size_t n = (size_t)snprintf(line, sizeof(line), "diag %d %s: box %.1f,%.1f-%.1f,%.1f scissor %s %u,%u %ux%u blend? colors %u",
++                                        w->diag, rp->_names, w->diag_box[0], w->diag_box[1], w->diag_box[2], w->diag_box[3],
++                                        w->have_scissor ? "on" : "off", w->scissor[0], w->scissor[1], w->scissor[2], w->scissor[3],
++                                        w->color_count);
++            static const float fr[3] = { 0.03f, 0.5f, 0.97f };
++            for (unsigned a = 0; a < w->color_count && a < 2 && n < sizeof(line) - 120; a++) {
++               BGMTLTexture *t = (BGMTLTexture *)w->color[a];
++               if (!t) continue;
++               int tw = (int)[t width], th = (int)[t height];
++               n += (size_t)snprintf(line + n, sizeof(line) - n, " | rt%u %dx%d fmt %lu:", a, tw, th, (unsigned long)[t pixelFormat]);
++               for (int iy = 0; iy < 3; iy++)
++                  for (int ix = 0; ix < 3 && n < sizeof(line) - 16; ix++) {
++                     int px = (int)(w->diag_box[0] + (w->diag_box[2] - w->diag_box[0]) * fr[ix]);
++                     int py = (int)(w->diag_box[1] + (w->diag_box[3] - w->diag_box[1]) * fr[iy]);
++                     px = px < 0 ? 0 : (px >= tw ? tw - 1 : px);
++                     py = py < 0 ? 0 : (py >= th ? th - 1 : py);
++                     uint8_t pix[16] = { 0 };
++                     [t getBytes:pix bytesPerRow:16 fromRegion:MTLRegionMake2D((NSUInteger)px, (NSUInteger)py, 1, 1) mipmapLevel:0];
++                     n += (size_t)snprintf(line + n, sizeof(line) - n, " %02x%02x%02x%02x", pix[0], pix[1], pix[2], pix[3]);
++                  }
++            }
++            BG_LOG("%s\n", line);
++         }
           // debugging (/private/var/tmp/bgmtl.dumpatt with the trace): colour 0 right after each blur-chain draw, before any
-@@ -1285,6 +1325,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+          // later draw of the pass touches it
+          if (bg_trace() && w->color_count && w->color[0] && access("/private/var/tmp/bgmtl.dumpatt", F_OK) == 0 &&
+@@ -1285,6 +1360,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     // round trip per attachment per commit over 10 MB surfaces (the largest cost in the first Metal-compositor profiles).
     static int in_compositor = -1;
     if (in_compositor < 0) in_compositor = getenv("BGMTL_BB") != NULL;
@@ -220,7 +264,7 @@ index b3a614e..604afa4 100644
     if (_status == 4 && !in_compositor) {
        NSMutableSet *written = nil;
        for (BGWork *w in _work)
-@@ -1588,6 +1641,35 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1588,6 +1676,35 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  
  
  // ---- texture / sampler / render pipeline ----------------------------------------------------------------------------
@@ -256,7 +300,7 @@ index b3a614e..604afa4 100644
  @implementation BGMTLTexture
  + (void)load { ensure_protocol(self, "MTLTexture"); ensure_protocol(self, "MTLTextureImplementation"); }
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d
-@@ -1620,6 +1702,23 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1620,6 +1737,23 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
        bg_unlock();
        _surface = CFRetain(surface);
        _plane = plane;
@@ -280,7 +324,7 @@ index b3a614e..604afa4 100644
     } else {
        bg_lock();
        _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
-@@ -1650,8 +1749,58 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1650,8 +1784,58 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     return t;
  }
  
@@ -339,7 +383,7 @@ index b3a614e..604afa4 100644
     // An IOSurface another process draws with the CPU (SpringBoard's status bar, the volume HUD): its new pixels may still sit in
     // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
     // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
-@@ -1675,13 +1824,33 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1675,13 +1859,33 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  
  - (struct rwa_texture *)rwaTexture
  {
@@ -376,7 +420,7 @@ index b3a614e..604afa4 100644
        bg_unlock();
     }
     if (_linSrc && _tex) {
-@@ -1951,6 +2120,46 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1951,8 +2155,76 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
                  f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
        }
     }
@@ -420,9 +464,39 @@ index b3a614e..604afa4 100644
 +         }
 +      }
 +   }
++   // Loxy (26 Nov 2026): the draws of CoreAnimation's corner clip (Tcim*, *S1* writing attachment 1, *M0/*M1 fetching an
++   // attachment, *_Isup) get their attachments sampled after they ran (commit), at their vertices' pixel bounds: the first 60
++   // per process, to see which step of the clip comes out wrong.
++   static int dgn;
++   float dbox[4] = { 1e9f, 1e9f, -1e9f, -1e9f };
++   BOOL dsel = NO;
++   {
++      const char *nm = _pipeline->_names;
++      if (dgn < 60 && nm && _vbuf[1] && count && count <= 4096 &&
++          (strstr(nm, "+Tcim") || strstr(nm, "S1X") || strstr(nm, "M1") || strstr(nm, "M0") || strstr(nm, "_Isup"))) {
++         const uint8_t *base = (const uint8_t *)[(BGMTLBuffer *)_vbuf[1] contents] + _voff[1];
++         NSUInteger blen = [(BGMTLBuffer *)_vbuf[1] length] - _voff[1];
++         for (NSUInteger k = 0; k < count; k++) {
++            long v = (long)(start + k);
++            if (ib && it == 0) v = ((const uint16_t *)((const uint8_t *)[(BGMTLBuffer *)ib contents] + io))[k];
++            else if (ib && it == 1) v = (long)((const uint32_t *)((const uint8_t *)[(BGMTLBuffer *)ib contents] + io))[k];
++            v += bv;
++            if (v < 0 || (NSUInteger)(48 * v + 8) > blen) continue;
++            const float *f = (const float *)(base + 48 * v);
++            if (f[0] < dbox[0]) dbox[0] = f[0];
++            if (f[1] < dbox[1]) dbox[1] = f[1];
++            if (f[0] > dbox[2]) dbox[2] = f[0];
++            if (f[1] > dbox[3]) dbox[3] = f[1];
++         }
++         dsel = dbox[0] <= dbox[2];
++      }
++   }
     BGWork *w = [[[BGWork alloc] init] autorelease];
     w->kind = BG_WORK_DRAW;
++   if (dsel) { w->diag = ++dgn; memcpy(w->diag_box, dbox, sizeof(dbox)); }
     w->render = [_pipeline retain];
+    w->vcount = _vhigh > _fhigh ? _vhigh : _fhigh;
+    w->count = _fhigh;
 diff --git a/test/bg_render.metal b/test/bg_render.metal
 index 4c7d2f6..c133c4c 100644
 --- a/test/bg_render.metal
