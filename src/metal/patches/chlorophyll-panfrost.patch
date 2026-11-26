@@ -127,7 +127,7 @@ index 67912be..659f1aa 100644
  
     /* The viewport, and now its z as well. Gallium's window depth is
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index b3a614e..1317bc5 100644
+index b3a614e..d057fbb 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
 @@ -121,6 +121,17 @@ bg_ctx_init(void)
@@ -192,7 +192,7 @@ index b3a614e..1317bc5 100644
  @end
  
  @interface BGMTLComputeEncoder : _MTLCommandEncoder {
-@@ -343,7 +365,17 @@ bg_install_fallback(Class c)
+@@ -343,7 +365,18 @@ bg_install_fallback(Class c)
     const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
     NSUInteger _ncLength;
     void (^_ncDealloc)(void *, NSUInteger);
@@ -202,6 +202,7 @@ index b3a614e..1317bc5 100644
 +   // 160/352/992 bytes a row) is a texture of our own, filled from the surface's bytes whenever its seed moves and,
 +   // when a pass rendered into it, written back after the GPU finished.
 +   BOOL _shadow, _shadowFilled;
++   NSUInteger _ycc;      // Loxy 950: Apple's private biplanar 8-bit YCbCr format (500/502/503) shown through an RGBA shadow
 +   uint32_t _shadowSeed;
 +   uint64_t _ncGen, _linGen;   // the replay that last refreshed it from _ncBytes / _linSrc (see bg_replay_gen)
 +}
@@ -211,7 +212,7 @@ index b3a614e..1317bc5 100644
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
  - (struct rwa_texture *)rwaTexture;
-@@ -416,6 +448,36 @@ ensure_protocol(Class cls, const char *proto)
+@@ -416,6 +449,36 @@ ensure_protocol(Class cls, const char *proto)
  }
  
  @implementation BGMTLDevice
@@ -248,7 +249,7 @@ index b3a614e..1317bc5 100644
  
  + (void)load
  {
-@@ -445,6 +507,8 @@ ensure_protocol(Class cls, const char *proto)
+@@ -445,6 +508,8 @@ ensure_protocol(Class cls, const char *proto)
  
  - (void)dealloc
  {
@@ -257,7 +258,7 @@ index b3a614e..1317bc5 100644
     if (_rwa) rwa_device_close(_rwa);
     [super dealloc];
  }
-@@ -600,6 +664,7 @@ ensure_protocol(Class cls, const char *proto)
+@@ -600,6 +665,7 @@ ensure_protocol(Class cls, const char *proto)
     return [[BGMTLCommandQueue alloc] initWithBGDevice:self descriptor:use];
  }
  
@@ -265,7 +266,7 @@ index b3a614e..1317bc5 100644
  // -- libraries from files: system metallibs (QuartzCore's default.metallib) are fat wrappers, slice 0 the AIR container
  // ("MTLB"), slice 1 precompiled Apple GPU code. _MTLDevice's own URL/bundle loaders pick the slice through MTLLoader by the
  // device's target architecture, which this device does not have (assertion "Target device architecture is nil"), so the
-@@ -724,6 +789,25 @@ bg_air_slice(NSData *d)
+@@ -724,6 +790,25 @@ bg_air_slice(NSData *d)
     return [[BGMTLSampler alloc] initWithBGDevice:self descriptor:d];
  }
  
@@ -291,7 +292,7 @@ index b3a614e..1317bc5 100644
  - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor error:(NSError **)error
  {
     static SEL bitcode;
-@@ -758,7 +842,8 @@ bg_air_slice(NSData *d)
+@@ -758,7 +843,8 @@ bg_air_slice(NSData *d)
     shape.sample_count = (unsigned)[descriptor sampleCount];
     for (unsigned i = 0; i < 8; i++) {
        MTLRenderPipelineColorAttachmentDescriptor *a = [[descriptor colorAttachments] objectAtIndexedSubscript:i];
@@ -301,7 +302,7 @@ index b3a614e..1317bc5 100644
        if (shape.color_format[i]) shape.color_count = i + 1;
        if (!a) { shape.color_blend[i].write_mask = 0xf; continue; }
        shape.color_blend[i].blending_enabled = [a isBlendingEnabled];
-@@ -813,6 +898,29 @@ bg_air_slice(NSData *d)
+@@ -813,6 +899,29 @@ bg_air_slice(NSData *d)
     BG_LOG("render pipeline %s + %s: vertex_buffers=%u fragment_buffers=%u fragment_textures=%u samplers=%u streams=%u\n",
            vertex ? [[vertex name] UTF8String] : "(generated)", [[fragment name] UTF8String], info.vertex_buffers, info.fragment_buffers,
            info.fragment_textures, info.fragment_samplers, info.vertex_streams);
@@ -331,7 +332,7 @@ index b3a614e..1317bc5 100644
     return p;
  }
  
-@@ -903,7 +1011,16 @@ bg_air_slice(NSData *d)
+@@ -903,7 +1012,16 @@ bg_air_slice(NSData *d)
     if (_deallocator) { _deallocator(_contents, _length); Block_release(_deallocator); }
     [super dealloc];
  }
@@ -349,7 +350,7 @@ index b3a614e..1317bc5 100644
  - (void *)contents { return _contents; }
  - (NSUInteger)length { return _length; }
  - (id)device { return _owner; }
-@@ -980,9 +1097,30 @@ bg_air_slice(NSData *d)
+@@ -980,9 +1098,30 @@ bg_air_slice(NSData *d)
  {
     [_queue release]; [_work release]; [_error release]; [_completed release]; [_scheduled release]; [_presents release];
     if (_done) dispatch_release(_done);
@@ -380,7 +381,7 @@ index b3a614e..1317bc5 100644
  - (void)bgRecord:(BGWork *)w { [_work addObject:w]; }
  - (NSInteger)status { return _status; }
  - (NSError *)error { return _error; }
-@@ -1066,8 +1204,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1066,8 +1205,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  {
     static int on = -1;
     static uint64_t win_start, last_end, n, draws, enc, wait, gap, enc_max, wait_max;
@@ -391,7 +392,7 @@ index b3a614e..1317bc5 100644
     if (win_start == 0) win_start = t_begin;
     uint64_t e = t_flushed - t_begin, w = t_waited - t_flushed;
     if (last_end && t_begin > last_end) gap += t_begin - last_end;
-@@ -1075,15 +1215,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1075,15 +1216,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     n++; draws += ndraw; enc += e; wait += w;
     if (e > enc_max) enc_max = e;
     if (w > wait_max) wait_max = w;
@@ -415,7 +416,7 @@ index b3a614e..1317bc5 100644
  }
  
  - (void)commit
-@@ -1095,6 +1239,8 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1095,6 +1240,8 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     _status = 2;   // Committed
     char why[512] = { 0 };
     bg_lock();
@@ -424,7 +425,7 @@ index b3a614e..1317bc5 100644
     for (BGWork *w in _work) {
        if (w->kind == BG_WORK_DISPATCH) {
           struct rwa_buffer *bufs[BG_MAX_BINDINGS] = { NULL };
-@@ -1169,8 +1315,48 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1169,8 +1316,48 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
           /* A draw the runtime refuses is skipped and logged, and the rest of the command buffer still runs. Failing the
            * whole command buffer left the frame's later passes undrawn (the wallpaper area black or grey, stale wedges in
            * the poster editor) and counted towards the watchdog that switches Metal off. */
@@ -473,7 +474,7 @@ index b3a614e..1317bc5 100644
           // debugging (/private/var/tmp/bgmtl.dumpatt with the trace): colour 0 right after each blur-chain draw, before any
           // later draw of the pass touches it
           if (bg_trace() && w->color_count && w->color[0] && access("/private/var/tmp/bgmtl.dumpatt", F_OK) == 0 &&
-@@ -1210,6 +1396,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1210,6 +1397,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
              memmove((uint8_t *)[(BGMTLBuffer *)w->dst contents] + w->dst_off, (uint8_t *)[(BGMTLBuffer *)w->src contents] + w->src_off, w->size);
           else
              memset((uint8_t *)[(BGMTLBuffer *)w->dst contents] + w->dst_off, w->fill, w->size);
@@ -481,7 +482,7 @@ index b3a614e..1317bc5 100644
        }
     }
     // Asynchronous completion (Chlorophyll: CPU and GPU overlap, as Metal's own do): the work is submitted and its fence handed to
-@@ -1231,6 +1418,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1231,6 +1419,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
        _status = 3;   // Scheduled
     struct rwa_fence *fence = _status != 5 ? rwa_flush([dev rwa]) : NULL;
     uint64_t t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
@@ -489,7 +490,7 @@ index b3a614e..1317bc5 100644
     bg_unlock();
     if (!defer_scheduled) {
        for (void (^h)(id) in _scheduled) h(self);
-@@ -1265,6 +1453,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1265,6 +1454,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
           [self bgFailWith:[NSString stringWithUTF8String:w2] code:3];
        else
           _status = 4;   // Completed: the fence has been paid
@@ -502,7 +503,7 @@ index b3a614e..1317bc5 100644
        rwa_fence_release([dev rwa], fence);
        [self bgCompleteFrom:t_begin];
        dispatch_group_leave(_done);
-@@ -1285,6 +1479,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1285,6 +1480,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     // round trip per attachment per commit over 10 MB surfaces (the largest cost in the first Metal-compositor profiles).
     static int in_compositor = -1;
     if (in_compositor < 0) in_compositor = getenv("BGMTL_BB") != NULL;
@@ -522,7 +523,7 @@ index b3a614e..1317bc5 100644
     if (_status == 4 && !in_compositor) {
        NSMutableSet *written = nil;
        for (BGWork *w in _work)
-@@ -1413,6 +1620,11 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1413,6 +1621,11 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
        }
     }
     [_presents removeAllObjects];
@@ -534,7 +535,7 @@ index b3a614e..1317bc5 100644
     for (void (^h)(id) in _completed) h(self);
     [_completed removeAllObjects];
  }
-@@ -1472,6 +1684,9 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1472,6 +1685,9 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  - (void)setSamplerState:(id)s atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _samplers[i] = s; if (i + 1 > _shigh) _shigh = (unsigned)i + 1; } }
  - (void)setBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
  {
@@ -544,7 +545,7 @@ index b3a614e..1317bc5 100644
     id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:length < 16 ? 16 : length options:0] autorelease];
     if (!b) { BG_LOG("setBytes: no buffer\n"); return; }
     [_scratch addObject:b];
-@@ -1588,6 +1803,35 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1588,6 +1804,35 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  
  
  // ---- texture / sampler / render pipeline ----------------------------------------------------------------------------
@@ -580,7 +581,7 @@ index b3a614e..1317bc5 100644
  @implementation BGMTLTexture
  + (void)load { ensure_protocol(self, "MTLTexture"); ensure_protocol(self, "MTLTextureImplementation"); }
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d
-@@ -1602,7 +1846,8 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1602,7 +1847,8 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     self = [super init];
     if (!self) return nil;
     if (![device rwa] || !d) { [self release]; return nil; }
@@ -590,11 +591,39 @@ index b3a614e..1317bc5 100644
     _shape.type = (unsigned)[d textureType];
     _shape.width = (unsigned)[d width];
     _shape.height = (unsigned)[d height];
-@@ -1620,6 +1865,23 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1615,11 +1861,51 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+    if (surface) {
+       _shape.usage |= 5;   /* a drawable is rendered into and may be sampled whatever CA asked for (MTLTextureUsageRenderTarget | ShaderRead) */
+       /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
++      NSUInteger ypf = [d pixelFormat];
++      /*
++       * Loxy (27 Nov 2026): MTLPixelFormat 500 / 502 / 503 = Apple's private YCBCR8_420_2P / 422_2P / 444_2P (two planes:
++       * Y, then interleaved CbCr). CoreAnimation samples such textures raw and applies its own colour matrix; refusing them
++       * (1859 times in one log) left photo/video content, posters and snapshots black or missing. They become an RGBA
++       * texture of our own, refilled from the planes whenever the surface's seed moves, with Metal's YCbCr channel
++       * order: G = Y, B = Cb, R = Cr (as in MTLPixelFormatGBGR422).
++       */
++      if (ypf == 500 || ypf == 502 || ypf == 503) {
++         _shape.pixel_format = 70;   // MTLPixelFormatRGBA8Unorm
++         bg_lock();
++         _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
++         bg_unlock();
++         _surface = CFRetain(surface);
++         _plane = plane;
++         if (_tex) { _shadow = YES; _ycc = ypf; }
++         static unsigned toldy;
++         if (toldy++ < 16)
++            BG_LOG("IOSurface %d YCbCr format %lu %lux%lu (planes %lu): %s\n", (int)IOSurfaceGetID((IOSurfaceRef)surface),
++                   (unsigned long)ypf, (unsigned long)[d width], (unsigned long)[d height],
++                   (unsigned long)IOSurfaceGetPlaneCount((IOSurfaceRef)surface), _tex ? "RGBA shadow" : why);
++      } else {
+       bg_lock();
+       _tex = rwa_texture_from_surface([device rwa], &_shape, (int)IOSurfaceGetID((IOSurfaceRef)surface), 0, 0, why, sizeof(why));
        bg_unlock();
        _surface = CFRetain(surface);
        _plane = plane;
-+      if (!_tex && strstr(why, "not a multiple of 64")) {
++      }
++      if (!_tex && !_ycc && strstr(why, "not a multiple of 64")) {
 +         // Loxy (26 Nov 2026): a texture of our own over the same shape, refreshed from the surface (see _shadow)
 +         char why2[256] = { 0 };
 +         bg_lock();
@@ -614,12 +643,47 @@ index b3a614e..1317bc5 100644
     } else {
        bg_lock();
        _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
-@@ -1650,8 +1912,59 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1650,8 +1936,94 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     return t;
  }
  
++- (void)yccRefreshLocked
++{
++   IOSurfaceRef s = (IOSurfaceRef)_surface;
++   uint32_t seed = 0;
++   if (IOSurfaceGetPlaneCount(s) < 2 || IOSurfaceLock(s, kIOSurfaceLockReadOnly, &seed) != 0) return;
++   const uint8_t *Y = (const uint8_t *)IOSurfaceGetBaseAddressOfPlane(s, 0);
++   const uint8_t *C = (const uint8_t *)IOSurfaceGetBaseAddressOfPlane(s, 1);
++   size_t ys = IOSurfaceGetBytesPerRowOfPlane(s, 0), cs = IOSurfaceGetBytesPerRowOfPlane(s, 1);
++   size_t yw = IOSurfaceGetWidthOfPlane(s, 0), yh = IOSurfaceGetHeightOfPlane(s, 0);
++   size_t cw = IOSurfaceGetWidthOfPlane(s, 1), ch = IOSurfaceGetHeightOfPlane(s, 1);
++   unsigned w = _shape.width < yw ? _shape.width : (unsigned)yw, h = _shape.height < yh ? _shape.height : (unsigned)yh;
++   unsigned sx = (cw && cw * 2 <= yw + 1) ? 2 : 1, sy = (ch && ch * 2 <= yh + 1) ? 2 : 1;
++   uint32_t *rgba = (Y && C && w && h && cw && ch) ? malloc((size_t)w * h * 4) : NULL;
++   if (rgba) {
++      for (unsigned y = 0; y < h; y++) {
++         const uint8_t *yr = Y + (size_t)y * ys;
++         size_t cy = y / sy < ch ? y / sy : ch - 1;
++         const uint8_t *cr = C + cy * cs;
++         uint32_t *o = rgba + (size_t)y * w;
++         for (unsigned x = 0; x < w; x++) {
++            size_t cx = x / sx < cw ? x / sx : cw - 1;
++            uint32_t cb = cr[cx * 2], crv = cr[cx * 2 + 1];
++            o[x] = crv | ((uint32_t)yr[x] << 8) | (cb << 16) | 0xff000000u;   // R = Cr, G = Y, B = Cb, A = 1
++         }
++      }
++      char why[256] = { 0 };
++      const unsigned org[3] = { 0, 0, 0 }, sz[3] = { w, h, 1 };
++      if (rwa_texture_write(_tex, 0, 0, org, sz, rgba, (size_t)w * 4, why, sizeof(why)) != 0)
++         BG_LOG("IOSurface %d YCbCr refresh: %s\n", (int)IOSurfaceGetID(s), why);
++      free(rgba);
++   }
++   IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, &seed);
++}
++
 +- (void)shadowRefreshLocked
 +{
++   if (_ycc) { [self yccRefreshLocked]; return; }
 +   IOSurfaceRef s = (IOSurfaceRef)_surface;
 +   uint32_t seed = 0;
 +   if (IOSurfaceLock(s, kIOSurfaceLockReadOnly, &seed) != 0) return;
@@ -637,7 +701,7 @@ index b3a614e..1317bc5 100644
 +// moves and the kernel cleans the lines for whoever reads the surface next).
 +- (void)shadowWriteBack
 +{
-+   if (!_shadow || !_surface || !_tex) return;
++   if (!_shadow || !_surface || !_tex || _ycc) return;
 +   IOSurfaceRef s = (IOSurfaceRef)_surface;
 +   uint32_t seed = 0;
 +   if (IOSurfaceLock(s, 0, &seed) != 0) return;
@@ -674,7 +738,7 @@ index b3a614e..1317bc5 100644
     // An IOSurface another process draws with the CPU (SpringBoard's status bar, the volume HUD): its new pixels may still sit in
     // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
     // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
-@@ -1675,16 +1988,42 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1675,16 +2047,42 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  
  - (struct rwa_texture *)rwaTexture
  {
@@ -721,7 +785,7 @@ index b3a614e..1317bc5 100644
        bg_lock();
        char why[256] = { 0 };
        const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height, 1 };
-@@ -1897,11 +2236,17 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1897,11 +2295,17 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)l atIndex:(NSUInteger)i
  {
     BG_TRACE("setVertexBytes length %lu index %lu\n", (unsigned long)l, (unsigned long)i);
@@ -739,7 +803,7 @@ index b3a614e..1317bc5 100644
     id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
     if (b) { [_scratch addObject:b]; [self setFragmentBuffer:b offset:0 atIndex:i]; }
  }
-@@ -1951,8 +2296,78 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1951,8 +2355,78 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
                  f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
        }
     }
