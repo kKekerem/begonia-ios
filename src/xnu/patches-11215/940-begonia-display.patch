@@ -227,7 +227,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  
  void begonia_usb_init(void);
  
-@@ -1055,16 +1074,1010 @@ parse_hex(const char *s, uint32_t *out)
+@@ -1055,16 +1074,1111 @@ parse_hex(const char *s, uint32_t *out)
  	return digits > 0;
  }
  
@@ -859,6 +859,98 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +	printf("BEGONIA FILE: rm %s -> %d\n", path, err);
 +}
 +
++/*
++ * "ucstat S NAME" (26 Nov 2026): S seconds of the IOKit external methods NAME's threads call in our drivers (1 SweetMali,
++ * 2 IOSurface, 3 IOMobileFramebuffer), per selector: calls, total time and the longest call. backboardd spent about half
++ * of its CPU in the kernel at ~20 fps; this says how much of it is ours.
++ */
++static uint64_t uc_cnt[4][64], uc_tot[4][64], uc_max[4][64];
++static volatile int uc_pid = -1;        /* -1 off, else only this pid (0: every process) */
++static uint64_t uc_t0, uc_at;
++static char uc_name[32];
++
++void begonia_uc_account(uint32_t cls, uint32_t sel, uint64_t abs);
++void
++begonia_uc_account(uint32_t cls, uint32_t sel, uint64_t abs)
++{
++	int want = uc_pid;
++	if (want < 0 || cls >= 4u || sel >= 64u || (want > 0 && proc_selfpid() != want)) {
++		return;
++	}
++	uc_cnt[cls][sel]++;
++	uc_tot[cls][sel] += abs;
++	if (abs > uc_max[cls][sel]) {
++		uc_max[cls][sel] = abs;
++	}
++}
++
++static int
++uc_find_cb(proc_t p, void *arg)
++{
++	char name[32];
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (strcmp(name, uc_name) == 0) {
++		*(int *)arg = proc_pid(p);
++		return PROC_RETURNED_DONE;
++	}
++	return PROC_RETURNED;
++}
++
++static void
++uc_start(uint32_t secs, const char *name)
++{
++	int pid = 0;
++	strlcpy(uc_name, name, sizeof(uc_name));
++	if (name[0] != '\0' && strcmp(name, "all") != 0) {
++		pid = -1;
++		proc_iterate(PROC_ALLPROCLIST, uc_find_cb, &pid, NULL, NULL);
++		if (pid <= 0) {
++			printf("BEGONIA UC: no process %s\n", name);
++			return;
++		}
++	}
++	bzero(uc_cnt, sizeof(uc_cnt));
++	bzero(uc_tot, sizeof(uc_tot));
++	bzero(uc_max, sizeof(uc_max));
++	uint64_t d;
++	nanoseconds_to_absolutetime((uint64_t)(secs < 1u ? 1u : (secs > 30u ? 30u : secs)) * NSEC_PER_SEC, &d);
++	uc_t0 = mach_absolute_time();
++	uc_at = uc_t0 + d;
++	uc_pid = pid;
++}
++
++static void
++uc_poll(void)
++{
++	if (uc_pid < 0 || mach_absolute_time() < uc_at) {
++		return;
++	}
++	int pid = uc_pid;
++	uc_pid = -1;
++	uint64_t wall_ns = 0, ns = 0, mx = 0, all = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - uc_t0, &wall_ns);
++	static const char *const cls_name[4] = { "?", "mali", "surface", "iomfb" };
++	for (uint32_t c = 1; c < 4u; c++) {
++		for (uint32_t k = 0; k < 64u; k++) {
++			all += uc_tot[c][k];
++		}
++	}
++	absolutetime_to_nanoseconds(all, &ns);
++	printf("BEGONIA UC: %s (pid %d) %llu ms: %llu ms in our external methods (%llu.%01llu%% of one CPU)\n", uc_name, pid,
++	    wall_ns / 1000000ull, ns / 1000000ull, wall_ns ? ns * 100ull / wall_ns : 0ull, wall_ns ? (ns * 1000ull / wall_ns) % 10ull : 0ull);
++	for (uint32_t c = 1; c < 4u; c++) {
++		for (uint32_t k = 0; k < 64u; k++) {
++			if (uc_cnt[c][k] == 0u) {
++				continue;
++			}
++			absolutetime_to_nanoseconds(uc_tot[c][k], &ns);
++			absolutetime_to_nanoseconds(uc_max[c][k], &mx);
++			printf("BEGONIA UC:   %-7s sel %2u: %6llu calls, %6llu us total, %5llu us max, %4llu us each\n", cls_name[c], k,
++			    uc_cnt[c][k], ns / 1000ull, mx / 1000ull, ns / 1000ull / uc_cnt[c][k]);
++		}
++	}
++}
++
 +static int
 +smp_cb(proc_t p, __unused void *arg)
 +{
@@ -1198,6 +1290,15 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +		cpufreq_report();
 +	} else if (strcmp(line, "kprof") == 0 || (strncmp(line, "kprof ", 6) == 0 && parse_ints(line + 6, iv, 1))) {
 +		kprof_report(line[5] == ' ' ? (uint32_t)iv[0] : 3u);
++	} else if (strncmp(line, "ucstat ", 7) == 0 && parse_ints(line + 7, iv, 1)) {
++		const char *nm = line + 7;
++		while (*nm >= '0' && *nm <= '9') {
++			nm++;
++		}
++		while (*nm == ' ') {
++			nm++;
++		}
++		uc_start((uint32_t)iv[0], nm);
 +	} else if (strncmp(line, "tail ", 5) == 0 && parse_ints(line + 5, iv, 1) && strchr(line + 5, '/') != NULL) {
 +		usb_file_tail((uint32_t)iv[0], strchr(line + 5, '/'));
 +	} else if (strncmp(line, "touch /", 7) == 0) {
@@ -1239,7 +1340,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  	} else if (strcmp(line, "fb") == 0) {
  		usb_fb_start(2u);
  	} else if (strncmp(line, "fb ", 3) == 0) {
-@@ -1079,7 +2092,7 @@ usb_cmd(char *line)
+@@ -1079,7 +2193,7 @@ usb_cmd(char *line)
  		usb.reboot_at = mach_absolute_time() + delta;
  		printf("BEGONIA USB: reboot in 2 s\n");
  	} else if (strncmp(line, "peek ", 5) == 0 && parse_hex(line + 5, &pa) && (pa & 3u) == 0 &&
@@ -1248,7 +1349,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		uint32_t page = pa & ~0xfffu;
  		if (usb.peek_va == 0 || usb.peek_page != page) {
  			usb.peek_va = ml_io_map(page, 0x1000);
-@@ -1137,6 +2150,27 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1137,6 +2251,27 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  		printf("BEGONIA USB: ml_io_map failed\n");
  		return;
  	}
@@ -1276,7 +1377,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  	if (!usb_hw_start()) {
  		printf("BEGONIA USB: not started\n");
  		return;
-@@ -1144,7 +2178,19 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1144,7 +2279,19 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  	nanoseconds_to_absolutetime(30ULL * NSEC_PER_SEC, &stat_gap);
  	usb.t0 = mach_absolute_time();
  	next_stat = usb.t0 + stat_gap;
@@ -1296,16 +1397,17 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		usb_bus_poll();
  		ep0_poll();
  		if (usb.configured) {
-@@ -1153,6 +2199,8 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1153,6 +2300,9 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  				usb_tx_poll();
  			}
  		}
 +		inj_poll();             /* 940: injected touches */
 +		top_poll();             /* 940: "top" results */
++		uc_poll();              /* 940: "ucstat" results */
  		if (usb.reboot_at != 0 && mach_absolute_time() >= usb.reboot_at) {
  			usb.reboot_at = 0;
  			printf("BEGONIA USB: rebooting\n");
-@@ -1186,6 +2234,7 @@ begonia_usb_init(void)
+@@ -1186,6 +2336,7 @@ begonia_usb_init(void)
  		return;
  	}
  	if (kernel_thread_start(begonia_usb_thread, NULL, &thread) == KERN_SUCCESS) {
@@ -1569,7 +1671,29 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
  		if (w <= 0 || h <= 0) {
  			w = (int32_t)s->width;
-@@ -3601,7 +3764,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -3591,17 +3754,29 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+ static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
+ 
+ IOReturn
++extern "C" void begonia_uc_account(uint32_t cls, uint32_t sel, uint64_t abs);
++namespace {
++/* 26 Nov 2026: time spent in each external method, per selector, for the USB console's "ucstat" (bsd/dev/begonia_usb.c) */
++struct BgUcTimer {
++	uint32_t cls, sel;
++	uint64_t t0;
++	BgUcTimer(uint32_t c, uint32_t s) : cls(c), sel(s), t0(mach_absolute_time()) {}
++	~BgUcTimer() { begonia_uc_account(cls, sel, mach_absolute_time() - t0); }
++};
++}
++
+ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+     __unused void *reference)
+ {
++	BgUcTimer bg_uc_timer(3, selector);
+ 	IOReturn ret = kIOReturnSuccess;
+ 	uint64_t out[2] = { 0, 0 };
+ 	uint32_t outCount = 0;
  
  	switch (selector) {
  	case kSweetFBGetLayerDefaultSurface:
@@ -1593,6 +1717,28 @@ diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
  			/* display-sized surfaces only: the compositor's framebuffers (828x1792 here) */
  			if (fragment && b->surface != NULL && !b->readonly && b->surface->width >= 600u &&
  			    b->surface->height >= 1200u) {
+@@ -479,9 +484,21 @@ IOReturn SweetMaliUserClient::submitJobs(struct sweet_mali_submit *r)
+ 	return kIOReturnSuccess;
+ }
+ 
++extern "C" void begonia_uc_account(uint32_t cls, uint32_t sel, uint64_t abs);
++namespace {
++/* 26 Nov 2026: time spent in each external method, per selector, for the USB console's "ucstat" (bsd/dev/begonia_usb.c) */
++struct BgUcTimer {
++	uint32_t cls, sel;
++	uint64_t t0;
++	BgUcTimer(uint32_t c, uint32_t s) : cls(c), sel(s), t0(mach_absolute_time()) {}
++	~BgUcTimer() { begonia_uc_account(cls, sel, mach_absolute_time() - t0); }
++};
++}
++
+ IOReturn SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
+ {
++	BgUcTimer bg_uc_timer(1, selector);
+ 	union {
+ 		struct sweet_mali_gem_close close;
+ 		struct sweet_mali_submit submit;
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
@@ -1653,7 +1799,30 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
  			s->memory = mem;
  			s->mapCache = kIOMapDefaultCache;
  			if (!sweet_surface_publish(s)) {
-@@ -1648,6 +1691,62 @@ sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
+@@ -1496,10 +1539,22 @@ IOSurfaceRootUserClient::wrapClient(uint32_t selector, IOExternalMethodArguments
+ }
+ 
+ IOReturn
++extern "C" void begonia_uc_account(uint32_t cls, uint32_t sel, uint64_t abs);
++namespace {
++/* 26 Nov 2026: time spent in each external method, per selector, for the USB console's "ucstat" (bsd/dev/begonia_usb.c) */
++struct BgUcTimer {
++	uint32_t cls, sel;
++	uint64_t t0;
++	BgUcTimer(uint32_t c, uint32_t s) : cls(c), sel(s), t0(mach_absolute_time()) {}
++	~BgUcTimer() { begonia_uc_account(cls, sel, mach_absolute_time() - t0); }
++};
++}
++
+ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+     __unused void *reference)
+ {
++	BgUcTimer bg_uc_timer(2, selector);
+ 	uint64_t arg0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
+ 
+ 	switch (selector) {
+@@ -1648,6 +1703,62 @@ sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
  	return kIOReturnSuccess;
  }
  
@@ -1716,7 +1885,7 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
  /* Retained surface this client created or looked up, or NULL. */
  static SweetSurface *
  sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
-@@ -1674,6 +1773,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+@@ -1674,6 +1785,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
  	if (s == NULL) {
  		return kIOReturnNotFound;
  	}
@@ -1724,7 +1893,7 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
  	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
  	s->release();
  	return ret;
-@@ -1689,6 +1789,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+@@ -1689,6 +1801,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
  	}
  	if (!((uintptr_t)options & kIOSurfaceLockReadOnly)) {
  		__atomic_add_fetch(&s->cpuWrites, 1, __ATOMIC_RELEASE);        /* the CPU may have written pixels: sweetfb_zcclean=3 cleans */
