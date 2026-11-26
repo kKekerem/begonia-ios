@@ -93,7 +93,7 @@ diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
  				for (uint32_t i = 0; i < sizeof(autotest_flag_files) / sizeof(autotest_flag_files[0]); i++) {
  					if (autotest_bgflags & (1u << i)) {
  						autotest_touch(autotest_flag_files[i]);
-@@ -123,11 +150,12 @@ begonia_autotest_init(void)
+@@ -123,15 +150,17 @@ begonia_autotest_init(void)
  	(void)PE_parse_boot_argn("begoniabgmtl", &autotest_bgmtl, sizeof(autotest_bgmtl));
  	(void)PE_parse_boot_argn("begoniareboot", &autotest_reboot, sizeof(autotest_reboot));
  	(void)PE_parse_boot_argn("begoniabgflags", &autotest_bgflags, sizeof(autotest_bgflags));
@@ -107,10 +107,54 @@ diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
  		return;
  	}
  	printf("BEGONIA AUTOTEST: bgmtl=%u reboot=%u s bgflags=%#x\n", autotest_bgmtl, autotest_reboot, autotest_bgflags);
+ 	if (kernel_thread_start(begonia_autotest_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "begonia autotest");
+ 		thread_deallocate(thread);
+ 	} else {
+ 		printf("BEGONIA AUTOTEST: kernel_thread_start failed\n");
+diff --git a/bsd/dev/begonia_mali.c b/bsd/dev/begonia_mali.c
+--- a/bsd/dev/begonia_mali.c
++++ b/bsd/dev/begonia_mali.c
+@@ -945,6 +945,7 @@ begonia_mali_init(void)
+ 	 * GPU wait for the SweetMali service / begonia_mali_ready().
+ 	 */
+ 	if (kernel_thread_start(begonia_mali_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "begonia mali");
+ 		thread_deallocate(thread);
+ 		printf("BEGONIA MALI: bring-up started in a kernel thread\n");
+ 	} else {
 diff --git a/bsd/dev/begonia_touch.c b/bsd/dev/begonia_touch.c
 --- a/bsd/dev/begonia_touch.c
 +++ b/bsd/dev/begonia_touch.c
-@@ -227,6 +227,7 @@ spi5_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
+@@ -60,7 +60,7 @@ static bool touch_started;
+ static int touch_chan;
+ static uint32_t touch_poll_ms = 8;
+ static int touch_log;
+-static uint64_t spi5_timeout_abs;       /* 2 ms */
++static uint64_t spi5_timeout_abs;       /* 300 us (begoniaspito=<us>; was 2 ms) */
+ static uint32_t spi5_timeouts;
+ static uint32_t spi5_last_fail;
+ 
+@@ -134,7 +134,17 @@ spi5_hw_init(void)
+ 	gpio_set_dir(38u, true);
+ 
+ 	/* 26 MHz / 6 = ~4.33 MHz, pad-select = 0 */
+-	nanoseconds_to_absolutetime(2u * NSEC_PER_MSEC, &spi5_timeout_abs);
++	/*
++	 * 26 Nov 2026: a 32-byte load takes ~60 us even at a 4.3 MHz SCK, but ~90 % of the polls hit a stuck transfer and
++	 * each one spun the whole 2 ms (~20 % of a CPU at 100 polls/s, and touch jitter). 300 us is still 5x the
++	 * transfer; the final status look in spi5_wait_status covers a preemption.
++	 */
++	uint32_t spito_us = 300u;
++	(void)PE_parse_boot_argn("begoniaspito", &spito_us, sizeof(spito_us));
++	if (spito_us < 50u || spito_us > 5000u) {
++		spito_us = 300u;
++	}
++	nanoseconds_to_absolutetime((uint64_t)spito_us * NSEC_PER_USEC, &spi5_timeout_abs);
+ 	delay(10);      /* the clock mux and gate writes above settle */
+ 	spi5_reset();
+ 	reg_wr(spi5_base, SPI_PAD_SEL_REG, 0u);
+@@ -227,6 +237,7 @@ spi5_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
  		cfg1 &= ~0x03ffff00u;
  		cfg1 |= ((chunk - 1u) << 16);
  		reg_wr(spi5_base, SPI_CFG1_REG, cfg1);
@@ -118,7 +162,7 @@ diff --git a/bsd/dev/begonia_touch.c b/bsd/dev/begonia_touch.c
  
  		for (uint32_t i = 0; i < chunk; i += 4u) {
  			uint32_t w = 0u;
-@@ -241,6 +242,15 @@ spi5_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
+@@ -241,6 +252,15 @@ spi5_xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
  			}
  			reg_wr(spi5_base, SPI_TX_DATA_REG, w);
  		}
@@ -134,10 +178,18 @@ diff --git a/bsd/dev/begonia_touch.c b/bsd/dev/begonia_touch.c
  
  		uint32_t cmd = base_cmd | (is_first ? SPI_CMD_ACT : SPI_CMD_RESUME);
  		reg_wr(spi5_base, SPI_CMD_REG, cmd);
+@@ -539,6 +559,7 @@ begonia_touch_init(void)
+ 		return;
+ 	}
+ 	if (kernel_thread_start(begonia_touch_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "begonia touch");
+ 		thread_deallocate(thread);
+ 	} else {
+ 		printf("BEGONIA TOUCH: kernel_thread_start failed\n");
 diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 --- a/bsd/dev/begonia_usb.c
 +++ b/bsd/dev/begonia_usb.c
-@@ -44,6 +44,17 @@ extern int reboot_kernel(int howto, char *message);
+@@ -44,6 +44,19 @@ extern int reboot_kernel(int howto, char *message);
  extern void begonia_wdt_stop_kicking(void);                                     /* begonia_reboot.c */
  extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);       /* sweet_ufs.c */
  extern uint64_t sweet_log_position(void);
@@ -145,6 +197,8 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +#include <sys/proc.h>
 +#include <sys/proc_internal.h>
 +#include <mach/task_info.h>
++#include <mach/thread_info.h>
++#include <sys/bsdtask_info.h>
 +extern void sweet_hid_touch(int finger, int down, int x, int y);              /* SweetHIDTouch (Bergamota 0058) */
 +extern void sweet_hid_key(int key, int down);                                   /* 0 power, 1 volume up, 2 volume down */
 +extern task_t proc_task(proc_t);
@@ -155,7 +209,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  
  void begonia_usb_init(void);
  
-@@ -1055,16 +1066,564 @@ parse_hex(const char *s, uint32_t *out)
+@@ -1055,16 +1068,641 @@ parse_hex(const char *s, uint32_t *out)
  	return digits > 0;
  }
  
@@ -230,6 +284,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +	int      pid;
 +	char     name[24];
 +	uint64_t us;
++	uint64_t sys;           /* 26 Nov: system part (traps such as the FJCVTZS emulation, syscalls) */
 +};
 +static struct top_ent top_a[TOP_MAX], top_b[TOP_MAX];
 +static uint32_t top_na, top_nb;
@@ -256,8 +311,8 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +	struct top_ent *e = &top_fill[(*top_fill_n)++];
 +	e->pid = proc_pid(p);
 +	proc_name(e->pid, e->name, sizeof(e->name));
-+	e->us = (uint64_t)tt.user_time.seconds * 1000000ull + (uint64_t)tt.user_time.microseconds +
-+	    (uint64_t)tt.system_time.seconds * 1000000ull + (uint64_t)tt.system_time.microseconds;
++	e->sys = (uint64_t)tt.system_time.seconds * 1000000ull + (uint64_t)tt.system_time.microseconds;
++	e->us = (uint64_t)tt.user_time.seconds * 1000000ull + (uint64_t)tt.user_time.microseconds + e->sys;
 +	return PROC_RETURNED;
 +}
 +
@@ -268,6 +323,77 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +	top_fill = t;
 +	top_fill_n = n;
 +	proc_iterate(PROC_ALLPROCLIST, top_cb, NULL, NULL, NULL);
++}
++
++/*
++ * 26 Nov 2026: kernel_task alone was 134 % of a CPU with the phone idle (live_054409). "top" now also lists its busiest
++ * threads: ours are named at kernel_thread_start ("begonia touch", "begonia usb", ...), SweetFB's work loop names
++ * itself; others show as "-" with their thread id and priority. Idle threads are skipped.
++ */
++#define KTOP_MAX 640
++struct ktop_ent {
++	uint64_t tid;
++	uint64_t ns;
++	int32_t  pri;
++	char     name[28];
++};
++static struct ktop_ent ktop_a[KTOP_MAX], ktop_b[KTOP_MAX];
++static uint64_t ktop_ids[KTOP_MAX];
++static uint32_t ktop_na, ktop_nb;
++
++static void
++ktop_snap(struct ktop_ent *t, uint32_t *n)
++{
++	task_t kt = proc_task(kernproc);
++	*n = 0;
++	if (kt == TASK_NULL) {
++		return;
++	}
++	int bytes = fill_taskthreadlist(kt, ktop_ids, KTOP_MAX, true);
++	uint32_t cnt = bytes > 0 ? (uint32_t)bytes / (uint32_t)sizeof(uint64_t) : 0u;
++	for (uint32_t i = 0; i < cnt && *n < KTOP_MAX; i++) {
++		struct proc_threadinfo_internal ti;
++		bzero(&ti, sizeof(ti));
++		if (fill_taskthreadinfo(kt, ktop_ids[i], true, &ti, NULL, NULL) != 0 || (ti.pth_flags & TH_FLAGS_IDLE)) {
++			continue;
++		}
++		struct ktop_ent *e = &t[(*n)++];
++		e->tid = ktop_ids[i];
++		e->ns = ti.pth_user_time + ti.pth_system_time;
++		e->pri = ti.pth_curpri;
++		strlcpy(e->name, ti.pth_name, sizeof(e->name));
++	}
++}
++
++static void
++ktop_report(uint64_t wall_us)
++{
++	ktop_snap(ktop_b, &ktop_nb);
++	for (uint32_t i = 0; i < ktop_nb; i++) {
++		uint64_t before = 0;
++		for (uint32_t j = 0; j < ktop_na; j++) {
++			if (ktop_a[j].tid == ktop_b[i].tid) {
++				before = ktop_a[j].ns;
++				break;
++			}
++		}
++		ktop_b[i].ns = ktop_b[i].ns > before ? ktop_b[i].ns - before : 0;
++	}
++	for (uint32_t k = 0; k < 12; k++) {
++		uint32_t best = KTOP_MAX;
++		for (uint32_t i = 0; i < ktop_nb; i++) {
++			if (ktop_b[i].tid != 0 && (best == KTOP_MAX || ktop_b[i].ns > ktop_b[best].ns)) {
++				best = i;
++			}
++		}
++		/* per mille of one CPU: ns / (wall_us * 1000) * 1000 */
++		if (best == KTOP_MAX || ktop_b[best].ns / wall_us < 3u) {
++			break;
++		}
++		printf("BEGONIA TOP:     kthread %-26s tid %-7llu pri %3d  %llu.%01llu%%\n", ktop_b[best].name[0] ? ktop_b[best].name : "-",
++		    ktop_b[best].tid, ktop_b[best].pri, ktop_b[best].ns / wall_us / 10u, (ktop_b[best].ns / wall_us) % 10u);
++		ktop_b[best].tid = 0;
++	}
 +}
 +
 +static void
@@ -287,14 +413,16 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +	/* delta per process (matched by pid), then the 14 biggest by selection */
 +	uint64_t total = 0;
 +	for (uint32_t i = 0; i < top_nb; i++) {
-+		uint64_t before = 0;
++		uint64_t before = 0, before_sys = 0;
 +		for (uint32_t j = 0; j < top_na; j++) {
 +			if (top_a[j].pid == top_b[i].pid) {
 +				before = top_a[j].us;
++				before_sys = top_a[j].sys;
 +				break;
 +			}
 +		}
 +		top_b[i].us = top_b[i].us > before ? top_b[i].us - before : 0;
++		top_b[i].sys = top_b[i].sys > before_sys ? top_b[i].sys - before_sys : 0;
 +		total += top_b[i].us;
 +	}
 +	printf("BEGONIA TOP: %llu ms, %u processes, CPU time %llu ms = %llu.%01llu cores busy\n", wall / 1000, top_nb,
@@ -309,10 +437,12 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +		if (best == TOP_MAX || top_b[best].us == 0) {
 +			break;
 +		}
-+		printf("BEGONIA TOP:   %-20s %5d  %llu.%01llu%%  (%llu ms)\n", top_b[best].name, top_b[best].pid,
-+		    top_b[best].us * 100 / wall, (top_b[best].us * 1000 / wall) % 10, top_b[best].us / 1000);
++		printf("BEGONIA TOP:   %-20s %5d  %llu.%01llu%%  (%llu ms, system %llu.%01llu%%)\n", top_b[best].name,
++		    top_b[best].pid, top_b[best].us * 100 / wall, (top_b[best].us * 1000 / wall) % 10, top_b[best].us / 1000,
++		    top_b[best].sys * 100 / wall, (top_b[best].sys * 1000 / wall) % 10);
 +		top_b[best].pid = -1;
 +	}
++	ktop_report(wall);
 +}
 +
 +/*
@@ -683,6 +813,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +		uint64_t d;
 +		nanoseconds_to_absolutetime((uint64_t)(secs < 1u ? 1u : (secs > 60u ? 60u : secs)) * NSEC_PER_SEC, &d);
 +		top_snap(top_a, &top_na);
++		ktop_snap(ktop_a, &ktop_na);
 +		top_t0 = mach_absolute_time();
 +		top_at = top_t0 + d;
 +	} else if (strncmp(line, "smp ", 4) == 0 && line[4] != '\0') {
@@ -721,7 +852,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  	} else if (strcmp(line, "fb") == 0) {
  		usb_fb_start(2u);
  	} else if (strncmp(line, "fb ", 3) == 0) {
-@@ -1079,7 +1638,7 @@ usb_cmd(char *line)
+@@ -1079,7 +1717,7 @@ usb_cmd(char *line)
  		usb.reboot_at = mach_absolute_time() + delta;
  		printf("BEGONIA USB: reboot in 2 s\n");
  	} else if (strncmp(line, "peek ", 5) == 0 && parse_hex(line + 5, &pa) && (pa & 3u) == 0 &&
@@ -730,7 +861,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		uint32_t page = pa & ~0xfffu;
  		if (usb.peek_va == 0 || usb.peek_page != page) {
  			usb.peek_va = ml_io_map(page, 0x1000);
-@@ -1137,6 +1696,21 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1137,6 +1775,21 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  		printf("BEGONIA USB: ml_io_map failed\n");
  		return;
  	}
@@ -752,7 +883,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  	if (!usb_hw_start()) {
  		printf("BEGONIA USB: not started\n");
  		return;
-@@ -1144,7 +1718,19 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1144,7 +1797,19 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  	nanoseconds_to_absolutetime(30ULL * NSEC_PER_SEC, &stat_gap);
  	usb.t0 = mach_absolute_time();
  	next_stat = usb.t0 + stat_gap;
@@ -772,7 +903,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		usb_bus_poll();
  		ep0_poll();
  		if (usb.configured) {
-@@ -1153,6 +1739,8 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1153,6 +1818,8 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  				usb_tx_poll();
  			}
  		}
@@ -781,10 +912,24 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		if (usb.reboot_at != 0 && mach_absolute_time() >= usb.reboot_at) {
  			usb.reboot_at = 0;
  			printf("BEGONIA USB: rebooting\n");
+@@ -1186,6 +1853,7 @@ begonia_usb_init(void)
+ 		return;
+ 	}
+ 	if (kernel_thread_start(begonia_usb_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "begonia usb");
+ 		thread_deallocate(thread);
+ 	} else {
+ 		printf("BEGONIA USB: kernel_thread_start failed\n");
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -53,6 +53,13 @@ extern "C" uint32_t sweet_gpu_fence_snapshot(void);     /* bsd/dev/sweet_a630.c
+@@ -49,10 +49,19 @@ extern "C" void sweet_busy_init(void);          /* iokit/Kernel/arm/SweetBusy.cp
+ extern "C" int sweet_smmu_probe_sid(unsigned sid, unsigned level); /* bsd/dev/sweet_smmu.c, read only */
+ extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb */
+ extern "C" int sweet_fb_hud;
++extern "C" void thread_set_thread_name(thread_t th, const char *name);   /* 26 Nov: named for the USB "top" */
++extern "C" thread_t current_thread(void);
+ extern "C" uint32_t sweet_gpu_fence_snapshot(void);     /* bsd/dev/sweet_a630.c (0229) */
  extern "C" bool sweet_gpu_blit_window(uint64_t pa, uint64_t size);      /* bsd/dev/sweet_a630.c (0240) */
  extern "C" uint32_t sweet_gpu_blit(uint64_t src_pa, uint32_t src_pitch, uint64_t dst_pa, uint32_t dst_pitch, uint32_t w, uint32_t h);
  extern "C" bool sweet_gpu_fence_passed(uint32_t fence);                    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_hud (patch 0213) */
@@ -798,7 +943,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  
  /*
   * 0228: per-frame trace for frame pacing (sysctl kern.sweet_fb_trace). One record per swap id (ring of 128, index id & 127):
-@@ -392,6 +399,8 @@ public:
+@@ -392,6 +401,8 @@ public:
  		uint64_t emptySwaps, emptyKept;                         /* 0233: swaps with no layer / of those, the ones that kept the frame */
  		uint64_t scanCopies, scanCopyAbs, scanCopyMaxAbs;       /* 0235: frames copied to a scan-out buffer, their time */
  		uint64_t scanGpuCopies, scanGpuFallbacks;               /* 0240: of those, copied by the GPU / by the CPU after a GPU failure */
@@ -807,7 +952,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint64_t scanGpuSubmitFails, scanGpuLate, scanGpuWaitMaxAbs; /* 0247: blits not submitted / not landed in 1 s; longest wait */
  	} fSt, fStPrev;
  	/*
-@@ -473,6 +482,17 @@ public:
+@@ -473,6 +484,17 @@ public:
  	vm_offset_t   fBlPwm;           /* begonia MT6785 disp_pwm0 @ 0x1100e000 */
  	uint32_t      fBlPwmPeriod;
  	bool          begoniaPwmWrite(uint32_t high);
@@ -825,7 +970,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	void          blInit(void);
  	bool          blStep(int dir);
  	bool          blSet(bool on);   /* 0242: the backlight straight to iOS's state (no ramp), retried; false: it did not take */
-@@ -485,6 +505,7 @@ public:
+@@ -485,6 +507,7 @@ public:
  	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
  	IOMemoryMap  *fMap;
  	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
@@ -833,7 +978,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLock       *fLock;            /* swaps and client list */
  	OSArray      *fClients;
  	uint32_t      fSwapID;
-@@ -815,6 +836,55 @@ AppleCLCD::start(IOService *provider)
+@@ -815,6 +838,55 @@ AppleCLCD::start(IOService *provider)
  			IOLog("SWEET FB: backlight fade off (sweetfb_blfade=0): black in one step\n");
  		}
  	}
@@ -889,9 +1034,13 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
  	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
  		IOLog("SWEET FB: no vsync timer\n");
-@@ -922,6 +992,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -921,7 +993,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
++	if (count == 1) {
++		thread_set_thread_name(current_thread(), "SweetFB work loop");
++	}
  	fb->fSt.ticks++;
 +	if (fb->fBegoniaVs && fb->fVsDeadline != 0 && now > fb->fVsDeadline) {
 +		uint64_t late = now - fb->fVsDeadline;  /* begonia 940: how late the timer ran after the deadline it was given */
@@ -904,7 +1053,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	/*
  	 * 0216: with sweetfb_vsyncalign the notification carries the time of the latest panel vsync that SwapWait saw (the
  	 * MDP latch, a real vsync of the panel) projected forward by whole periods, and the timer is re-armed for the next
-@@ -982,11 +1060,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -982,11 +1065,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		if (fb->fBlOK && fb->fBlPos != 0 && !fb->fBlOffFailed && !fb->blSet(false)) {
  			fb->fBlOffFailed = true;
  		}
@@ -919,7 +1068,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		return;
  	}
  	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && fb->gpuGateOpen(mach_absolute_time());
-@@ -1030,6 +1108,30 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -1030,6 +1113,30 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	sweet_hold_release(taken);      /* copied: CA may render into them again */
  	fb->statsTick(now);
  	fb->hudTick(now);
@@ -950,7 +1099,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	sender->setTimeoutUS(nextUS);
  }
  
-@@ -1190,6 +1292,21 @@ AppleCLCD::statsTick(uint64_t now)
+@@ -1190,6 +1297,21 @@ AppleCLCD::statsTick(uint64_t now)
  	    c.scanGpuSubmitFails, c.scanGpuLate, sweet_abs_us(c.scanGpuWaitMaxAbs));
  	#undef PER_S
  	sweet_fb_stats_publish(line);
@@ -972,7 +1121,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
  		fStLogT = now;
  		IOLog("SWEET FB: stats %s", line);
-@@ -2668,6 +2785,31 @@ bool
+@@ -2668,6 +2790,31 @@ bool
  AppleCLCD::blSet(bool on)
  {
  	if (sweet_board_begonia()) {
@@ -1004,7 +1153,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint32_t high = on ? (((uint32_t)(fBlRaw[0] & 0xfffu) * fBlPwmPeriod + 2047u) / 4095u) : 0u;
  		if (begoniaPwmWrite(high)) {
  			fBlPos = on ? SWEET_FB_BL_STEPS : 0;
-@@ -3436,6 +3578,22 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -3436,6 +3583,22 @@ AppleCLCD::present(const uint8_t *rec)
  				}
  			}
  		}
@@ -1027,7 +1176,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
  		if (w <= 0 || h <= 0) {
  			w = (int32_t)s->width;
-@@ -3601,7 +3759,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -3601,7 +3764,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  
  	switch (selector) {
  	case kSweetFBGetLayerDefaultSurface:
