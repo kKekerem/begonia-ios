@@ -35,7 +35,23 @@ diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
 --- a/bsd/dev/begonia_autotest.c
 +++ b/bsd/dev/begonia_autotest.c
-@@ -45,6 +45,8 @@ static const char *const autotest_flag_files[] = {
+@@ -33,6 +33,15 @@ extern void begonia_wdt_stop_kicking(void);     /* begonia_reboot.c */
+ static uint32_t autotest_bgmtl = 2;     /* 2 = not given */
+ static uint32_t autotest_reboot;
+ static uint32_t autotest_bgflags = ~0u; /* begoniabgflags=<mask>; ~0 = not given */
++/*
++ * begoniamgreset=1 (26 Nov 2026): MobileGestalt's answer cache, removed once. The native-canvas ADT says
++ * artwork-scale-factor 3 (360x780 points), but the cache written at the first boot (n841 donor values, scale 2) kept
++ * iOS at 2x: 540x1170 points, icons and text two thirds of their size with room for another icon between two. Without
++ * the cache MobileGestalt answers from the device tree again and writes a new one. A marker file makes it once only.
++ */
++static uint32_t autotest_mgreset;
++#define MG_CACHE    "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist"
++#define MG_DONE     BGMTL_DIR "loxy-mgreset.done"
+ 
+ /*
+  * begoniabgflags=<mask> (20 Nov 2026): Chlorophyll's switch files, read when a process starts (docs/FIXES.md):
+@@ -45,6 +54,8 @@ static const char *const autotest_flag_files[] = {
  	BGMTL_DIR "bgmtl-bb.full",      /* bit 3: backboardd redraws in full (no dirty regions) */
  	BGMTL_DIR "bgmtl.dumpatt",      /* bit 4: with the trace, attachments dumped to /private/var/tmp/att */
  	BGMTL_DIR "bgmtl.probe",        /* bit 5 (24 Nov): bgl-launch runs bgmtl_render_probe once -> bgmtl-probe.txt */
@@ -44,6 +60,46 @@ diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
  };
  
  static void
+@@ -72,7 +83,7 @@ begonia_autotest_thread(void *arg __unused, wait_result_t wr __unused)
+ 	uint64_t t0 = mach_absolute_time();
+ 	uint64_t ns;
+ 
+-	if (autotest_bgmtl != 2 || autotest_bgflags != ~0u) {
++	if (autotest_bgmtl != 2 || autotest_bgflags != ~0u || autotest_mgreset) {
+ 		/* wait for the root mount (rd=ufsroot0), at most 120 s */
+ 		for (int i = 0; i < 1200 && rootvnode == NULLVP; i++) {
+ 			IOSleep(100);
+@@ -87,6 +98,16 @@ begonia_autotest_thread(void *arg __unused, wait_result_t wr __unused)
+ 			} else if (autotest_bgmtl == 0) {
+ 				autotest_remove(BGMTL_DIR "bgmtl-bb.arm");
+ 			}
++			if (autotest_mgreset) {
++				vnode_t vp = NULLVP;
++				if (vnode_lookup(MG_DONE, 0, &vp, vfs_context_kernel()) == 0) {
++					vnode_put(vp);
++					printf("BEGONIA AUTOTEST: MobileGestalt cache already reset once\n");
++				} else {
++					autotest_remove(MG_CACHE);
++					autotest_touch(MG_DONE);
++				}
++			}
+ 			if (autotest_bgflags != ~0u) {
+ 				for (uint32_t i = 0; i < sizeof(autotest_flag_files) / sizeof(autotest_flag_files[0]); i++) {
+ 					if (autotest_bgflags & (1u << i)) {
+@@ -123,11 +144,12 @@ begonia_autotest_init(void)
+ 	(void)PE_parse_boot_argn("begoniabgmtl", &autotest_bgmtl, sizeof(autotest_bgmtl));
+ 	(void)PE_parse_boot_argn("begoniareboot", &autotest_reboot, sizeof(autotest_reboot));
+ 	(void)PE_parse_boot_argn("begoniabgflags", &autotest_bgflags, sizeof(autotest_bgflags));
++	(void)PE_parse_boot_argn("begoniamgreset", &autotest_mgreset, sizeof(autotest_mgreset));
+ 	if (autotest_reboot && (autotest_reboot < 30 || autotest_reboot > 3600)) {
+ 		printf("BEGONIA AUTOTEST: begoniareboot=%u out of range 30..3600, ignored\n", autotest_reboot);
+ 		autotest_reboot = 0;
+ 	}
+-	if (autotest_bgmtl == 2 && !autotest_reboot && autotest_bgflags == ~0u) {
++	if (autotest_bgmtl == 2 && !autotest_reboot && autotest_bgflags == ~0u && !autotest_mgreset) {
+ 		return;
+ 	}
+ 	printf("BEGONIA AUTOTEST: bgmtl=%u reboot=%u s bgflags=%#x\n", autotest_bgmtl, autotest_reboot, autotest_bgflags);
 diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 --- a/bsd/dev/begonia_usb.c
 +++ b/bsd/dev/begonia_usb.c
@@ -65,7 +121,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  
  void begonia_usb_init(void);
  
-@@ -1055,16 +1066,561 @@ parse_hex(const char *s, uint32_t *out)
+@@ -1055,16 +1066,564 @@ parse_hex(const char *s, uint32_t *out)
  	return digits > 0;
  }
  
@@ -320,6 +376,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +extern bool begonia_pmic_read(uint32_t reg, uint32_t *val);
 +extern bool begonia_pmic_write(uint32_t reg, uint32_t val);
 +extern void delay(int usec);
++extern int begonia_bl_i2c(bool on);
 +
 +#define BGC_APMIXED             0x1000c000u
 +#define BGC_MCUCFG_DIV          0x0c53a000u     /* MP0/MP1/BUS_PLL_DIVIDER at +0x2a0/+0x2a4/+0x2e0 */
@@ -603,6 +660,8 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +		bgc_info();
 +	} else if (strncmp(line, "gpumhz ", 7) == 0 && parse_ints(line + 7, iv, 1)) {
 +		bgg_set((uint32_t)iv[0]);
++	} else if (strncmp(line, "bli2c ", 6) == 0 && parse_ints(line + 6, iv, 1)) {
++		(void)begonia_bl_i2c(iv[0] != 0);       /* the LM36273 backlight on/off over I2C (test) */
 +	} else if (strncmp(line, "cpuopp ", 7) == 0 && parse_ints(line + 7, iv, 2)) {
 +		if (iv[0] != 0) {
 +			bgc_opp(0, (uint32_t)iv[0]);
@@ -628,7 +687,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  	} else if (strcmp(line, "fb") == 0) {
  		usb_fb_start(2u);
  	} else if (strncmp(line, "fb ", 3) == 0) {
-@@ -1079,7 +1635,7 @@ usb_cmd(char *line)
+@@ -1079,7 +1638,7 @@ usb_cmd(char *line)
  		usb.reboot_at = mach_absolute_time() + delta;
  		printf("BEGONIA USB: reboot in 2 s\n");
  	} else if (strncmp(line, "peek ", 5) == 0 && parse_hex(line + 5, &pa) && (pa & 3u) == 0 &&
@@ -637,7 +696,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		uint32_t page = pa & ~0xfffu;
  		if (usb.peek_va == 0 || usb.peek_page != page) {
  			usb.peek_va = ml_io_map(page, 0x1000);
-@@ -1137,6 +1693,21 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1137,6 +1696,21 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  		printf("BEGONIA USB: ml_io_map failed\n");
  		return;
  	}
@@ -659,7 +718,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  	if (!usb_hw_start()) {
  		printf("BEGONIA USB: not started\n");
  		return;
-@@ -1144,7 +1715,19 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1144,7 +1718,19 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  	nanoseconds_to_absolutetime(30ULL * NSEC_PER_SEC, &stat_gap);
  	usb.t0 = mach_absolute_time();
  	next_stat = usb.t0 + stat_gap;
@@ -679,7 +738,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		usb_bus_poll();
  		ep0_poll();
  		if (usb.configured) {
-@@ -1153,6 +1736,8 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1153,6 +1739,8 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  				usb_tx_poll();
  			}
  		}
@@ -691,7 +750,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -53,6 +53,12 @@ extern "C" uint32_t sweet_gpu_fence_snapshot(void);     /* bsd/dev/sweet_a630.c
+@@ -53,6 +53,13 @@ extern "C" uint32_t sweet_gpu_fence_snapshot(void);     /* bsd/dev/sweet_a630.c
  extern "C" bool sweet_gpu_blit_window(uint64_t pa, uint64_t size);      /* bsd/dev/sweet_a630.c (0240) */
  extern "C" uint32_t sweet_gpu_blit(uint64_t src_pa, uint32_t src_pitch, uint64_t dst_pa, uint32_t dst_pitch, uint32_t w, uint32_t h);
  extern "C" bool sweet_gpu_fence_passed(uint32_t fence);                    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_hud (patch 0213) */
@@ -700,11 +759,12 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +extern "C" uint64_t begonia_disp_next_sof(uint64_t from, int64_t *err_out);
 +extern "C" uint64_t begonia_disp_period(void);
 +extern "C" int begonia_disp_dcs(uint8_t cmd, int param);
++extern "C" int begonia_bl_i2c(bool on);         /* bsd/dev/begonia_disp.c: the LM36273 backlight over I2C */
 +extern "C" bool begonia_disp_alive(void);
  
  /*
   * 0228: per-frame trace for frame pacing (sysctl kern.sweet_fb_trace). One record per swap id (ring of 128, index id & 127):
-@@ -392,6 +398,8 @@ public:
+@@ -392,6 +399,8 @@ public:
  		uint64_t emptySwaps, emptyKept;                         /* 0233: swaps with no layer / of those, the ones that kept the frame */
  		uint64_t scanCopies, scanCopyAbs, scanCopyMaxAbs;       /* 0235: frames copied to a scan-out buffer, their time */
  		uint64_t scanGpuCopies, scanGpuFallbacks;               /* 0240: of those, copied by the GPU / by the CPU after a GPU failure */
@@ -713,7 +773,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint64_t scanGpuSubmitFails, scanGpuLate, scanGpuWaitMaxAbs; /* 0247: blits not submitted / not landed in 1 s; longest wait */
  	} fSt, fStPrev;
  	/*
-@@ -473,6 +481,17 @@ public:
+@@ -473,6 +482,17 @@ public:
  	vm_offset_t   fBlPwm;           /* begonia MT6785 disp_pwm0 @ 0x1100e000 */
  	uint32_t      fBlPwmPeriod;
  	bool          begoniaPwmWrite(uint32_t high);
@@ -723,7 +783,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	 * gets 60 even ticks; fVsDeadline = the tick asked for. fBlDcs: the backlight follows the display power through DCS
 +	 * 0x51 (boot-arg begoniabl=<level 1..255>, 0 = off), fBlLevel = the level put back at power on.
 +	 */
-+	bool          fBegonia, fBegoniaVs, fBlDcs;
++	bool          fBegonia, fBegoniaVs, fBlDcs, fBlI2c;
 +	uint64_t      fVsLeadAbs, fVsDeadline;
 +	uint32_t      fBlLevel;
 +	uint64_t      fRateT;           /* last "rate" log line */
@@ -731,7 +791,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	void          blInit(void);
  	bool          blStep(int dir);
  	bool          blSet(bool on);   /* 0242: the backlight straight to iOS's state (no ramp), retried; false: it did not take */
-@@ -485,6 +504,7 @@ public:
+@@ -485,6 +505,7 @@ public:
  	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
  	IOMemoryMap  *fMap;
  	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
@@ -739,7 +799,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLock       *fLock;            /* swaps and client list */
  	OSArray      *fClients;
  	uint32_t      fSwapID;
-@@ -815,6 +835,52 @@ AppleCLCD::start(IOService *provider)
+@@ -815,6 +836,55 @@ AppleCLCD::start(IOService *provider)
  			IOLog("SWEET FB: backlight fade off (sweetfb_blfade=0): black in one step\n");
  		}
  	}
@@ -756,7 +816,10 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		PE_parse_boot_argn("begoniabl", &bl, sizeof(bl));
 +		fBegoniaVs = fBegonia && vs != 0 && begonia_disp_period() != 0;
 +		nanoseconds_to_absolutetime((uint64_t)(lead < 0 ? 0 : (lead > 8000 ? 8000 : lead)) * 1000, &fVsLeadAbs);
++		int bli2c = 0;   /* 26 Nov 2026: begoniabli2c=1 also switches the LM36273 itself (the panel's PWM did not darken it) */
++		PE_parse_boot_argn("begoniabli2c", &bli2c, sizeof(bli2c));
 +		if (fBegonia && bl > 0) {
++			fBlI2c = bli2c != 0;
 +			fBlDcs = true;
 +			fBlOK = true;
 +			fBlPos = SWEET_FB_BL_STEPS;
@@ -792,7 +855,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
  	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
  		IOLog("SWEET FB: no vsync timer\n");
-@@ -922,6 +988,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -922,6 +992,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
  	fb->fSt.ticks++;
@@ -807,7 +870,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	/*
  	 * 0216: with sweetfb_vsyncalign the notification carries the time of the latest panel vsync that SwapWait saw (the
  	 * MDP latch, a real vsync of the panel) projected forward by whole periods, and the timer is re-armed for the next
-@@ -982,11 +1056,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -982,11 +1060,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		if (fb->fBlOK && fb->fBlPos != 0 && !fb->fBlOffFailed && !fb->blSet(false)) {
  			fb->fBlOffFailed = true;
  		}
@@ -822,7 +885,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		return;
  	}
  	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && fb->gpuGateOpen(mach_absolute_time());
-@@ -1030,6 +1104,30 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -1030,6 +1108,30 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	sweet_hold_release(taken);      /* copied: CA may render into them again */
  	fb->statsTick(now);
  	fb->hudTick(now);
@@ -853,7 +916,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	sender->setTimeoutUS(nextUS);
  }
  
-@@ -1190,6 +1288,21 @@ AppleCLCD::statsTick(uint64_t now)
+@@ -1190,6 +1292,21 @@ AppleCLCD::statsTick(uint64_t now)
  	    c.scanGpuSubmitFails, c.scanGpuLate, sweet_abs_us(c.scanGpuWaitMaxAbs));
  	#undef PER_S
  	sweet_fb_stats_publish(line);
@@ -875,7 +938,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
  		fStLogT = now;
  		IOLog("SWEET FB: stats %s", line);
-@@ -2668,6 +2781,25 @@ bool
+@@ -2668,6 +2785,31 @@ bool
  AppleCLCD::blSet(bool on)
  {
  	if (sweet_board_begonia()) {
@@ -885,7 +948,13 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		 */
 +		if (fBlDcs) {
 +			uint32_t lvl = on ? fBlLevel : 0u;
++			if (fBlI2c && on) {
++				(void)begonia_bl_i2c(true);     /* backlight driver on before the panel brightness comes back */
++			}
 +			int r = begonia_disp_dcs(0x51, (int)lvl);
++			if (fBlI2c && !on) {
++				(void)begonia_bl_i2c(false);    /* and off: BL_ENABLE 0, current sinks off */
++			}
 +			bool alive = begonia_disp_alive();
 +			static uint32_t told;
 +			if (told++ < 40 || r != 0 || !alive) {
@@ -901,7 +970,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint32_t high = on ? (((uint32_t)(fBlRaw[0] & 0xfffu) * fBlPwmPeriod + 2047u) / 4095u) : 0u;
  		if (begoniaPwmWrite(high)) {
  			fBlPos = on ? SWEET_FB_BL_STEPS : 0;
-@@ -3436,6 +3568,22 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -3436,6 +3578,22 @@ AppleCLCD::present(const uint8_t *rec)
  				}
  			}
  		}
@@ -924,7 +993,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
  		if (w <= 0 || h <= 0) {
  			w = (int32_t)s->width;
-@@ -3601,7 +3749,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -3601,7 +3759,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  
  	switch (selector) {
  	case kSweetFBGetLayerDefaultSurface:
@@ -1116,7 +1185,7 @@ diff --git a/bsd/dev/begonia_disp.c b/bsd/dev/begonia_disp.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/begonia_disp.c
-@@ -0,0 +1,341 @@
+@@ -0,0 +1,456 @@
 +/*
 + * begonia_disp.c (Loxy, 26 Nov 2026): the MT6785 display engine as LK left it, for the SweetFB framebuffer
 + * (iokit/Kernel/arm/SweetFramebuffer.cpp) on begonia (Redmi Note 8 Pro, CSOT NT36672A video-mode panel).
@@ -1455,6 +1524,121 @@ new file mode 100644
 +{
 +	*sent = g_dcs_sent;
 +	*failed = g_dcs_fail;
++}
++
++/*
++ * 26 Nov 2026: the backlight itself. The user saw the screen stay lit after the panel's DCS 0x51 went to 0: the LK left
++ * the LM36273 (backlight + LCD bias, I2C channel 0 at 0x11007000, address 0x11, begonia.dws I2C_LCD_BIAS) in I2C
++ * brightness mode, where the panel's PWM output means nothing. Android's own driver for this phone (leds-lm36273.c)
++ * switches it with register 0x08 BL_ENABLE: 0x00 = backlight and current sinks off, 0x17 = on (then 0x03 BC2 = 0xcd).
++ * A FIFO-mode write on the MT6785 I2C controller (i2c-mtk.c's sequence, without its DMA and interrupt): the timing and
++ * pin setup the LK programmed are kept; the I2C0 clock gate (infracfg_ao MODULE_SW_CG_0 bit 11) is opened if it is
++ * shut; the interrupt mask stays 0 and completion is polled (INTR_STAT, else START going back to 0), 5 ms at most.
++ */
++#define BGI_I2C0_PA             0x11007000u
++#define BGI_INFRA_PA            0x10001000u
++#define BGI_CG0_CLR             0x84u
++#define BGI_CG0_STA             0x90u
++#define BGI_I2C0_CG             (1u << 11)
++#define BGI_DATA_PORT           0x00u
++#define BGI_SLAVE_ADDR          0x04u
++#define BGI_INTR_MASK           0x08u
++#define BGI_INTR_STAT           0x0cu
++#define BGI_CONTROL             0x10u
++#define BGI_TRANSFER_LEN        0x14u
++#define BGI_TRANSAC_LEN         0x18u
++#define BGI_START               0x24u
++#define BGI_FIFO_ADDR_CLR       0x38u
++#define BGI_INTR_ALL            0x1ffu
++#define BGI_TRANSAC_COMP        0x001u
++#define BGI_ERRORS              0x12eu  /* bus error, timeout, arbitration lost, HS NACK, ACK error */
++static vm_offset_t g_i2c, g_infra;
++static uint32_t g_i2c_ok, g_i2c_fail;
++
++static inline void
++i2c_w16(uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint16_t *)(g_i2c + off) = (uint16_t)v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline uint32_t
++i2c_r16(uint32_t off)
++{
++	uint32_t v = *(volatile uint16_t *)(g_i2c + off);
++	__asm__ volatile ("dmb sy" ::: "memory");
++	return v;
++}
++
++/* one register of a 7-bit I2C device on channel 0; 0, or -1 (mapping), -2 (NACK/bus error), -3 (no completion) */
++int begonia_i2c0_write(uint8_t addr7, uint8_t reg, uint8_t val);
++int
++begonia_i2c0_write(uint8_t addr7, uint8_t reg, uint8_t val)
++{
++	if (g_infra == 0) {
++		g_infra = ml_io_map(BGI_INFRA_PA, 0x1000);
++	}
++	if (g_i2c == 0) {
++		g_i2c = ml_io_map(BGI_I2C0_PA, 0x1000);
++	}
++	if (g_i2c == 0 || g_infra == 0) {
++		g_i2c_fail++;
++		return -1;
++	}
++	if (*(volatile uint32_t *)(g_infra + BGI_CG0_STA) & BGI_I2C0_CG) {
++		*(volatile uint32_t *)(g_infra + BGI_CG0_CLR) = BGI_I2C0_CG;     /* the controller's clock on */
++		__asm__ volatile ("dsb sy" ::: "memory");
++		delay(10);
++	}
++	i2c_w16(BGI_CONTROL, (1u << 5) | (1u << 3));           /* ACKERR_DET_EN | CLK_EXT_EN: a plain write */
++	i2c_w16(BGI_SLAVE_ADDR, (uint32_t)addr7 << 1);
++	i2c_w16(BGI_INTR_MASK, 0);
++	i2c_w16(BGI_INTR_STAT, BGI_INTR_ALL);
++	i2c_w16(BGI_FIFO_ADDR_CLR, 1);
++	i2c_w16(BGI_TRANSFER_LEN, 2);
++	i2c_w16(BGI_TRANSAC_LEN, 1);
++	i2c_w16(BGI_DATA_PORT, reg);
++	i2c_w16(BGI_DATA_PORT, val);
++	i2c_w16(BGI_START, 1);
++	uint32_t st = 0;
++	int r = -3;
++	for (int i = 0; i < 500; i++) {         /* 2 bytes at 100..400 kHz take 60..250 us */
++		delay(10);
++		st = i2c_r16(BGI_INTR_STAT);
++		if (st & BGI_ERRORS) {
++			r = -2;
++			break;
++		}
++		if ((st & BGI_TRANSAC_COMP) || (i > 40 && (i2c_r16(BGI_START) & 1u) == 0)) {
++			r = 0;
++			break;
++		}
++	}
++	i2c_w16(BGI_INTR_STAT, BGI_INTR_ALL);
++	if (r == 0) {
++		g_i2c_ok++;
++	} else {
++		g_i2c_fail++;
++		if (g_i2c_fail < 20) {
++			printf("BEGONIA I2C: write %#x reg %#x = %#x failed %d (stat %#x start %#x)\n", addr7, reg, val, r, st,
++			    i2c_r16(BGI_START));
++		}
++	}
++	return r;
++}
++
++/* the LM36273's backlight off (BL_ENABLE 0) or on (BL_ENABLE 0x17, BC2 0xcd), as Android's driver does */
++int begonia_bl_i2c(bool on);
++int
++begonia_bl_i2c(bool on)
++{
++	int r = begonia_i2c0_write(0x11, 0x08, on ? 0x17 : 0x00);
++	if (on && r == 0) {
++		r = begonia_i2c0_write(0x11, 0x03, 0xcd);
++	}
++	printf("BEGONIA I2C: LM36273 backlight %s -> %d (%u ok, %u failed)\n", on ? "on" : "off", r, g_i2c_ok, g_i2c_fail);
++	return r;
 +}
 +
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
