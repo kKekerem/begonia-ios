@@ -208,6 +208,7 @@ $CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -c "$CHL_WORK/test/b
 $CC -o "$OUT/probes/bgmtl_render_probe" "$WORK/bgmtl.o" "$WORK/bgmtl_render_probe.o" \
   "$OUT/bgmtl/libbgair.dylib" "$OUT/bgmtl/libdrm.2.dylib" \
   -framework Foundation -framework Metal -framework IOSurface -Wl,-rpath,/usr/local/lib/bgmtl
+xcrun strip -x "$OUT/probes/bgmtl_render_probe"   # 26 Nov 2026: the in-place install must fit (like the inject)
 
 # 7. PAC-strip + ad-hoc sign all Mach-O outputs (strip first, deps last -> callers valid)
 BINARIES=(
