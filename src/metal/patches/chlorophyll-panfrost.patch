@@ -127,7 +127,7 @@ index 67912be..659f1aa 100644
  
     /* The viewport, and now its z as well. Gallium's window depth is
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index b3a614e..70fbfe0 100644
+index b3a614e..604afa4 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
 @@ -343,7 +343,16 @@ bg_install_fallback(Class c)
@@ -178,7 +178,7 @@ index b3a614e..70fbfe0 100644
     return p;
  }
  
-@@ -1169,6 +1194,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1169,6 +1194,21 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
           /* A draw the runtime refuses is skipped and logged, and the rest of the command buffer still runs. Failing the
            * whole command buffer left the frame's later passes undrawn (the wallpaper area black or grey, stale wedges in
            * the poster editor) and counted towards the watchdog that switches Metal off. */
@@ -188,10 +188,19 @@ index b3a614e..70fbfe0 100644
 +         static int noluma = -1;
 +         if (noluma < 0) noluma = access("/private/var/tmp/bgmtl-bb.noluma", F_OK) == 0;
 +         if (noluma && strstr(rp->_names, "luma_boost")) continue;
++         /* Loxy (26 Nov 2026): CoreAnimation's corner clip reads colour attachment 1 back with framebuffer fetch (its *M1*
++          * fragment functions) after its *S1* draws wrote it in the same pass. With /private/var/tmp/bgmtl-bb.m1flush such
++          * a read starts a new GPU batch, so attachment 1 is written out and preloaded before the fetch (render probe P12). */
++         static int m1flush = -1;
++         if (m1flush < 0) m1flush = access("/private/var/tmp/bgmtl-bb.m1flush", F_OK) == 0;
++         if (m1flush && w->color_count > 1 && strstr(rp->_names, "M1")) {
++            struct rwa_fence *f = rwa_flush([dev rwa]);
++            if (f) rwa_fence_release([dev rwa], f);
++         }
           if (rwa_render_draw(rp->_render, &dr, why, sizeof(why)) != 0)
              BG_LOG("draw skipped: %s\n", why);
           // debugging (/private/var/tmp/bgmtl.dumpatt with the trace): colour 0 right after each blur-chain draw, before any
-@@ -1285,6 +1316,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1285,6 +1325,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     // round trip per attachment per commit over 10 MB surfaces (the largest cost in the first Metal-compositor profiles).
     static int in_compositor = -1;
     if (in_compositor < 0) in_compositor = getenv("BGMTL_BB") != NULL;
@@ -211,7 +220,7 @@ index b3a614e..70fbfe0 100644
     if (_status == 4 && !in_compositor) {
        NSMutableSet *written = nil;
        for (BGWork *w in _work)
-@@ -1588,6 +1632,35 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1588,6 +1641,35 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  
  
  // ---- texture / sampler / render pipeline ----------------------------------------------------------------------------
@@ -247,7 +256,7 @@ index b3a614e..70fbfe0 100644
  @implementation BGMTLTexture
  + (void)load { ensure_protocol(self, "MTLTexture"); ensure_protocol(self, "MTLTextureImplementation"); }
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d
-@@ -1620,6 +1693,23 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1620,6 +1702,23 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
        bg_unlock();
        _surface = CFRetain(surface);
        _plane = plane;
@@ -271,7 +280,7 @@ index b3a614e..70fbfe0 100644
     } else {
        bg_lock();
        _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
-@@ -1650,8 +1740,58 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1650,8 +1749,58 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     return t;
  }
  
@@ -330,7 +339,7 @@ index b3a614e..70fbfe0 100644
     // An IOSurface another process draws with the CPU (SpringBoard's status bar, the volume HUD): its new pixels may still sit in
     // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
     // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
-@@ -1675,13 +1815,33 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1675,13 +1824,33 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  
  - (struct rwa_texture *)rwaTexture
  {
@@ -367,7 +376,7 @@ index b3a614e..70fbfe0 100644
        bg_unlock();
     }
     if (_linSrc && _tex) {
-@@ -1951,6 +2111,46 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1951,6 +2120,46 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
                  f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
        }
     }
