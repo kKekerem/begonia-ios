@@ -65,7 +65,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  
  void begonia_usb_init(void);
  
-@@ -1055,16 +1066,284 @@ parse_hex(const char *s, uint32_t *out)
+@@ -1055,16 +1066,504 @@ parse_hex(const char *s, uint32_t *out)
  	return digits > 0;
  }
  
@@ -306,6 +306,215 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +	return true;
 +}
 +
++/*
++ * 26 Nov 2026 (940 v7): CPU clocks. Nothing on the iOS path runs MediaTek's CPU DVFS (Android's kernel asks the SSPM's
++ * DVFS processor through CSRAM 0x0011bc00), so every core stays at the OPP the boot loader left: A55 (LL, cpu0-5)
++ * 1175 MHz, A76 (L, cpu6-7) 1085 MHz. "cpuopp LL L" (MHz, 0 = leave) sets an OPP of the MT6785T table (frequencies
++ * and Vproc from Android's mtk_cpufreq_opp_table.h, the higher of that and this phone's /proc/cpufreq table):
++ * MT6359 VPROC2 (LL, shared with the CCI) / VPROC1 (L) through the PMIC wrapper, VSRAM by the PMIC's hardware tracking
++ * (else by hand: Vproc + 100 mV, 850..1120 mV), then the cluster PLL (ARMPLL_LL / ARMPLL_L CON1, apmixed 0x1000c000 +
++ * 0x204 / 0x214) moved in steps of at most 50 MHz with its post-divider kept (the VCO stays inside what the table
++ * uses: at most 3340 MHz). Up: voltage, then clock; down: clock, then voltage, never below what the boot loader set.
++ * "cpuinfo" prints the registers. Volatile: every boot starts from the boot loader's OPP again.
++ */
++extern bool begonia_pmic_read(uint32_t reg, uint32_t *val);
++extern bool begonia_pmic_write(uint32_t reg, uint32_t val);
++extern void delay(int usec);
++
++#define BGC_APMIXED             0x1000c000u
++#define BGC_MCUCFG_DIV          0x0c53a000u     /* MP0/MP1/BUS_PLL_DIVIDER at +0x2a0/+0x2a4/+0x2e0 */
++#define BGC_VSRAM1_DA           0x1e8eu         /* LDO_VSRAM_PROC1_VOSEL1, bits 14:8 */
++#define BGC_VSRAM2_DA           0x1eacu
++
++struct bgc_cluster {
++	const char *name;
++	uint32_t con1, div;                     /* offsets: apmixed CON1, divider config */
++	uint32_t vset, vda, sset, strack, sda;  /* MT6359: VPROC ELR0 / DBG0, VSRAM ELR / TRACK0 / VOSEL1 */
++	const uint16_t (*opp)[2];               /* MHz, mV */
++	uint32_t nopp;
++	uint32_t boot_vsel, boot_svsel, boot_dds;   /* saved at the first change */
++	bool saved;
++};
++static const uint16_t bgc_opp_ll[][2] = {
++	{ 1618, 957 }, { 1500, 913 }, { 1375, 875 }, { 1275, 844 }, { 1175, 800 },
++};
++static const uint16_t bgc_opp_l[][2] = {
++	{ 1796, 925 }, { 1733, 907 }, { 1670, 900 }, { 1530, 857 }, { 1419, 825 }, { 1308, 800 }, { 1169, 775 }, { 1085, 750 },
++};
++static struct bgc_cluster bgc[2] = {
++	{ "LL", 0x204, 0x2a0, 0x17b2, 0x17a6, 0x1b42, 0x1ebe, BGC_VSRAM2_DA, bgc_opp_ll, 5, 0, 0, 0, false },
++	{ "L", 0x214, 0x2a4, 0x172e, 0x1726, 0x1b40, 0x1ea0, BGC_VSRAM1_DA, bgc_opp_l, 8, 0, 0, 0, false },
++};
++static vm_offset_t bgc_apm, bgc_mcu;
++
++static bool
++bgc_map(void)
++{
++	if (bgc_apm == 0) {
++		bgc_apm = ml_io_map(BGC_APMIXED, 0x1000);
++	}
++	if (bgc_mcu == 0) {
++		bgc_mcu = ml_io_map(BGC_MCUCFG_DIV, 0x1000);
++	}
++	return bgc_apm != 0 && bgc_mcu != 0;
++}
++
++static inline uint32_t
++bgc_rd(vm_offset_t b, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(b + off);
++	__asm__ volatile ("dmb sy" ::: "memory");
++	return v;
++}
++
++static inline void
++bgc_wr(vm_offset_t b, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(b + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* PLL output in MHz from CON1: 26 MHz x PCW / 2^14, then the post-divider (bits 26:24) */
++static uint32_t
++bgc_mhz(uint32_t con1)
++{
++	uint32_t vco = (uint32_t)(((uint64_t)(con1 & 0x3fffffu) * 26u) >> 14);
++	return vco >> ((con1 >> 24) & 7u);
++}
++
++static void
++bgc_info(void)
++{
++	if (!bgc_map()) {
++		printf("BEGONIA CPU: no mapping\n");
++		return;
++	}
++	for (int c = 0; c < 2; c++) {
++		struct bgc_cluster *k = &bgc[c];
++		uint32_t con1 = bgc_rd(bgc_apm, k->con1), div = bgc_rd(bgc_mcu, k->div);
++		uint32_t vs = 0, vd = 0, ss = 0, st = 0, sd = 0;
++		bool ok = begonia_pmic_read(k->vset, &vs) && begonia_pmic_read(k->vda, &vd) && begonia_pmic_read(k->sset, &ss) &&
++		    begonia_pmic_read(k->strack, &st) && begonia_pmic_read(k->sda, &sd);
++		printf("BEGONIA CPU: %s CON1 %#x (%u MHz, postdiv %u) div %#x (mux %u, ckdiv %u) | PMIC %s vproc set %u (%u mV) "
++		    "now %u (%u mV), vsram set %u (%u mV) now %u (%u mV), track %#x\n",
++		    k->name, con1, bgc_mhz(con1), 1u << ((con1 >> 24) & 7u), div, (div >> 9) & 3u, (div >> 17) & 31u,
++		    ok ? "ok" : "READ FAILED", vs & 0x7fu, 400u + (vs & 0x7fu) * 25u / 4u, vd & 0x7fu, 400u + (vd & 0x7fu) * 25u / 4u,
++		    ss & 0x7fu, 500u + (ss & 0x7fu) * 25u / 4u, (sd >> 8) & 0x7fu, 500u + ((sd >> 8) & 0x7fu) * 25u / 4u, st);
++	}
++	printf("BEGONIA CPU: CCIPLL CON1 %#x (%u MHz), BUS div %#x, FHCTL HP_EN %#x\n", bgc_rd(bgc_apm, 0x2a4),
++	    bgc_mhz(bgc_rd(bgc_apm, 0x2a4)), bgc_rd(bgc_mcu, 0x2e0), bgc_rd(bgc_apm, 0xe00));
++}
++
++/* Vproc to mV and back (MT6359 buck: 400 mV + 6.25 mV a step, 7 bits) */
++static uint32_t
++bgc_vsel(uint32_t mv)
++{
++	return (mv <= 400u) ? 0u : ((mv - 400u) * 4u + 24u) / 25u;
++}
++
++static bool
++bgc_set_volt(struct bgc_cluster *k, uint32_t vsel, bool tracking)
++{
++	uint32_t cur = 0;
++	if (vsel > 115u || !begonia_pmic_read(k->vda, &cur)) {     /* 115 = 1118.75 mV, the table's top */
++		return false;
++	}
++	cur &= 0x7fu;
++	uint32_t mv = 400u + vsel * 25u / 4u;
++	uint32_t smv = mv + 100u < 850u ? 850u : (mv + 100u > 1120u ? 1120u : mv + 100u);
++	uint32_t ssel = (smv - 500u) * 4u / 25u;
++	if (!tracking && vsel > cur && !begonia_pmic_write(k->sset, ssel)) {
++		return false;   /* up: SRAM first */
++	}
++	if (!begonia_pmic_write(k->vset, vsel)) {
++		return false;
++	}
++	uint32_t d = vsel > cur ? vsel - cur : cur - vsel;      /* steps of 6.25 mV; up 10 mV/us, down 7.5 mV/us */
++	delay((int)(d + 25u));
++	for (int i = 0; i < 20; i++) {
++		uint32_t now = 0;
++		if (begonia_pmic_read(k->vda, &now) && (now & 0x7fu) == vsel) {
++			if (!tracking && vsel < cur) {
++				(void)begonia_pmic_write(k->sset, ssel);        /* down: SRAM after */
++			}
++			return true;
++		}
++		delay(20);
++	}
++	return false;
++}
++
++/* the PLL to `mhz` with its post-divider kept, in steps of at most 50 MHz at the output */
++static bool
++bgc_set_clock(struct bgc_cluster *k, uint32_t mhz)
++{
++	uint32_t con1 = bgc_rd(bgc_apm, k->con1);
++	uint32_t pd = (con1 >> 24) & 7u;
++	uint32_t vco = mhz << pd;
++	if (pd > 2u || vco < 1000u || vco > 3340u) {
++		printf("BEGONIA CPU: %s: VCO %u MHz with post-divider %u is outside what the table uses\n", k->name, vco, 1u << pd);
++		return false;
++	}
++	uint32_t target = (vco << 14) / 26u;
++	uint32_t cur = con1 & 0x3fffffu;
++	uint32_t step = ((50u << pd) << 14) / 26u;
++	while (cur != target) {
++		uint32_t next = cur < target ? (target - cur > step ? cur + step : target) : (cur - target > step ? cur - step : target);
++		uint32_t v = (bgc_rd(bgc_apm, k->con1) & ~0x3fffffu) | next | (1u << 31);
++		bgc_wr(bgc_apm, k->con1, v);
++		delay(20);
++		cur = next;
++	}
++	return true;
++}
++
++static void
++bgc_opp(int c, uint32_t mhz)
++{
++	struct bgc_cluster *k = &bgc[c];
++	uint32_t mv = 0;
++	for (uint32_t i = 0; i < k->nopp; i++) {
++		if (k->opp[i][0] == mhz) {
++			mv = k->opp[i][1];
++		}
++	}
++	if (mv == 0) {
++		printf("BEGONIA CPU: %s %u MHz is not one of its OPPs here\n", k->name, mhz);
++		return;
++	}
++	uint32_t track = 0, vda = 0, sda = 0;
++	if (!bgc_map() || !begonia_pmic_read(k->strack, &track) || !begonia_pmic_read(k->vda, &vda) ||
++	    !begonia_pmic_read(k->sset, &sda)) {
++		printf("BEGONIA CPU: %s: PMIC not readable, nothing changed\n", k->name);
++		return;
++	}
++	if (bgc_rd(bgc_apm, 0xe00) & (c == 0 ? 1u : 2u)) {
++		printf("BEGONIA CPU: %s: its PLL is under frequency hopping control, nothing changed\n", k->name);
++		return;
++	}
++	if (!k->saved) {
++		k->boot_vsel = vda & 0x7fu;
++		k->boot_svsel = sda & 0x7fu;
++		k->boot_dds = bgc_rd(bgc_apm, k->con1) & 0x3fffffu;
++		k->saved = true;
++	}
++	bool tracking = (track & 1u) != 0;
++	uint32_t vsel = bgc_vsel(mv);
++	if (vsel < k->boot_vsel) {
++		vsel = k->boot_vsel;            /* never below what the boot loader chose (the CCI shares VPROC2) */
++	}
++	uint32_t was = bgc_mhz(bgc_rd(bgc_apm, k->con1));
++	bool ok;
++	if (mhz >= was) {
++		ok = bgc_set_volt(k, vsel, tracking) && bgc_set_clock(k, mhz);
++	} else {
++		ok = bgc_set_clock(k, mhz) && bgc_set_volt(k, vsel, tracking);
++	}
++	printf("BEGONIA CPU: %s %u -> %u MHz at %u mV (vsel %u, sram %s): %s\n", k->name, was, bgc_mhz(bgc_rd(bgc_apm, k->con1)),
++	    400u + vsel * 25u / 4u, vsel, tracking ? "tracked by the PMIC" : "set by hand", ok ? "done" : "FAILED");
++}
++
  static void
  usb_cmd(char *line)
  {
@@ -335,6 +544,17 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +		proc_iterate(PROC_ALLPROCLIST, smp_cb, NULL, NULL, NULL);
 +	} else if (strcmp(line, "cpufreq") == 0) {
 +		cpufreq_report();
++	} else if (strcmp(line, "cpuinfo") == 0) {
++		bgc_info();
++	} else if (strncmp(line, "cpuopp ", 7) == 0 && parse_ints(line + 7, iv, 2)) {
++		if (iv[0] != 0) {
++			bgc_opp(0, (uint32_t)iv[0]);
++		}
++		if (iv[1] != 0) {
++			bgc_opp(1, (uint32_t)iv[1]);
++		}
++		bgc_info();
++		cpufreq_report();
 +	} else if (strncmp(line, "key ", 4) == 0) {
 +		int k = strcmp(line + 4, "power") == 0 ? 0 : (strcmp(line + 4, "volup") == 0 ? 1 :
 +		    (strcmp(line + 4, "voldown") == 0 ? 2 : -1));
@@ -351,7 +571,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  	} else if (strcmp(line, "fb") == 0) {
  		usb_fb_start(2u);
  	} else if (strncmp(line, "fb ", 3) == 0) {
-@@ -1079,7 +1358,7 @@ usb_cmd(char *line)
+@@ -1079,7 +1578,7 @@ usb_cmd(char *line)
  		usb.reboot_at = mach_absolute_time() + delta;
  		printf("BEGONIA USB: reboot in 2 s\n");
  	} else if (strncmp(line, "peek ", 5) == 0 && parse_hex(line + 5, &pa) && (pa & 3u) == 0 &&
@@ -360,7 +580,29 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		uint32_t page = pa & ~0xfffu;
  		if (usb.peek_va == 0 || usb.peek_page != page) {
  			usb.peek_va = ml_io_map(page, 0x1000);
-@@ -1153,6 +1432,8 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1137,6 +1636,21 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+ 		printf("BEGONIA USB: ml_io_map failed\n");
+ 		return;
+ 	}
++	{
++		/* 940 v7: begoniacpull=<MHz> begoniacpul=<MHz>: CPU OPPs set at boot (bgc_opp; absent: the boot loader's) */
++		uint32_t ll = 0, l = 0;
++		(void)PE_parse_boot_argn("begoniacpull", &ll, sizeof(ll));
++		(void)PE_parse_boot_argn("begoniacpul", &l, sizeof(l));
++		if (ll != 0) {
++			bgc_opp(0, ll);
++		}
++		if (l != 0) {
++			bgc_opp(1, l);
++		}
++		if (ll != 0 || l != 0) {
++			bgc_info();
++		}
++	}
+ 	if (!usb_hw_start()) {
+ 		printf("BEGONIA USB: not started\n");
+ 		return;
+@@ -1153,6 +1667,8 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  				usb_tx_poll();
  			}
  		}
