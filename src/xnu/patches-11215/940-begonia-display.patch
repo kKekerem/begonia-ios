@@ -1671,10 +1671,10 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
  		if (w <= 0 || h <= 0) {
  			w = (int32_t)s->width;
-@@ -3591,17 +3754,29 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+@@ -3590,18 +3753,30 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+ 
  static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
  
- IOReturn
 +extern "C" void begonia_uc_account(uint32_t cls, uint32_t sel, uint64_t abs);
 +namespace {
 +/* 26 Nov 2026: time spent in each external method, per selector, for the USB console's "ucstat" (bsd/dev/begonia_usb.c) */
@@ -1686,6 +1686,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +};
 +}
 +
+ IOReturn
  IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
      __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
      __unused void *reference)
@@ -1799,10 +1800,10 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
  			s->memory = mem;
  			s->mapCache = kIOMapDefaultCache;
  			if (!sweet_surface_publish(s)) {
-@@ -1496,10 +1539,22 @@ IOSurfaceRootUserClient::wrapClient(uint32_t selector, IOExternalMethodArguments
+@@ -1495,11 +1538,23 @@ IOSurfaceRootUserClient::wrapClient(uint32_t selector, IOExternalMethodArguments
+ 	return ret;
  }
  
- IOReturn
 +extern "C" void begonia_uc_account(uint32_t cls, uint32_t sel, uint64_t abs);
 +namespace {
 +/* 26 Nov 2026: time spent in each external method, per selector, for the USB console's "ucstat" (bsd/dev/begonia_usb.c) */
@@ -1814,6 +1815,7 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
 +};
 +}
 +
+ IOReturn
  IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
      __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
      __unused void *reference)
