@@ -134,6 +134,9 @@ $CC -dynamiclib -o "$OUT/bgmtl/bgmtl-inject.dylib" "$WORK/bgmtl.o" "$WORK/bgmtl_
   "$OUT/bgmtl/libbgair.dylib" "$OUT/bgmtl/libdrm.2.dylib" \
   -install_name "/usr/local/lib/bgmtl/bgmtl-inject.dylib" -Wl,-not_for_dyld_shared_cache \
   -framework Foundation -framework Metal -framework IOSurface -Wl,-rpath,@loader_path
+# 26 Nov 2026: local symbols out (the installed copy is rewritten in place on the phone's HFS root and must fit the blocks
+# it already owns; ObjC method names and statics are most of __LINKEDIT)
+xcrun strip -x "$OUT/bgmtl/bgmtl-inject.dylib"
 
 # 4. Build Chlorophyll.bundle (/System/Library/Extensions/Chlorophyll.bundle)
 B="$OUT/Chlorophyll.bundle"
@@ -148,6 +151,7 @@ $CC -O2 -g -fno-objc-arc -Wall -Wno-deprecated-declarations $RENAME \
 $CC -bundle -o "$B/Chlorophyll" "$WORK/chlorophyll_plugin.o" \
   "$B/libbgair.dylib" "$B/libdrm.2.dylib" \
   -framework Foundation -framework Metal -framework IOSurface -framework IOKit -Wl,-rpath,@loader_path
+xcrun strip -x "$B/Chlorophyll"
 cat > "$B/Info.plist" <<'EOP'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

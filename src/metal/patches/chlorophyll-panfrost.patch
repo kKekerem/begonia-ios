@@ -1,5 +1,5 @@
 diff --git a/air/air_metal.c b/air/air_metal.c
-index 67912be..08bdb96 100644
+index 67912be..659f1aa 100644
 --- a/air/air_metal.c
 +++ b/air/air_metal.c
 @@ -45,6 +45,11 @@
@@ -90,24 +90,7 @@ index 67912be..08bdb96 100644
        static const driOptionDescription freedreno_options[] = {
  #include "freedreno/driinfo_freedreno.h"
        };
-@@ -2020,6 +2046,16 @@ caller_stride(const struct rwa_texture *texture, const struct pipe_box *box, siz
-    return true;
- }
- 
-+void
-+rwa_texture_block_layout(const struct rwa_texture *texture, unsigned width, unsigned height,
-+                         size_t *row_bytes, unsigned *rows, unsigned *block_height)
-+{
-+   enum pipe_format f = texture->res->format;
-+   *row_bytes = (size_t)util_format_get_nblocksx(f, width) * util_format_get_blocksize(f);
-+   *rows = util_format_get_nblocksy(f, height);
-+   *block_height = util_format_get_blockheight(f);
-+}
-+
- int
- rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
-                   const unsigned origin[3], const unsigned size[3], const void *bytes,
-@@ -7235,7 +7271,9 @@ fail:
+@@ -7235,7 +7261,9 @@ fail:
  
  /* Chlorophyll: freedreno's debug flags, present only in a build that links the freedreno driver (the host build runs
   * softpipe). FD_DBG_SYSMEM (bit 9) makes every batch render in sysmem instead of tiling through GMEM. */
@@ -117,7 +100,7 @@ index 67912be..08bdb96 100644
  
  int
  rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
-@@ -7577,8 +7615,10 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
+@@ -7577,8 +7605,10 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
      * patched from the resource (patch_fb_read_sysmem) is exact. Sticky for the process: such a batch can be flushed
      * by a later call, and a client that fetches at all (CoreAnimation) does so every frame.
      */
@@ -128,7 +111,7 @@ index 67912be..08bdb96 100644
  
     fb_bind(device, &fb, draw->color, draw->color_count, draw->depth);
  
-@@ -7587,7 +7627,14 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
+@@ -7587,7 +7617,14 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
      * colour cache had not written back yet (the pass's clear colour): Control Center's blur passes came out with one
      * triangle of each quad white (CoreAnimation's Tc3sA2Xhf_Idst after the downsample draw), and which half depended on
      * timing. FRAMEBUFFER: wait for idle, flush CCU colour/depth, flush and invalidate the texture cache. */
@@ -143,28 +126,8 @@ index 67912be..08bdb96 100644
        pipe->texture_barrier(pipe, PIPE_TEXTURE_BARRIER_FRAMEBUFFER);
  
     /* The viewport, and now its z as well. Gallium's window depth is
-diff --git a/air/air_metal.h b/air/air_metal.h
-index ee2b232..f05d0eb 100644
---- a/air/air_metal.h
-+++ b/air/air_metal.h
-@@ -190,6 +190,15 @@ int rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned laye
- int rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,
- 		     const unsigned origin[3], const unsigned size[3], void *bytes,
- 		     size_t stride, char *why, size_t why_size);
-+/*
-+ * Loxy (26 Nov 2026): the row shape of a width x height region in this texture's format, for
-+ * callers that hold bytes without a stride (-newTextureWithBytesNoCopy:): the bytes of one row
-+ * of blocks, tightly packed, the number of block rows, and the block height (1 for the plain
-+ * formats, 4 for ASTC 4x4). A row of an ASTC image is a row of BLOCKS: length / texel rows
-+ * gave 1085 bytes for 1080 texels of ASTC 4x4, which need 4320.
-+ */
-+void rwa_texture_block_layout(const struct rwa_texture *texture, unsigned width, unsigned height,
-+			      size_t *row_bytes, unsigned *rows, unsigned *block_height);
- 
- /*
-  * What a depth/stencil texture holds, by aspect, which is the reading rwa_texture_read
 diff --git a/src/bgmtl.m b/src/bgmtl.m
-index b3a614e..f5018ba 100644
+index b3a614e..e04bcb4 100644
 --- a/src/bgmtl.m
 +++ b/src/bgmtl.m
 @@ -343,7 +343,16 @@ bg_install_fallback(Class c)
@@ -185,69 +148,15 @@ index b3a614e..f5018ba 100644
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
  - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
  - (struct rwa_texture *)rwaTexture;
-@@ -600,6 +609,45 @@ ensure_protocol(Class cls, const char *proto)
+@@ -600,6 +609,7 @@ ensure_protocol(Class cls, const char *proto)
     return [[BGMTLCommandQueue alloc] initWithBGDevice:self descriptor:use];
  }
  
-+// Loxy (26 Nov 2026): every pipeline's AIR modules, when /private/var/tmp/bgmtl.airdump exists, to
-+// /private/var/tmp/air/<process>/<function>.<v|f|c>.bc (once per name, 1500 files per process at most). CoreAnimation compiles
-+// most of its shaders at run time from source (VfxU10Xh, TcimA2Xhf_Isrc, ...), so they are on no disk to look at otherwise.
-+static void
-+bg_air_dump_one(const char *name, NSData *bc, char kind)
-+{
-+   static int on = -1;
-+   static unsigned count;
-+   static char dir[128];
-+   if (on < 0) {
-+      on = access("/private/var/tmp/bgmtl.airdump", F_OK) == 0;
-+      if (on) {
-+         snprintf(dir, sizeof(dir), "/private/var/tmp/air/%s", getprogname());
-+         mkdir("/private/var/tmp/air", 0777);
-+         mkdir(dir, 0777);
-+      }
-+   }
-+   if (!on || !name || !bc.length || count >= 1500) return;
-+   char safe[200];
-+   size_t i = 0;
-+   for (; name[i] && i < sizeof(safe) - 1; i++) safe[i] = name[i] == '/' ? '_' : name[i];
-+   safe[i] = 0;
-+   char path[400];
-+   snprintf(path, sizeof(path), "%s/%s.%c.bc", dir, safe, kind);
-+   if (access(path, F_OK) == 0) return;
-+   FILE *f = fopen(path, "wb");
-+   if (!f) return;
-+   fwrite(bc.bytes, 1, bc.length, f);
-+   fclose(f);
-+   count++;
-+}
-+
-+static void
-+bg_air_dump(const char *vname, NSData *vair, const char *fname, NSData *fair)
-+{
-+   bg_air_dump_one(vname, vair, 'v');
-+   bg_air_dump_one(fname, fair, 'f');
-+}
 +
  // -- libraries from files: system metallibs (QuartzCore's default.metallib) are fat wrappers, slice 0 the AIR container
  // ("MTLB"), slice 1 precompiled Apple GPU code. _MTLDevice's own URL/bundle loaders pick the slice through MTLLoader by the
  // device's target architecture, which this device does not have (assertion "Target device architecture is nil"), so the
-@@ -753,6 +801,7 @@ bg_air_slice(NSData *d)
-       if (vair) [vair writeToFile:[d stringByAppendingFormat:@"/%@.v.bc", [vertex name]] atomically:NO];
-       [fair writeToFile:[d stringByAppendingFormat:@"/%@.f.bc", [fragment name]] atomically:NO];
-    }
-+   bg_air_dump(vertex ? [[vertex name] UTF8String] : NULL, vair, [[fragment name] UTF8String], fair);
-    struct rwa_render_shape shape;
-    memset(&shape, 0, sizeof(shape));
-    shape.sample_count = (unsigned)[descriptor sampleCount];
-@@ -826,6 +875,7 @@ bg_air_slice(NSData *d)
-    if (![function respondsToSelector:bitcode]) return [self bgFail:error with:@"function has no bitcodeData selector"];
-    NSData *air = ((NSData * (*)(id, SEL))objc_msgSend)(function, bitcode);
-    if (!air.length) return [self bgFail:error with:@"function has no bitcode"];
-+   bg_air_dump_one([[function name] UTF8String], air, 'c');
-    char why[512] = { 0 };
-    struct rwa_compute_info info = { 0 };
-    bg_lock();
-@@ -1169,6 +1219,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1169,6 +1179,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
           /* A draw the runtime refuses is skipped and logged, and the rest of the command buffer still runs. Failing the
            * whole command buffer left the frame's later passes undrawn (the wallpaper area black or grey, stale wedges in
            * the poster editor) and counted towards the watchdog that switches Metal off. */
@@ -260,7 +169,7 @@ index b3a614e..f5018ba 100644
           if (rwa_render_draw(rp->_render, &dr, why, sizeof(why)) != 0)
              BG_LOG("draw skipped: %s\n", why);
           // debugging (/private/var/tmp/bgmtl.dumpatt with the trace): colour 0 right after each blur-chain draw, before any
-@@ -1285,6 +1341,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1285,6 +1301,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     // round trip per attachment per commit over 10 MB surfaces (the largest cost in the first Metal-compositor profiles).
     static int in_compositor = -1;
     if (in_compositor < 0) in_compositor = getenv("BGMTL_BB") != NULL;
@@ -280,7 +189,43 @@ index b3a614e..f5018ba 100644
     if (_status == 4 && !in_compositor) {
        NSMutableSet *written = nil;
        for (BGWork *w in _work)
-@@ -1620,6 +1689,23 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1588,6 +1617,35 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+ 
+ 
+ // ---- texture / sampler / render pipeline ----------------------------------------------------------------------------
++// Loxy (26 Nov 2026): bytes per block of the block-compressed formats QuartzCore hands over without a stride (0: not
++// compressed), and the block's width and height. A row of such an image is a row of blocks.
++static unsigned
++bg_block_bytes(unsigned f, unsigned *bw, unsigned *bh)
++{
++   *bw = *bh = 4;
++   switch (f) {
++   case MTLPixelFormatASTC_4x4_sRGB: case MTLPixelFormatASTC_4x4_LDR: case MTLPixelFormatASTC_4x4_HDR: return 16;
++   case MTLPixelFormatASTC_5x4_sRGB: case MTLPixelFormatASTC_5x4_LDR: case MTLPixelFormatASTC_5x4_HDR: *bw = 5; return 16;
++   case MTLPixelFormatASTC_5x5_sRGB: case MTLPixelFormatASTC_5x5_LDR: case MTLPixelFormatASTC_5x5_HDR: *bw = 5; *bh = 5; return 16;
++   case MTLPixelFormatASTC_6x5_sRGB: case MTLPixelFormatASTC_6x5_LDR: case MTLPixelFormatASTC_6x5_HDR: *bw = 6; *bh = 5; return 16;
++   case MTLPixelFormatASTC_6x6_sRGB: case MTLPixelFormatASTC_6x6_LDR: case MTLPixelFormatASTC_6x6_HDR: *bw = 6; *bh = 6; return 16;
++   case MTLPixelFormatASTC_8x5_sRGB: case MTLPixelFormatASTC_8x5_LDR: case MTLPixelFormatASTC_8x5_HDR: *bw = 8; *bh = 5; return 16;
++   case MTLPixelFormatASTC_8x6_sRGB: case MTLPixelFormatASTC_8x6_LDR: case MTLPixelFormatASTC_8x6_HDR: *bw = 8; *bh = 6; return 16;
++   case MTLPixelFormatASTC_8x8_sRGB: case MTLPixelFormatASTC_8x8_LDR: case MTLPixelFormatASTC_8x8_HDR: *bw = 8; *bh = 8; return 16;
++   case MTLPixelFormatASTC_10x5_sRGB: case MTLPixelFormatASTC_10x5_LDR: case MTLPixelFormatASTC_10x5_HDR: *bw = 10; *bh = 5; return 16;
++   case MTLPixelFormatASTC_10x6_sRGB: case MTLPixelFormatASTC_10x6_LDR: case MTLPixelFormatASTC_10x6_HDR: *bw = 10; *bh = 6; return 16;
++   case MTLPixelFormatASTC_10x8_sRGB: case MTLPixelFormatASTC_10x8_LDR: case MTLPixelFormatASTC_10x8_HDR: *bw = 10; *bh = 8; return 16;
++   case MTLPixelFormatASTC_10x10_sRGB: case MTLPixelFormatASTC_10x10_LDR: case MTLPixelFormatASTC_10x10_HDR: *bw = 10; *bh = 10; return 16;
++   case MTLPixelFormatASTC_12x10_sRGB: case MTLPixelFormatASTC_12x10_LDR: case MTLPixelFormatASTC_12x10_HDR: *bw = 12; *bh = 10; return 16;
++   case MTLPixelFormatASTC_12x12_sRGB: case MTLPixelFormatASTC_12x12_LDR: case MTLPixelFormatASTC_12x12_HDR: *bw = 12; *bh = 12; return 16;
++   case MTLPixelFormatETC2_RGB8: case MTLPixelFormatETC2_RGB8_sRGB: case MTLPixelFormatETC2_RGB8A1: case MTLPixelFormatETC2_RGB8A1_sRGB:
++   case MTLPixelFormatEAC_R11Unorm: case MTLPixelFormatEAC_R11Snorm: return 8;
++   case MTLPixelFormatEAC_RG11Unorm: case MTLPixelFormatEAC_RG11Snorm: case MTLPixelFormatEAC_RGBA8: case MTLPixelFormatEAC_RGBA8_sRGB:
++      return 16;
++   default: *bw = *bh = 1; return 0;
++   }
++}
++
+ @implementation BGMTLTexture
+ + (void)load { ensure_protocol(self, "MTLTexture"); ensure_protocol(self, "MTLTextureImplementation"); }
+ - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d
+@@ -1620,6 +1678,23 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
        bg_unlock();
        _surface = CFRetain(surface);
        _plane = plane;
@@ -304,7 +249,7 @@ index b3a614e..f5018ba 100644
     } else {
        bg_lock();
        _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
-@@ -1650,8 +1736,58 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1650,8 +1725,58 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
     return t;
  }
  
@@ -363,7 +308,7 @@ index b3a614e..f5018ba 100644
     // An IOSurface another process draws with the CPU (SpringBoard's status bar, the volume HUD): its new pixels may still sit in
     // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
     // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
-@@ -1675,13 +1811,33 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
+@@ -1675,13 +1800,33 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
  
  - (struct rwa_texture *)rwaTexture
  {
@@ -385,16 +330,16 @@ index b3a614e..f5018ba 100644
 +       * rounded up to a page) is block rows packed tightly; length / texel rows gave 1085 bytes for 1080 texels of
 +       * ASTC 4x4 (which need 4320) and every such image was refused. Such an image does not change: uploaded once.
 +       */
-+      size_t tight = 0;
-+      unsigned rows = 0, bh = 1;
-+      rwa_texture_block_layout(_tex, _shape.width, _shape.height, &tight, &rows, &bh);
-+      size_t stride = bh > 1 ? tight : (size_t)(_ncLength / (rows ? rows : 1));
-+      if (bh > 1 && (uint64_t)tight * rows > _ncLength) {
-+         BG_LOG("no-copy texture refresh: %lu bytes hold less than %u rows of %zu\n", (unsigned long)_ncLength, rows, tight);
++      unsigned bw = 1, bh = 1, bb = bg_block_bytes(_shape.pixel_format, &bw, &bh);
++      size_t rows = bb ? (_shape.height + bh - 1) / bh : (_shape.height ? _shape.height : 1);
++      size_t tight = bb ? (size_t)((_shape.width + bw - 1) / bw) * bb : 0;
++      size_t stride = bb ? tight : (size_t)(_ncLength / rows);
++      if (bb && (uint64_t)tight * rows > _ncLength) {
++         BG_LOG("no-copy texture refresh: %lu bytes hold less than %zu rows of %zu\n", (unsigned long)_ncLength, rows, tight);
 +         _ncDone = YES;
 +      } else if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)_ncBytes, stride, why, sizeof(why)) != 0) {
           BG_LOG("no-copy texture refresh: %s\n", why);
-+      } else if (bh > 1) {
++      } else if (bb) {
 +         _ncDone = YES;
 +      }
        bg_unlock();
