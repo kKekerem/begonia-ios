@@ -1753,7 +1753,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -49,10 +49,47 @@ extern "C" void sweet_busy_init(void);          /* iokit/Kernel/arm/SweetBusy.cp
+@@ -49,10 +49,48 @@ extern "C" void sweet_busy_init(void);          /* iokit/Kernel/arm/SweetBusy.cp
  extern "C" int sweet_smmu_probe_sid(unsigned sid, unsigned level); /* bsd/dev/sweet_smmu.c, read only */
  extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb */
  extern "C" int sweet_fb_hud;
@@ -1763,6 +1763,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  extern "C" bool sweet_gpu_blit_window(uint64_t pa, uint64_t size);      /* bsd/dev/sweet_a630.c (0240) */
  extern "C" uint32_t sweet_gpu_blit(uint64_t src_pa, uint32_t src_pitch, uint64_t dst_pa, uint32_t dst_pitch, uint32_t w, uint32_t h);
  extern "C" bool sweet_gpu_fence_passed(uint32_t fence);                    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_hud (patch 0213) */
++extern "C" bool sweet_surface_pin(SweetSurface *s);    /* SweetSurface.cpp (951) */
 +extern "C" uint64_t begonia_mali_submitted_seq(void);   /* bsd/dev/begonia_mali.c (950) */
 +extern "C" uint64_t begonia_mali_done_seq(void);
 +/*
@@ -1801,7 +1802,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  
  /*
   * 0228: per-frame trace for frame pacing (sysctl kern.sweet_fb_trace). One record per swap id (ring of 128, index id & 127):
-@@ -392,6 +429,8 @@ public:
+@@ -392,6 +430,8 @@ public:
  		uint64_t emptySwaps, emptyKept;                         /* 0233: swaps with no layer / of those, the ones that kept the frame */
  		uint64_t scanCopies, scanCopyAbs, scanCopyMaxAbs;       /* 0235: frames copied to a scan-out buffer, their time */
  		uint64_t scanGpuCopies, scanGpuFallbacks;               /* 0240: of those, copied by the GPU / by the CPU after a GPU failure */
@@ -1810,7 +1811,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint64_t scanGpuSubmitFails, scanGpuLate, scanGpuWaitMaxAbs; /* 0247: blits not submitted / not landed in 1 s; longest wait */
  	} fSt, fStPrev;
  	/*
-@@ -473,6 +512,17 @@ public:
+@@ -473,6 +513,17 @@ public:
  	vm_offset_t   fBlPwm;           /* begonia MT6785 disp_pwm0 @ 0x1100e000 */
  	uint32_t      fBlPwmPeriod;
  	bool          begoniaPwmWrite(uint32_t high);
@@ -1828,7 +1829,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	void          blInit(void);
  	bool          blStep(int dir);
  	bool          blSet(bool on);   /* 0242: the backlight straight to iOS's state (no ramp), retried; false: it did not take */
-@@ -485,6 +535,7 @@ public:
+@@ -485,6 +536,7 @@ public:
  	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
  	IOMemoryMap  *fMap;
  	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
@@ -1836,7 +1837,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLock       *fLock;            /* swaps and client list */
  	OSArray      *fClients;
  	uint32_t      fSwapID;
-@@ -815,6 +866,55 @@ AppleCLCD::start(IOService *provider)
+@@ -815,6 +867,58 @@ AppleCLCD::start(IOService *provider)
  			IOLog("SWEET FB: backlight fade off (sweetfb_blfade=0): black in one step\n");
  		}
  	}
@@ -1877,6 +1878,9 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		if (defsurf != 0 && (fRowBytes & 63u) != 0) {
 +			uint32_t bpr = (fWidth * 4u + 63u) & ~63u;
 +			fDefault = sweet_surface_create_buffer(fWidth, fHeight, bpr, SWEET_FB_FORMAT_BGRA);
++			if (fDefault != NULL) {
++				(void)sweet_surface_pin(fDefault);     /* 951: stays importable by ID (backdrop blurs sample it) */
++			}
 +			uintptr_t dst = fDefault != NULL ? fDefault->kernelAddress() : 0;
 +			if (dst != 0) {
 +				/* what the panel shows now (the boot screen), for a compositor that starts from its default surface */
@@ -1892,7 +1896,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
  	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
  		IOLog("SWEET FB: no vsync timer\n");
-@@ -921,7 +1021,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -921,7 +1025,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	AppleCLCD *fb = (AppleCLCD *)owner;
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
@@ -1911,7 +1915,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	/*
  	 * 0216: with sweetfb_vsyncalign the notification carries the time of the latest panel vsync that SwapWait saw (the
  	 * MDP latch, a real vsync of the panel) projected forward by whole periods, and the timer is re-armed for the next
-@@ -982,11 +1093,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -982,11 +1097,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		if (fb->fBlOK && fb->fBlPos != 0 && !fb->fBlOffFailed && !fb->blSet(false)) {
  			fb->fBlOffFailed = true;
  		}
@@ -1926,7 +1930,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		return;
  	}
  	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && fb->gpuGateOpen(mach_absolute_time());
-@@ -1030,6 +1141,30 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -1030,6 +1145,30 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	sweet_hold_release(taken);      /* copied: CA may render into them again */
  	fb->statsTick(now);
  	fb->hudTick(now);
@@ -1957,7 +1961,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	sender->setTimeoutUS(nextUS);
  }
  
-@@ -1046,7 +1181,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -1046,7 +1185,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  bool
  AppleCLCD::gpuGateOpen(uint64_t now)
  {
@@ -1966,7 +1970,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		return true;
  	}
  	uint64_t cap;
-@@ -1190,6 +1325,21 @@ AppleCLCD::statsTick(uint64_t now)
+@@ -1190,6 +1329,21 @@ AppleCLCD::statsTick(uint64_t now)
  	    c.scanGpuSubmitFails, c.scanGpuLate, sweet_abs_us(c.scanGpuWaitMaxAbs));
  	#undef PER_S
  	sweet_fb_stats_publish(line);
@@ -1988,7 +1992,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
  		fStLogT = now;
  		IOLog("SWEET FB: stats %s", line);
-@@ -1288,7 +1438,7 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -1288,7 +1442,7 @@ AppleCLCD::swap(const uint8_t *rec)
  	}
  	IOLockLock(fLock);
  	fSt.swaps++;
@@ -1997,7 +2001,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fPendAbs = mach_absolute_time();
  	__atomic_store_n(&fSwapNewest, get32(rec, 0x50), __ATOMIC_RELEASE);
  	{
-@@ -2294,7 +2444,7 @@ AppleCLCD::scanBlitPoll(void)
+@@ -2294,7 +2448,7 @@ AppleCLCD::scanBlitPoll(void)
  	 * buffer scanned anyway, as before, so the panel cannot freeze for good.
  	 */
  	uint64_t waited = mach_absolute_time() - fScanBlitAbs;
@@ -2006,7 +2010,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint64_t lim;
  		nanoseconds_to_absolutetime(1000 * NSEC_PER_MSEC, &lim);
  		if (waited < lim) {
-@@ -2437,11 +2587,11 @@ AppleCLCD::scanCopyPresent(SweetSurface *s, uint32_t id)
+@@ -2437,11 +2591,11 @@ AppleCLCD::scanCopyPresent(SweetSurface *s, uint32_t id)
  			/* 0241: swapFired did not hold this swap for the GPU (it expected a GPU copy): wait for its work here */
  			uint64_t lim;
  			nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &lim);
@@ -2020,7 +2024,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				IODelay(50);
  			}
  			fScanBlitT = -1;
-@@ -2668,6 +2818,31 @@ bool
+@@ -2668,6 +2822,31 @@ bool
  AppleCLCD::blSet(bool on)
  {
  	if (sweet_board_begonia()) {
@@ -2052,7 +2056,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint32_t high = on ? (((uint32_t)(fBlRaw[0] & 0xfffu) * fBlPwmPeriod + 2047u) / 4095u) : 0u;
  		if (begoniaPwmWrite(high)) {
  			fBlPos = on ? SWEET_FB_BL_STEPS : 0;
-@@ -3436,6 +3611,22 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -3436,6 +3615,22 @@ AppleCLCD::present(const uint8_t *rec)
  				}
  			}
  		}
@@ -2075,7 +2079,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
  		if (w <= 0 || h <= 0) {
  			w = (int32_t)s->width;
-@@ -3590,18 +3781,30 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+@@ -3590,18 +3785,30 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
  
  static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
  
@@ -2175,7 +2179,26 @@ diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -638,6 +638,44 @@ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+@@ -446,6 +446,18 @@ sweet_surface_get(SweetSurface *s)
+ 	return ok;
+ }
+ 
++/*
++ * begonia 951: a surface the kernel itself keeps using stays findable by ID. The framebuffer's default surface (ID 2,
++ * one of backboardd's two framebuffers) went out of the table when the client's port to it was released: every later
++ * import by ID failed ("the kernel would not describe IOSurface 2", 1029 times in one log), and CoreAnimation's backdrop
++ * blurs, which sample the framebuffer, got Chlorophyll's zero texture: black materials (alert platters, Control Center).
++ */
++extern "C" bool
++sweet_surface_pin(SweetSurface *s)
++{
++	return s != NULL && sweet_surface_get(s);
++}
++
+ /* Drop a user; the last one removes the surface from the table. */
+ static void
+ sweet_surface_put(SweetSurface *s)
+@@ -638,6 +650,44 @@ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
  	return s;
  }
  
@@ -2220,7 +2243,7 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
  mach_port_name_t
  sweet_surface_port_in_task(SweetSurface *s, task_t task)
  {
-@@ -1147,6 +1185,11 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -1147,6 +1197,11 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  			ret = kIOReturnNoMemory;
  		} else {
  			bzero(mem->getBytesNoCopy(), s->allocSize);
@@ -2232,7 +2255,7 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
  			s->memory = mem;
  			s->mapCache = kIOMapDefaultCache;
  			if (!sweet_surface_publish(s)) {
-@@ -1495,11 +1538,23 @@ IOSurfaceRootUserClient::wrapClient(uint32_t selector, IOExternalMethodArguments
+@@ -1495,11 +1550,23 @@ IOSurfaceRootUserClient::wrapClient(uint32_t selector, IOExternalMethodArguments
  	return ret;
  }
  
@@ -2256,7 +2279,7 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
  	uint64_t arg0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
  
  	switch (selector) {
-@@ -1648,6 +1703,70 @@ sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
+@@ -1648,6 +1715,70 @@ sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
  	return kIOReturnSuccess;
  }
  
@@ -2327,7 +2350,7 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
  /* Retained surface this client created or looked up, or NULL. */
  static SweetSurface *
  sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
-@@ -1674,6 +1793,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+@@ -1674,6 +1805,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
  	if (s == NULL) {
  		return kIOReturnNotFound;
  	}
@@ -2335,7 +2358,7 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
  	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
  	s->release();
  	return ret;
-@@ -1689,6 +1809,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+@@ -1689,6 +1821,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
  	}
  	if (!((uintptr_t)options & kIOSurfaceLockReadOnly)) {
  		__atomic_add_fetch(&s->cpuWrites, 1, __ATOMIC_RELEASE);        /* the CPU may have written pixels: sweetfb_zcclean=3 cleans */
