@@ -635,7 +635,7 @@ index 4c7d2f6..c133c4c 100644
 +}
 +fragment half4 bg_fs_read1(V in [[stage_in]], half4 d1 [[color(1)]]) { return d1; }
 diff --git a/test/bgmtl_render_probe.m b/test/bgmtl_render_probe.m
-index 48ce6a2..814566a 100644
+index 48ce6a2..e51b156 100644
 --- a/test/bgmtl_render_probe.m
 +++ b/test/bgmtl_render_probe.m
 @@ -12,8 +12,15 @@
@@ -662,7 +662,7 @@ index 48ce6a2..814566a 100644
        // ---- P1: texture read in a kernel (RGBA32Float 8x8) ----
        printf("== P1 bg_tex_read\n");
        {
-@@ -459,6 +467,148 @@ main(int argc, char **argv)
+@@ -459,6 +467,155 @@ main(int argc, char **argv)
              printf("  %u red (near), %u green (far) of 1024\n", red, green);
           } else { g_fail++; printf("  setup failed (pso=%d dss=%d dt=%d)\n", pso != nil, dss != nil, dt != nil); }
        }
@@ -738,7 +738,10 @@ index 48ce6a2..814566a 100644
 +      // ---- P13 (Loxy, 26 Nov 2026): P12 (attachment 1 written, then fetched into attachment 0: passed) with CoreAnimation's
 +      // blend states: its *S1* pipelines blend attachment 1 (One, OneMinusSourceAlpha), its *M1* ones blend attachment 0 the
 +      // same way, and a diagnostic boot showed TcimA2Xhf_IsrcM1 leaving attachment 0 untouched over a white attachment 1.
-+      // v0: fetch with attachment 0 not blended (P12); v1: blended, one pass; v2: blended, second pass ----
++      // v0: fetch with attachment 0 not blended (P12); v1: blended, one pass; v2: blended, second pass;
++      // v3: second pass in a SECOND command buffer. Panfrost reuses the open batch of the same attachments, so v2 stays one
++      // GPU batch; v3 forces a new one, which only works if the fetched attachment 1 (colour mask 0 there) is preloaded
++      // (Mesa fix in pan_cmdstream.c, 26 Nov) - the corner case when a material's backdrop splits CoreAnimation's pass ----
 +      {
 +         printf("== P13 attachment 1 fetch with CoreAnimation's blend states\n");
 +         static const float fq[6 * 8] = {
@@ -765,11 +768,15 @@ index 48ce6a2..814566a 100644
 +            ps[k] = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
 +            printf("  pipeline %d: %s\n", k, ps[k] ? "created" : (err ? [[err localizedDescription] UTF8String] : "nil"));
 +         }
-+         for (int variant = 0; variant < 3 && ps[0] && ps[1] && ps[2] && vb; variant++) {
++         for (int variant = 0; variant < 4 && ps[0] && ps[1] && ps[2] && vb; variant++) {
 +            id rt0 = tex2d(MTLPixelFormatBGRA8Unorm, 64, 64, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
 +            id rt1 = tex2d(MTLPixelFormatBGRA8Unorm, 64, 64, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
 +            id cb = [g_queue commandBuffer];
-+            for (int pass = 0; pass < (variant == 2 ? 2 : 1); pass++) {
++            for (int pass = 0; pass < (variant >= 2 ? 2 : 1); pass++) {
++               if (variant == 3 && pass == 1) {
++                  CHECK(run(cb, "P13 v3 first buffer"), "P13 v3 first command buffer did not complete");
++                  cb = [g_queue commandBuffer];
++               }
 +               MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
 +               rp.colorAttachments[0].texture = rt0;
 +               rp.colorAttachments[1].texture = rt1;
