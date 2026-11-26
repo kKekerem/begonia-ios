@@ -424,7 +424,7 @@ index b3a614e..604afa4 100644
     w->kind = BG_WORK_DRAW;
     w->render = [_pipeline retain];
 diff --git a/test/bg_render.metal b/test/bg_render.metal
-index 4c7d2f6..04e9fdc 100644
+index 4c7d2f6..c133c4c 100644
 --- a/test/bg_render.metal
 +++ b/test/bg_render.metal
 @@ -3,6 +3,10 @@
@@ -446,13 +446,17 @@ index 4c7d2f6..04e9fdc 100644
  fragment float4 bg_fs_color(V in [[stage_in]]) { return in.color; }
  
  fragment float4 bg_fs_tex(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]])
-@@ -45,3 +50,59 @@ fragment float4 bg_fs_tex3(V in [[stage_in]], texture2d<float> t [[texture(3)]],
+@@ -45,3 +50,65 @@ fragment float4 bg_fs_tex3(V in [[stage_in]], texture2d<float> t [[texture(3)]],
  // a fragment stage with the varyings of CoreAnimation's std_vert0_*: color (float4) and texcoord0_0 (float2)
  struct CAV { float4 pos [[position]]; float4 color; float2 texcoord0_0; };
  fragment float4 bg_fs_ca_color(CAV in [[stage_in]]) { return in.color; }
 +
 +#endif
 +
++#ifndef BG_PROBE_CORNER
++#define BG_PROBE_CORNER 0
++#endif
++#if BG_PROBE_CORNER
 +// Loxy (26 Nov 2026): rounded corners came out square or chamfered. CoreAnimation draws a continuous (superellipse)
 +// corner as a quad whose vertices carry a corner coordinate t (-1..1, its texcoord0A) and computes the coverage per
 +// pixel from t with an fwidth edge. These stages repeat that computation and write the intermediate values, so the
@@ -493,6 +497,8 @@ index 4c7d2f6..04e9fdc 100644
 +   return float4(cov, d, fw, len);
 +}
 +
++#endif
++
 +// Loxy (26 Nov 2026), P12: framebuffer fetch from a SECOND colour attachment. CoreAnimation clips a layer to its continuous
 +// corners by copying the framebuffer's corner patches into colour attachment 1 (its *S1* shaders write [[color(1)]]) and
 +// blending them back with shaders that read [[color(1)]] (*M1*, TcimA2Xhf_IsrcM1: dest_1 x colour). Corners came out
@@ -507,10 +513,10 @@ index 4c7d2f6..04e9fdc 100644
 +}
 +fragment half4 bg_fs_read1(V in [[stage_in]], half4 d1 [[color(1)]]) { return d1; }
 diff --git a/test/bgmtl_render_probe.m b/test/bgmtl_render_probe.m
-index 48ce6a2..0df532f 100644
+index 48ce6a2..678c6d6 100644
 --- a/test/bgmtl_render_probe.m
 +++ b/test/bgmtl_render_probe.m
-@@ -12,6 +12,10 @@
+@@ -12,8 +12,15 @@
  #include <stdlib.h>
  #include <string.h>
  
@@ -520,8 +526,13 @@ index 48ce6a2..0df532f 100644
 +
  extern id bgmtl_create_device(void);
  
++#ifndef BG_PROBE_CORNER
++#define BG_PROBE_CORNER 0
++#endif
  static int g_pass, g_fail;
-@@ -70,6 +74,7 @@ main(int argc, char **argv)
+ #define CHECK(cond, ...) do { if (cond) { g_pass++; } else { g_fail++; printf("  FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
+ 
+@@ -70,6 +77,7 @@ main(int argc, char **argv)
        id klib = load_lib(argv[1]), rlib = load_lib(argv[2]);
        if (!g_dev || !g_queue || !klib || !rlib) return 3;
  
@@ -529,11 +540,12 @@ index 48ce6a2..0df532f 100644
        // ---- P1: texture read in a kernel (RGBA32Float 8x8) ----
        printf("== P1 bg_tex_read\n");
        {
-@@ -459,6 +464,146 @@ main(int argc, char **argv)
+@@ -459,6 +467,148 @@ main(int argc, char **argv)
              printf("  %u red (near), %u green (far) of 1024\n", red, green);
           } else { g_fail++; printf("  setup failed (pso=%d dss=%d dt=%d)\n", pso != nil, dss != nil, dt != nil); }
        }
 +#endif /* BG_PROBE_BASIC */
++#if BG_PROBE_CORNER   /* P10/P11 passed on 26 Nov (v33); kept out of the installed build (its file has no room) */
 +      // ---- P10/P11 (Loxy, 26 Nov 2026): CoreAnimation's continuous-corner coverage. A 64x64 quad whose corner
 +      // coordinate t runs -1..1 across it (t = clip position), drawn with bg_fs_deriv (t interpolated, fwidth/dfdx) and
 +      // with bg_fs_sup (CoreAnimation's coverage, intermediate values out), RGBA32Float, compared with the CPU ----
@@ -600,6 +612,7 @@ index 48ce6a2..0df532f 100644
 +            }
 +         }
 +      }
++#endif
 +      // ---- P12 (Loxy, 26 Nov 2026): CoreAnimation's corner clip writes colour attachment 1 and reads it back with
 +      // framebuffer fetch ([[color(1)]]). Left half red, right half blue into attachment 1; then attachment 1 copied into
 +      // attachment 0 by a fetch, in the same pass (a) and in a second pass that loads both (b) ----
