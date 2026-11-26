@@ -209,7 +209,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  
  void begonia_usb_init(void);
  
-@@ -1055,16 +1068,641 @@ parse_hex(const char *s, uint32_t *out)
+@@ -1055,16 +1068,699 @@ parse_hex(const char *s, uint32_t *out)
  	return digits > 0;
  }
  
@@ -493,6 +493,54 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +	printf("%s\n", line);
 +}
 +
++/*
++ * "membw" (26 Nov 2026): DRAM copy bandwidth from an A55 (cpu0) and an A76 (cpu6). On the iOS path nothing runs the
++ * DRAM/vcore DVFS (DVFSRC + SSPM firmware are Android's), so the DRAM may sit at whatever the boot loader left; this shows
++ * it. 8 MB copied into another 8 MB buffer 8 times per core (64 MB read + 64 MB written); MB/s of copy.
++ */
++static void
++membw_report(void)
++{
++	const size_t sz = 8u << 20;
++	uint8_t *a = kalloc_data(sz, Z_WAITOK);
++	uint8_t *b = kalloc_data(sz, Z_WAITOK);
++	char line[160];
++	size_t n = (size_t)snprintf(line, sizeof(line), "BEGONIA MEMBW: copy MB/s");
++
++	if (a == NULL || b == NULL) {
++		printf("BEGONIA MEMBW: no memory\n");
++	} else {
++		memset(a, 0x5a, sz);
++		memset(b, 0xa5, sz);
++		static const unsigned int cpus[2] = { 0u, 6u };
++		for (unsigned int k = 0; k < 2u; k++) {
++			processor_t p = cpus[k] <= ml_get_max_cpu_number() ? cpu_to_processor((int)cpus[k]) : (processor_t)NULL;
++			if (p == (processor_t)NULL) {
++				continue;
++			}
++			thread_bind(p);
++			thread_block(THREAD_CONTINUE_NULL);
++			bcopy(a, b, sz);        /* warm the TLB */
++			uint64_t ns = 0, t0 = mach_absolute_time();
++			for (int i = 0; i < 8; i++) {
++				bcopy((i & 1) ? b : a, (i & 1) ? a : b, sz);
++			}
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			n += (size_t)snprintf(line + n, sizeof(line) - n, " cpu%u=%llu", cpus[k],
++			    ns ? (uint64_t)(8u * sz) * 1000ull / ns : 0ull);
++		}
++		thread_bind((processor_t)NULL);
++		thread_block(THREAD_CONTINUE_NULL);
++		printf("%s\n", line);
++	}
++	if (a != NULL) {
++		kfree_data(a, sz);
++	}
++	if (b != NULL) {
++		kfree_data(b, sz);
++	}
++}
++
 +static int
 +smp_cb(proc_t p, __unused void *arg)
 +{
@@ -556,15 +604,23 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +	uint32_t boot_vsel, boot_svsel, boot_dds;   /* saved at the first change */
 +	bool saved;
 +};
++/*
++ * 26 Nov 2026: the rest of MTK's 6785T table (mtk_cpufreq_opp_table.h, MiCode begonia-r-oss: CPU_DVFS_FREQn_L/LL_6785T
++ * with VOLTn_VPROC1/2_6785T): L up to 2050 MHz at 1031.25 mV, LL up to 1733 at 1012.5 mV (its 1800..2000 MHz rows need
++ * 1037..1119 mV on six cores without any thermal control here: left out).
++ */
 +static const uint16_t bgc_opp_ll[][2] = {
-+	{ 1618, 957 }, { 1500, 913 }, { 1375, 875 }, { 1275, 844 }, { 1175, 800 },
++	{ 1733, 1013 }, { 1666, 982 }, { 1618, 957 }, { 1500, 913 }, { 1375, 875 }, { 1275, 844 }, { 1175, 800 },
 +};
 +static const uint16_t bgc_opp_l[][2] = {
++	{ 2050, 1032 }, { 1986, 1007 }, { 1923, 982 }, { 1860, 950 },
 +	{ 1796, 925 }, { 1733, 907 }, { 1670, 900 }, { 1530, 857 }, { 1419, 825 }, { 1308, 800 }, { 1169, 775 }, { 1085, 750 },
 +};
 +static struct bgc_cluster bgc[2] = {
-+	{ "LL", 0x204, 0x2a0, 0x17b2, 0x17a6, 0x1b42, 0x1ebe, BGC_VSRAM2_DA, bgc_opp_ll, 5, 0, 0, 0, false },
-+	{ "L", 0x214, 0x2a4, 0x172e, 0x1726, 0x1b40, 0x1ea0, BGC_VSRAM1_DA, bgc_opp_l, 8, 0, 0, 0, false },
++	{ "LL", 0x204, 0x2a0, 0x17b2, 0x17a6, 0x1b42, 0x1ebe, BGC_VSRAM2_DA, bgc_opp_ll,
++	  (uint32_t)(sizeof(bgc_opp_ll) / sizeof(bgc_opp_ll[0])), 0, 0, 0, false },
++	{ "L", 0x214, 0x2a4, 0x172e, 0x1726, 0x1b40, 0x1ea0, BGC_VSRAM1_DA, bgc_opp_l,
++	  (uint32_t)(sizeof(bgc_opp_l) / sizeof(bgc_opp_l[0])), 0, 0, 0, false },
 +};
 +static vm_offset_t bgc_apm, bgc_mcu;
 +
@@ -821,6 +877,8 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 +		proc_iterate(PROC_ALLPROCLIST, smp_cb, NULL, NULL, NULL);
 +	} else if (strcmp(line, "cpufreq") == 0) {
 +		cpufreq_report();
++	} else if (strcmp(line, "membw") == 0) {
++		membw_report();
 +	} else if (strcmp(line, "cpuinfo") == 0) {
 +		bgc_info();
 +	} else if (strncmp(line, "gpumhz ", 7) == 0 && parse_ints(line + 7, iv, 1)) {
@@ -852,7 +910,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  	} else if (strcmp(line, "fb") == 0) {
  		usb_fb_start(2u);
  	} else if (strncmp(line, "fb ", 3) == 0) {
-@@ -1079,7 +1717,7 @@ usb_cmd(char *line)
+@@ -1079,7 +1775,7 @@ usb_cmd(char *line)
  		usb.reboot_at = mach_absolute_time() + delta;
  		printf("BEGONIA USB: reboot in 2 s\n");
  	} else if (strncmp(line, "peek ", 5) == 0 && parse_hex(line + 5, &pa) && (pa & 3u) == 0 &&
@@ -861,7 +919,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		uint32_t page = pa & ~0xfffu;
  		if (usb.peek_va == 0 || usb.peek_page != page) {
  			usb.peek_va = ml_io_map(page, 0x1000);
-@@ -1137,6 +1775,21 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1137,6 +1833,21 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  		printf("BEGONIA USB: ml_io_map failed\n");
  		return;
  	}
@@ -883,7 +941,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  	if (!usb_hw_start()) {
  		printf("BEGONIA USB: not started\n");
  		return;
-@@ -1144,7 +1797,19 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1144,7 +1855,19 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  	nanoseconds_to_absolutetime(30ULL * NSEC_PER_SEC, &stat_gap);
  	usb.t0 = mach_absolute_time();
  	next_stat = usb.t0 + stat_gap;
@@ -903,7 +961,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		usb_bus_poll();
  		ep0_poll();
  		if (usb.configured) {
-@@ -1153,6 +1818,8 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1153,6 +1876,8 @@ begonia_usb_thread(void *arg __unused, wait_result_t wr __unused)
  				usb_tx_poll();
  			}
  		}
@@ -912,7 +970,7 @@ diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
  		if (usb.reboot_at != 0 && mach_absolute_time() >= usb.reboot_at) {
  			usb.reboot_at = 0;
  			printf("BEGONIA USB: rebooting\n");
-@@ -1186,6 +1853,7 @@ begonia_usb_init(void)
+@@ -1186,6 +1911,7 @@ begonia_usb_init(void)
  		return;
  	}
  	if (kernel_thread_start(begonia_usb_thread, NULL, &thread) == KERN_SUCCESS) {
