@@ -44,23 +44,6 @@ diff --git a/bsd/dev/begonia_autotest.c b/bsd/dev/begonia_autotest.c
  };
  
  static void
-@@ -84,6 +86,16 @@ begonia_autotest_thread(void *arg __unused, wait_result_t wr __unused)
- 				autotest_remove(BGMTL_DIR "bgmtl-bb.off");
- 				autotest_remove(BGMTL_DIR "bgmtl-bb.state");
- 				autotest_touch(BGMTL_DIR "bgmtl-bb.arm");
-+				/*
-+				 * 26 Nov 2026 (Loxy 940): the wallpaper's process (MercuryPoster) as well. Its kill switch
-+				 * (bgmtl.off) was written once by a GPU loss days ago and nothing ever removed it, so the
-+				 * poster stayed on the CPU path and drew nothing: a black wallpaper, and every blur and
-+				 * material over it black too. Re-armed on each boot like the compositor; the dead-man in
-+				 * the inject writes it again if the GPU fails in that boot.
-+				 */
-+				autotest_remove(BGMTL_DIR "bgmtl.off");
-+				autotest_remove(BGMTL_DIR "bgmtl.state");
-+				autotest_touch(BGMTL_DIR "bgmtl.arm");
- 			} else if (autotest_bgmtl == 0) {
- 				autotest_remove(BGMTL_DIR "bgmtl-bb.arm");
- 			}
 diff --git a/bsd/dev/begonia_usb.c b/bsd/dev/begonia_usb.c
 --- a/bsd/dev/begonia_usb.c
 +++ b/bsd/dev/begonia_usb.c
@@ -429,7 +412,15 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	void          blInit(void);
  	bool          blStep(int dir);
  	bool          blSet(bool on);   /* 0242: the backlight straight to iOS's state (no ramp), retried; false: it did not take */
-@@ -815,6 +834,29 @@ AppleCLCD::start(IOService *provider)
+@@ -485,6 +504,7 @@ public:
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
++	SweetSurface *fDefault;         /* begonia 940: what GetLayerDefaultSurface hands out instead (64-byte rows), or NULL */
+ 	IOLock       *fLock;            /* swaps and client list */
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+@@ -815,6 +835,52 @@ AppleCLCD::start(IOService *provider)
  			IOLog("SWEET FB: backlight fade off (sweetfb_blfade=0): black in one step\n");
  		}
  	}
@@ -455,11 +446,34 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		IOLog("SWEET FB: begonia display: %s, vsync %s (lead %d us), backlight %s (level %u)\n",
 +		    fBegonia ? "engine found" : "engine NOT found", fBegoniaVs ? "on the panel's frame starts" : "free-running timer",
 +		    lead, fBlDcs ? "DCS 0x51 with the display power" : "untouched (begoniabl=0)", fBlLevel);
++		/*
++		 * 26 Nov 2026: the default surface. The panel memory's rows are 4320 bytes (1080 x 4), not a multiple of 64,
++		 * and on the native canvas backboardd takes the default surface as one of its two framebuffers. The Mali cannot
++		 * render into that pitch (Chlorophyll refuses it: 1482 refusals in one boot), so every other frame was never
++		 * drawn and the panel kept the one before: half the frame rate. A surface of our own with 64-byte rows is handed
++		 * out instead and copied to the panel like every other frame (begoniadefsurf=0: the panel memory as before).
++		 */
++		int defsurf = 1;
++		PE_parse_boot_argn("begoniadefsurf", &defsurf, sizeof(defsurf));
++		if (defsurf != 0 && (fRowBytes & 63u) != 0) {
++			uint32_t bpr = (fWidth * 4u + 63u) & ~63u;
++			fDefault = sweet_surface_create_buffer(fWidth, fHeight, bpr, SWEET_FB_FORMAT_BGRA);
++			uintptr_t dst = fDefault != NULL ? fDefault->kernelAddress() : 0;
++			if (dst != 0) {
++				/* what the panel shows now (the boot screen), for a compositor that starts from its default surface */
++				for (uint32_t y = 0; y < fHeight; y++) {
++					memcpy((void *)(dst + (uintptr_t)y * bpr), (const void *)(fPixels + (uintptr_t)y * fRowBytes), fWidth * 4u);
++				}
++				sweet_dma_sync_va((const void *)dst, fDefault->allocSize);
++			}
++			IOLog("SWEET FB: begonia default surface %u (%ux%u, %u bytes a row) instead of the panel memory (%u bytes a row)\n",
++			    fDefault != NULL ? fDefault->id : 0, fWidth, fHeight, bpr, fRowBytes);
++		}
 +	}
  	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
  	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
  		IOLog("SWEET FB: no vsync timer\n");
-@@ -922,6 +964,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -922,6 +988,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
  	fb->fSt.ticks++;
@@ -474,7 +488,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	/*
  	 * 0216: with sweetfb_vsyncalign the notification carries the time of the latest panel vsync that SwapWait saw (the
  	 * MDP latch, a real vsync of the panel) projected forward by whole periods, and the timer is re-armed for the next
-@@ -982,11 +1032,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -982,11 +1056,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		if (fb->fBlOK && fb->fBlPos != 0 && !fb->fBlOffFailed && !fb->blSet(false)) {
  			fb->fBlOffFailed = true;
  		}
@@ -489,7 +503,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		return;
  	}
  	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && fb->gpuGateOpen(mach_absolute_time());
-@@ -1030,6 +1080,30 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -1030,6 +1104,30 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	sweet_hold_release(taken);      /* copied: CA may render into them again */
  	fb->statsTick(now);
  	fb->hudTick(now);
@@ -520,7 +534,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	sender->setTimeoutUS(nextUS);
  }
  
-@@ -1190,6 +1264,21 @@ AppleCLCD::statsTick(uint64_t now)
+@@ -1190,6 +1288,21 @@ AppleCLCD::statsTick(uint64_t now)
  	    c.scanGpuSubmitFails, c.scanGpuLate, sweet_abs_us(c.scanGpuWaitMaxAbs));
  	#undef PER_S
  	sweet_fb_stats_publish(line);
@@ -542,7 +556,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
  		fStLogT = now;
  		IOLog("SWEET FB: stats %s", line);
-@@ -2668,6 +2757,25 @@ bool
+@@ -2668,6 +2781,25 @@ bool
  AppleCLCD::blSet(bool on)
  {
  	if (sweet_board_begonia()) {
@@ -568,7 +582,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint32_t high = on ? (((uint32_t)(fBlRaw[0] & 0xfffu) * fBlPwmPeriod + 2047u) / 4095u) : 0u;
  		if (begoniaPwmWrite(high)) {
  			fBlPos = on ? SWEET_FB_BL_STEPS : 0;
-@@ -3436,6 +3544,22 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -3436,6 +3568,22 @@ AppleCLCD::present(const uint8_t *rec)
  				}
  			}
  		}
@@ -591,6 +605,15 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
  		if (w <= 0 || h <= 0) {
  			w = (int32_t)s->width;
+@@ -3601,7 +3749,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 
+ 	switch (selector) {
+ 	case kSweetFBGetLayerDefaultSurface:
+-		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
++		out[0] = sweet_surface_port_in_task(fFB->fDefault != NULL ? fFB->fDefault : fFB->fSurface, fTask);
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBSwapBegin:
 diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
 --- a/iokit/Kernel/arm/SweetMali.cpp
 +++ b/iokit/Kernel/arm/SweetMali.cpp
@@ -609,7 +632,52 @@ diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -1147,6 +1147,11 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -638,6 +638,44 @@ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+ 	return s;
+ }
+ 
++/*
++ * begonia 940 (26 Nov 2026): a surface in normal kernel memory that the kernel makes itself (the framebuffer's default
++ * surface when the panel's rows are not a multiple of 64 bytes). Write-back cacheable like the surfaces clients create,
++ * zeroed, the zeros pushed out of the CPU caches. A retained, published surface, or NULL.
++ */
++SweetSurface *
++sweet_surface_create_buffer(uint32_t width, uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat)
++{
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) {
++		return NULL;
++	}
++	s->width = width;
++	s->height = height;
++	s->bytesPerRow = bytesPerRow;
++	s->bytesPerElement = 4;
++	s->elementWidth = s->elementHeight = 1;
++	s->pixelFormat = pixelFormat;
++	s->allocSize = (uint32_t)round_page((uint64_t)bytesPerRow * height);
++	OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);  /* free() takes it back for buffer memory */
++	IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++	if (mem == NULL) {
++		OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++		s->release();
++		return NULL;
++	}
++	bzero(mem->getBytesNoCopy(), s->allocSize);
++	sweet_dma_sync_va(mem->getBytesNoCopy(), s->allocSize);
++	s->memory = mem;
++	s->mapCache = kIOMapDefaultCache;
++	if (!sweet_surface_publish(s)) {
++		s->release();
++		return NULL;
++	}
++	return s;
++}
++
+ mach_port_name_t
+ sweet_surface_port_in_task(SweetSurface *s, task_t task)
+ {
+@@ -1147,6 +1185,11 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  			ret = kIOReturnNoMemory;
  		} else {
  			bzero(mem->getBytesNoCopy(), s->allocSize);
@@ -621,7 +689,7 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
  			s->memory = mem;
  			s->mapCache = kIOMapDefaultCache;
  			if (!sweet_surface_publish(s)) {
-@@ -1648,6 +1653,62 @@ sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
+@@ -1648,6 +1691,62 @@ sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
  	return kIOReturnSuccess;
  }
  
@@ -684,7 +752,7 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
  /* Retained surface this client created or looked up, or NULL. */
  static SweetSurface *
  sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
-@@ -1674,6 +1735,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+@@ -1674,6 +1773,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
  	if (s == NULL) {
  		return kIOReturnNotFound;
  	}
@@ -692,7 +760,7 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
  	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
  	s->release();
  	return ret;
-@@ -1689,6 +1751,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+@@ -1689,6 +1789,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
  	}
  	if (!((uintptr_t)options & kIOSurfaceLockReadOnly)) {
  		__atomic_add_fetch(&s->cpuWrites, 1, __ATOMIC_RELEASE);        /* the CPU may have written pixels: sweetfb_zcclean=3 cleans */
@@ -715,6 +783,16 @@ diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
  	void free() APPLE_KEXT_OVERRIDE;
  
  	/* Kernel address of the pixels (mapped on first use; wrapped memory: of the first pixel), or 0. */
+@@ -71,6 +73,9 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
++/* begonia 940: a surface in normal (write-back) kernel memory, zeroed; retained and published, or NULL. */
++SweetSurface *sweet_surface_create_buffer(uint32_t width, uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
++
+ /*
+  * Zero-copy scanout (SweetFramebuffer.cpp, boot-arg sweetfb_zc=1; patch 0127,
+  * docs/DISPLAY_HW.md section 3). The MDP's source address registers are 32 bit
 diff --git a/bsd/dev/begonia_disp.c b/bsd/dev/begonia_disp.c
 new file mode 100644
 --- /dev/null
